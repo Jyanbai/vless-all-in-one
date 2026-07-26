@@ -12,86 +12,6 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - **Telegram Group:** https://t.me/vless_vaio
 - **Telegram Channel:** https://t.me/vaio_channel
 
-## Sponsors & Recommendations
-
-### Hosting Sponsors
-
-<p>
-  <a href="https://www.takehost.biz/" target="_blank" rel="noopener noreferrer">
-    <img src="https://www.takehost.biz/favicon.ico" alt="takehost" width="50" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>takehost</strong>
-  </a>
-  — Dedicated servers, VPS, and game servers with up to 100 Gbps networking.
-</p>
-
-<p>
-  <a href="https://akile.io/register?aff_code=b349580b-113a-4b42-ab76-c2db81c5c22d" target="_blank" rel="noopener noreferrer">
-    <img src="https://akile.io/favicon.ico" alt="AkileCloud" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>AkileCloud</strong>
-  </a>
-  — Multi-region coverage, streaming-unlocked routes, multi-country SOCKS5 exit nodes, native residential IP options, and strong value for money.
-</p>
-
-<p>
-  <a href="https://cloud.yt.net/?ref=13192" target="_blank" rel="noopener noreferrer">
-    <img src="https://cloud.yt.net/logo.png" alt="YT.NET" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>YT.NET</strong>
-  </a>
-  — Native IP, complimentary CNIX NAT entry, Shenzhen–Hong Kong optimized routes, and a BGP international network.
-</p>
-
-<p>
-  <a href="https://dash.lain.sh?ref=Charonlio" target="_blank" rel="noopener noreferrer">
-    <img src="https://dash.lain.sh/img/favicon-16x16.png" alt="Lain.sh" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>Lain.sh</strong>
-  </a>
-  — Native IP, streaming-unlocked routes, residential ISP resources, and dedicated servers.
-</p>
-
-<p>
-  <a href="https://www.cstonecloud.com/aff.php?aff=358" target="_blank" rel="noopener noreferrer">
-    <img src="https://www.cstonecloud.com/logo.png" alt="CstoneCloud" height="15" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>CstoneCloud</strong>
-  </a>
-  — Residential dual-ISP connectivity, streaming-unlocked routes, direct connectivity and five-network 9929 return paths, plus dual CN2 access.
-</p>
-
-<p>
-  <a href="https://www.skylineconnect.io/signup?aff=01CC63AP" target="_blank" rel="noopener noreferrer">
-    <img src="https://www.skylineconnect.io/images/favicon.svg" height="50">
-    <strong>SkylineConnect</strong>
-  </a>
-  — SoftBank/Lumen routes, mainland China optimized networking, high-traffic servers, and 10 Gbps virtual machine ports.
-</p>
-
-<p>
-  <a href="https://www.geelinx.com/aff/HLGCSMDN" target="_blank" rel="noopener noreferrer">
-    <img src="https://www.geelinx.com/favicon.ico" alt="Geelinx" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>Geelinx</strong>
-  </a>
-  — Streaming-unlocked routes, mainland China optimized networking, and one-way bandwidth billing.
-</p>
-
-### Recommended Fingerprint Browser
-
-<p>
-  <a href="https://roxybrowser.com?code=0128SUFA" target="_blank" rel="noopener noreferrer">
-    <img src="https://roxybrowser.com/favicon.ico" alt="RoxyBrowser" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>RoxyBrowser</strong>
-  </a>
-  — Isolated multi-account environments, cross-device sync, anti-linking detection, team collaboration, browser fingerprint isolation, proxy binding, and AI-powered multi-account management.
-</p>
-
-### Recommended iOS SSH App
-
-<p>
-  <a href="https://apps.apple.com/us/app/careserver/id6474921250" target="_blank" rel="noopener noreferrer">
-    <img src="https://nicejwin.github.io/CareServerWebSite/assets/img/logo.png" alt="CareServer" height="50" style="vertical-align: middle; margin-right: 6px;" />
-    <strong>CareServer</strong>
-  </a>
-  — Real-time server monitoring (CPU, memory, disk), container management (Docker/Podman), port forwarding (local/remote/dynamic), SFTP file management, proxy support (SOCKS/HTTP), and group management.
-</p>
-
 ## Features
 
 - One-click installation and management
@@ -103,7 +23,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 ## Quick Install
 
 ```bash
-wget -O vless-server.sh https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
+wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
 ## Documents
@@ -124,4 +44,4 @@ A step-by-step installation note is provided in the release asset:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Zyx0rx/vless-all-in-one&type=Date)](https://www.star-history.com/#Zyx0rx/vless-all-in-one&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Jyanbai/vless-all-in-one&type=Date)](https://www.star-history.com/#Jyanbai/vless-all-in-one&Date)
