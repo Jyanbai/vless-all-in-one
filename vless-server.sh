@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.15 [服务端]
+#  多协议代理一键部署脚本 v3.5.16 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.15"
+readonly VERSION="3.5.16"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -4692,22 +4692,26 @@ generate_mieru_config() {
     cfg=$(db_get "xray" "mieru")
     [[ -z "$cfg" || "$cfg" == "null" ]] && { _err "mieru 配置为空"; return 1; }
 
-    if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        cfg=$(echo "$cfg" | jq '.[0]')
+    mkdir -p "$CFG"
+    if ! echo "$cfg" | jq '
+        (if (. | type) == "array" then . else [.] end) as $items |
+        {
+            portBindings: ($items | map(select(.port != null and .port != "") | {port: (.port | tonumber), protocol: "TCP"}) | unique),
+            users: ($items | map(select((.username // "") != "" and (.password // "") != "") | {name: .username, password: .password}) | unique),
+            loggingLevel: "INFO"
+        }
+    ' > "$CFG/mieru.json"; then
+        _err "生成 mieru.json 基础配置失败"
+        return 1
     fi
 
-    local port username password
-    port=$(echo "$cfg" | jq -r '.port // empty')
-    username=$(echo "$cfg" | jq -r '.username // empty')
-    password=$(echo "$cfg" | jq -r '.password // empty')
-    [[ -z "$port" || -z "$username" || -z "$password" ]] && { _err "mieru 配置缺少 port/username/password"; return 1; }
-
-    mkdir -p "$CFG"
-    jq -n         --argjson port "$port"         --arg username "$username"         --arg password "$password"         '{
-            portBindings: [{port: $port, protocol: "TCP"}],
-            users: [{name: $username, password: $password}],
-            loggingLevel: "INFO"
-        }' > "$CFG/mieru.json"
+    local has_ports has_users
+    has_ports=$(jq -r '(.portBindings // []) | length' "$CFG/mieru.json" 2>/dev/null)
+    has_users=$(jq -r '(.users // []) | length' "$CFG/mieru.json" 2>/dev/null)
+    if [[ -z "$has_ports" || "$has_ports" -le 0 || -z "$has_users" || "$has_users" -le 0 ]]; then
+        _err "mieru 配置缺少有效端口或用户凭据"
+        return 1
+    fi
 
     local chain_name="" node="" node_type=""
     chain_name=$(_mieru_chain_node_name 2>/dev/null || true)
@@ -21180,10 +21184,20 @@ show_protocols_overview() {
     if [[ -n "$standalone_protocols" ]]; then
         echo -e "  ${Y}独立协议 (独立服务):${NC}"
         for protocol in $standalone_protocols; do
-            # 先从 xray 获取，如果为空再从 singbox 获取
-            local port=$(db_get_field "xray" "$protocol" "port")
-            [[ -z "$port" ]] && port=$(db_get_field "singbox" "$protocol" "port")
-            [[ -n "$port" ]] && echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
+            # 支持多端口实例展示
+            local ports=$(db_list_ports "xray" "$protocol")
+            [[ -z "$ports" ]] && ports=$(db_list_ports "singbox" "$protocol")
+            if [[ -n "$ports" ]]; then
+                local port_count=$(echo "$ports" | wc -l)
+                if [[ $port_count -eq 1 ]]; then
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$ports${NC}"
+                else
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port_count 个实例${NC}"
+                    echo "$ports" | while read -r port; do
+                        echo -e "      ${C}├─${NC} 端口 ${G}$port${NC}"
+                    done
+                fi
+            fi
         done
         echo ""
     fi
@@ -21478,11 +21492,8 @@ uninstall_specific_protocol() {
             _ok "Sing-box 服务已停止"
         fi
     else
-        # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
+        # 独立协议 (Snell/AnyTLS/ShadowTLS/mieru)
         local service_name="vless-${selected_protocol}"
-        
-        # 停止主服务
-        svc stop "$service_name" 2>/dev/null
         
         # ShadowTLS 组合协议：还需要停止后端服务
         if [[ "$selected_protocol" == "snell-shadowtls" || "$selected_protocol" == "snell-v5-shadowtls" || "$selected_protocol" == "ss2022-shadowtls" ]]; then
@@ -21491,63 +21502,72 @@ uninstall_specific_protocol() {
         fi
         
         # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
+        if [[ "$SELECTED_PORT" == "all" || "$selected_protocol" != "mieru" ]]; then
             echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
+            # 停止主服务
+            svc stop "$service_name" 2>/dev/null
             unregister_protocol "$selected_protocol"
             rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
+            # 删除配置文件
+            case "$selected_protocol" in
+                snell) rm -f "$CFG/snell.conf" ;;
+                snell-v5) rm -f "$CFG/snell-v5.conf" ;;
+                snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
+                snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
+                snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
+                ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
+                mieru) rm -f "$CFG/mieru.json" ;;
+            esac
+            
+            # 删除服务文件
+            if [[ "$DISTRO" == "alpine" ]]; then
+                rc-update del "$service_name" default 2>/dev/null
+                rm -f "/etc/init.d/$service_name"
+                # ShadowTLS 后端服务
+                if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
+                    rc-update del "${BACKEND_NAME[$selected_protocol]}" default 2>/dev/null
+                    rm -f "/etc/init.d/${BACKEND_NAME[$selected_protocol]}"
                 fi
             else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
-        fi
-        
-        # 删除配置文件
-        case "$selected_protocol" in
-            snell) rm -f "$CFG/snell.conf" ;;
-            snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-            snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
-            snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-            snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
-            ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
-            mieru) rm -f "$CFG/mieru.json" ;;
-        esac
-        
-        # 删除服务文件
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-update del "$service_name" default 2>/dev/null
-            rm -f "/etc/init.d/$service_name"
-            # ShadowTLS 后端服务
-            if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
-                rc-update del "${BACKEND_NAME[$selected_protocol]}" default 2>/dev/null
-                rm -f "/etc/init.d/${BACKEND_NAME[$selected_protocol]}"
+                systemctl disable "$service_name" 2>/dev/null
+                rm -f "/etc/systemd/system/${service_name}.service"
+                # ShadowTLS 后端服务
+                if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
+                    systemctl disable "${BACKEND_NAME[$selected_protocol]}" 2>/dev/null
+                    rm -f "/etc/systemd/system/${BACKEND_NAME[$selected_protocol]}.service"
+                fi
+                systemctl daemon-reload
             fi
         else
-            systemctl disable "$service_name" 2>/dev/null
-            rm -f "/etc/systemd/system/${service_name}.service"
-            # ShadowTLS 后端服务
-            if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
-                systemctl disable "${BACKEND_NAME[$selected_protocol]}" 2>/dev/null
-                rm -f "/etc/systemd/system/${BACKEND_NAME[$selected_protocol]}.service"
+            # mieru 支持单端口移除并重建聚合配置
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+            db_remove_port "xray" "$selected_protocol" "$SELECTED_PORT"
+            
+            local remaining_ports=$(db_list_ports "xray" "$selected_protocol")
+            if [[ -z "$remaining_ports" ]]; then
+                echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
+                svc stop "$service_name" 2>/dev/null
+                db_del "xray" "$selected_protocol"
+                rm -f "$CFG/${selected_protocol}.join" "$CFG/mieru.json"
+                if [[ "$DISTRO" == "alpine" ]]; then
+                    rc-update del "$service_name" default 2>/dev/null
+                    rm -f "/etc/init.d/$service_name"
+                else
+                    systemctl disable "$service_name" 2>/dev/null
+                    rm -f "/etc/systemd/system/${service_name}.service"
+                    systemctl daemon-reload
+                fi
+            else
+                echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行，正在重建配置并重启服务...${NC}"
+                rm -f "$CFG/mieru.json"
+                if generate_mieru_config; then
+                    svc restart "$service_name" 2>/dev/null || svc start "$service_name" 2>/dev/null
+                    _ok "mieru 配置已更新"
+                else
+                    _err "mieru 配置生成失败"
+                fi
             fi
-            systemctl daemon-reload
         fi
     fi
     
@@ -21928,9 +21948,11 @@ do_install_server() {
     
     # 检查该协议是否已安装
     if is_protocol_installed "$protocol"; then
-        # 处理已安装协议的多端口选择
-        if [[ "$core" != "standalone" ]]; then
-            handle_existing_protocol "$protocol" "$core" || return 1
+        # 处理已安装协议的多端口选择（mieru 为独立进程但支持单服务多端口绑定）
+        if [[ "$core" != "standalone" || "$protocol" == "mieru" ]]; then
+            local check_core="$core"
+            [[ "$protocol" == "mieru" ]] && check_core="xray"
+            handle_existing_protocol "$protocol" "$check_core" || return 1
         else
             # 独立协议保持原有的重新安装确认
             echo -e "${YELLOW}检测到 $protocol 已安装，将清理旧配置...${NC}"
@@ -23382,7 +23404,7 @@ do_install_server() {
             else
                 echo -e "  链式出口: ${D}跟随全局${NC}"
             fi
-            echo -e "  ${D}单端口实例，运行时文件由数据库重建${NC}"
+            echo -e "  ${D}多端口实例，运行时文件由数据库重建${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
