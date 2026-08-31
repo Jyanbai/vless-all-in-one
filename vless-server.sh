@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.14 [服务端]
+#  多协议代理一键部署脚本 v3.5.13 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -24,23 +24,21 @@ fi
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
-#           Snell v4 / Snell v5 / Snell v6 / AnyTLS / TUIC / NaïveProxy /
-#           VLESS-Enc-FinalMask / mieru (多协议)
+#           Snell v4 / Snell v5 / Snell v6 / AnyTLS / TUIC / NaïveProxy (多协议)
 #  插件支持: Snell v4/v5/v6 和 SS2022 可选启用 ShadowTLS
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
 #  
-#  原作者: Zyx0rx
-#  Fork 维护: Jyanbai
-#  项目地址: https://github.com/Jyanbai/vless-all-in-one
+#  作者: Zyx0rx
+#  项目地址: https://github.com/mozisen
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.14"
+readonly VERSION="3.5.13"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
-readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
-readonly SCRIPT_SOURCE_REPO="Jyanbai/vless-all-in-one"
+readonly REPO_URL="https://github.com/mozisen/surge"
+readonly SCRIPT_REPO="mozisen/surge"
+readonly SCRIPT_SOURCE_REPO="mozisen/surge"
 SCRIPT_SOURCE_REF="${VLESS_SCRIPT_SOURCE_REF:-main}"
 if [[ ! "$SCRIPT_SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "错误: VLESS_SCRIPT_SOURCE_REF 格式无效" >&2
