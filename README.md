@@ -4,7 +4,7 @@
 
 An all-in-one proxy deployment script for Linux servers.
 
-It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, and **SS2022**.
+It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, and **mieru**.
 
 ## Documentation
 
@@ -25,6 +25,8 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 ```bash
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
+
+Current script version: **v3.5.14**
 
 ## Documents
 
