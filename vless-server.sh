@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.14 [服务端]
+#  多协议代理一键部署脚本 v3.5.15 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.14"
+readonly VERSION="3.5.15"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -6943,6 +6943,30 @@ urlencode() {
     echo "$o"
 }
 
+# 全量百分号编码（VLESS encryption / fm JSON：. _ - 也要编码）
+urlencode_strict() {
+    local s="$1" i c o=""
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        printf -v c '%%%02X' "'$c"
+        o+="$c"
+    done
+    echo "$o"
+}
+
+# 分享名：地区-协议显示名-IP尾（与 Clash 订阅一致）
+_share_node_name() {
+    local ip="$1" country="${2:-}" proto="$3"
+    local ip_suffix tag name
+    ip_suffix=$(get_ip_suffix "$ip")
+    tag=$(get_protocol_name "$proto")
+    [[ -z "$tag" ]] && tag="$proto"
+    name="$tag"
+    [[ -n "$country" ]] && name="${country}-${name}"
+    [[ -n "$ip_suffix" ]] && name="${name}-${ip_suffix}"
+    echo "$name"
+}
+
 # 提取 IP 地址后缀（IPv4 取最后一段，IPv6 直接返回 "v6"）
 get_ip_suffix() {
     local ip="$1"
@@ -6975,6 +6999,26 @@ gen_vless_encryption_link() {
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}VLESS+Encryption${ip_suffix:+-${ip_suffix}}"
     printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=${encryption}&security=none&type=tcp#${name}"
+}
+
+# VLESS-Enc + FinalMask/Sudoku：v2rayN 非标准 fm=（客户端 encryption，不含服务端 decryption）
+gen_vless_finalmask_link() {
+    local ip="$1" port="$2" uuid="$3" encryption="$4" fm_password="$5"
+    local fm_ascii="${6:-prefer_entropy}" fm_padding_min="${7:-0}" fm_padding_max="${8:-3}" country="${9:-}"
+    local ip_suffix name enc_q fm fm_q host
+    [[ -z "$uuid" || -z "$encryption" || -z "$fm_password" ]] && return 1
+    ip="${ip#[}"
+    ip="${ip%]}"
+    if [[ "$ip" == *:* ]]; then
+        host="[$ip]"
+    else
+        host="$ip"
+    fi
+    name=$(_share_node_name "$ip" "$country" "vless-finalmask")
+    enc_q=$(urlencode_strict "$encryption")
+    fm=$(jq -nc --arg pw "$fm_password" --arg ascii "$fm_ascii" --argjson pmin "$fm_padding_min" --argjson pmax "$fm_padding_max"         '{tcp:[{type:"sudoku",settings:{password:$pw,ascii:$ascii,paddingMin:$pmin,paddingMax:$pmax}}]}') || return 1
+    fm_q=$(urlencode_strict "$fm")
+    printf '%s\n' "vless://${uuid}@${host}:${port}?encryption=${enc_q}&type=tcp&security=none&fm=${fm_q}#${name}"
 }
 
 gen_vless_xhttp_link() {
@@ -7010,14 +7054,11 @@ EOF
 # 生成二维码 (使用 qrencode 生成终端二维码)
 gen_qr() {
     local text="$1"
-    local margin="${2:-2}" 
-    
-    # 使用 qrencode 生成终端二维码 (标准黑白二维码)
+    local margin="${2:-2}"
     if command -v qrencode &>/dev/null; then
-        echo "$text" | qrencode -t UTF8 -m "$margin" 2>/dev/null && return 0
+        echo "$text" | qrencode -t UTF8 -l M -m "$margin" 2>/dev/null && return 0
+        echo "$text" | qrencode -t UTF8 -l L -m "$margin" 2>/dev/null && return 0
     fi
-    
-    # 未安装 qrencode，提示用户安装
     echo "[需安装 qrencode 才能显示二维码]"
     return 1
 }
@@ -7140,18 +7181,21 @@ gen_naive_link() {
 # mieru 客户端 JSON（mieru apply config）与官方简单分享 URI（mierus://）
 # 官方 mieru:// 是 protobuf ClientConfig（mieru export config），这里不伪造。
 gen_mieru_client_json() {
-    local ip="$1" port="$2" username="$3" password="$4"
+    local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
+    local name
     ip="${ip#[}"
     ip="${ip%]}"
+    name=$(_share_node_name "$ip" "$country" "mieru")
     jq -n \
         --arg ip "$ip" \
         --arg port "$port" \
         --arg username "$username" \
         --arg password "$password" \
+        --arg name "$name" \
         '{
             profiles: [
                 {
-                    profileName: "default",
+                    profileName: $name,
                     user: { name: $username, password: $password },
                     servers: [
                         {
@@ -7165,7 +7209,7 @@ gen_mieru_client_json() {
                     handshakeMode: "HANDSHAKE_NO_WAIT"
                 }
             ],
-            activeProfile: "default",
+            activeProfile: $name,
             rpcPort: 8964,
             socks5Port: 1080,
             loggingLevel: "INFO",
@@ -7174,8 +7218,8 @@ gen_mieru_client_json() {
 }
 
 gen_mierus_link() {
-    local ip="$1" port="$2" username="$3" password="$4"
-    local host user_enc pass_enc
+    local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
+    local host user_enc pass_enc name name_q
     ip="${ip#[}"
     ip="${ip%]}"
     if [[ "$ip" == *:* ]]; then
@@ -7183,9 +7227,11 @@ gen_mierus_link() {
     else
         host="$ip"
     fi
+    name=$(_share_node_name "$ip" "$country" "mieru")
+    name_q=$(urlencode "$name")
     user_enc=$(urlencode "$username")
     pass_enc=$(urlencode "$password")
-    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_OFF&port=${port}&profile=default&protocol=TCP"
+    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_OFF&port=${port}&profile=${name_q}&protocol=TCP#${name_q}"
 }
 
 gen_mieru_link() { gen_mierus_link "$@"; }
@@ -7210,11 +7256,12 @@ gen_mieru_clash_yaml() {
 }
 
 _print_mieru_share() {
-    local ip="$1" port="$2" username="$3" password="$4"
-    local link json clash _line
-    link=$(gen_mierus_link "$ip" "$port" "$username" "$password")
-    json=$(gen_mieru_client_json "$ip" "$port" "$username" "$password")
-    clash=$(gen_mieru_clash_yaml "mieru-mita-tcp" "$ip" "$port" "$username" "$password")
+    local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
+    local link json clash _line name
+    name=$(_share_node_name "$ip" "$country" "mieru")
+    link=$(gen_mierus_link "$ip" "$port" "$username" "$password" "$country")
+    json=$(gen_mieru_client_json "$ip" "$port" "$username" "$password" "$country")
+    clash=$(gen_mieru_clash_yaml "$name" "$ip" "$port" "$username" "$password")
     echo -e "  ${C}分享链接:${NC}"
     echo -e "  ${G}${link}${NC}"
     echo ""
@@ -7223,12 +7270,17 @@ _print_mieru_share() {
         echo -e "  ${C}${_line}${NC}"
     done <<< "$json"
     echo ""
-    echo -e "  ${C}【Clash / mihomo 配置片段】${NC}"
+    echo -e "  ${C}[Clash / mihomo配置]${NC}"
     echo -e "  ${C}proxies:${NC}"
     while IFS= read -r _line || [[ -n "$_line" ]]; do
         echo -e "  ${C}${_line}${NC}"
     done <<< "$clash"
+
+    echo ""
+    echo -e "  ${C}二维码:${NC}"
+    echo -e "  ${G}$(gen_qr "$link")${NC}"
 }
+
 
 gen_shadowtls_link() {
     local ip="$1" port="$2" password="$3" method="$4" sni="$5" stls_password="$6" country="${7:-}"
@@ -12617,7 +12669,7 @@ gen_vless_xhttp_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# VLESS+Encryption+FinalMask/Sudoku 意图（不写引擎文件，不生成分享链接）
+# VLESS+Encryption+FinalMask/Sudoku 意图（不写引擎文件）
 gen_vless_finalmask_server_config() {
     local uuid="$1" port="$2" decryption="$3" encryption="$4"
     local fm_password="$5" fm_ascii="${6:-prefer_entropy}" fm_padding_min="${7:-0}" fm_padding_max="${8:-3}"
@@ -20171,10 +20223,13 @@ show_all_share_links() {
                     anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
                     socks) link=$(gen_socks_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
-                    mieru) link=$(gen_mierus_link "$ipv4" "$display_port" "$username" "$password") ;;
+                    mieru) link=$(gen_mierus_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
                     vless-finalmask)
-                        echo -e "  ${D}暂无链接${NC}"
-                        has_links=true
+                        local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                        local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
+                        local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
+                        local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
+                        link=$(gen_vless_finalmask_link "$ipv4" "$display_port" "$uuid" "$encryption" "$password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
                         ;;
                     # ShadowTLS 组合协议：没有标准分享链接，显示 Surge/Loon 配置
                     snell-shadowtls)
@@ -20228,13 +20283,13 @@ show_all_share_links() {
                     anytls) link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
                     socks) link=$(gen_socks_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
-                    mieru) link=$(gen_mierus_link "$ip6" "$display_port" "$username" "$password") ;;
+                    mieru) link=$(gen_mierus_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
                     vless-finalmask)
-                        # IPv4 块已打印「暂无链接」；仅纯 IPv6 时补一次
-                        if [[ -z "$ipv4" ]]; then
-                            echo -e "  ${D}暂无链接${NC}"
-                            has_links=true
-                        fi
+                        local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                        local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
+                        local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
+                        local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
+                        link=$(gen_vless_finalmask_link "$ip6" "$display_port" "$uuid" "$encryption" "$password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
                         ;;
                     # ShadowTLS 组合协议 IPv6：没有标准分享链接，显示 Surge/Loon 配置
                     snell-shadowtls)
@@ -20845,11 +20900,15 @@ show_single_protocol_info() {
                 fi
                 ;;
             mieru)
-                link=$(gen_mierus_link "$ip_addr" "$link_port" "$username" "$password")
+                link=$(gen_mierus_link "$ip_addr" "$link_port" "$username" "$password" "$country_code")
                 join_code=""
                 ;;
             vless-finalmask)
-                link=""
+                local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
+                local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
+                local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
+                link=$(gen_vless_finalmask_link "$ip_addr" "$link_port" "$uuid" "$encryption" "$password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
                 join_code=""
                 ;;
         esac
@@ -20861,12 +20920,21 @@ show_single_protocol_info() {
             echo ""
         fi
         
-        # ShadowTLS 组合协议只显示 JOIN 码；FinalMask 无分享链接
+        # ShadowTLS 组合协议只显示 JOIN 码
         if [[ "$protocol" == "vless-finalmask" ]]; then
             echo -e "  ${C}分享链接:${NC}"
-            echo -e "  ${D}暂无链接${NC}"
+            if [[ -n "$link" ]]; then
+                echo -e "  ${G}$link${NC}"
+                echo ""
+                echo -e "  ${D}仅新版 v2rayN 识别 fm=；码较密，扫丢字段时用 JSON${NC}"
+                echo ""
+                echo -e "  ${C}二维码:${NC}"
+                echo -e "  ${G}$(gen_qr "$link")${NC}"
+            else
+                echo -e "  ${D}暂无链接（缺客户端 encryption 或 Sudoku 密码）${NC}"
+            fi
         elif [[ "$protocol" == "mieru" ]]; then
-            _print_mieru_share "$ip_addr" "$link_port" "$username" "$password"
+            _print_mieru_share "$ip_addr" "$link_port" "$username" "$password" "$country_code"
         elif [[ "$protocol" != "snell-shadowtls" && "$protocol" != "snell-v5-shadowtls" && "$protocol" != "ss2022-shadowtls" ]]; then
             if [[ "$protocol" == "socks" ]]; then
                 local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
@@ -24997,10 +25065,14 @@ gen_v2ray_sub() {
                     [[ -n "$server_ip" ]] && link=$(gen_socks_link "$server_ip" "$actual_port" "$username" "$password" "$country_code")
                     ;;
                 mieru)
-                    [[ -n "$server_ip" ]] && link=$(gen_mierus_link "$server_ip" "$actual_port" "$username" "$password")
+                    [[ -n "$server_ip" ]] && link=$(gen_mierus_link "$server_ip" "$actual_port" "$username" "$password" "$country_code")
                     ;;
                 vless-finalmask)
-                    link=""
+                    local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                    local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
+                    local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
+                    local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
+                    [[ -n "$server_ip" ]] && link=$(gen_vless_finalmask_link "$server_ip" "$actual_port" "$uuid" "$encryption" "$password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
                     ;;
             esac
             
@@ -27681,7 +27753,19 @@ _gen_user_share_link() {
                 link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$remark") 
                 ;;
             socks) link=$(gen_socks_link "$ipv4" "$display_port" "$user_name" "$uuid" "$remark") ;;
-            vless-finalmask|mieru) link="" ;;
+            vless-finalmask)
+                local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
+                local fm_password=$(echo "$cfg" | jq -r '.password // empty')
+                local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
+                local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
+                local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
+                link=$(gen_vless_finalmask_link "$ipv4" "$display_port" "$uuid" "$encryption" "$fm_password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
+                ;;
+            mieru)
+                local m_user=$(echo "$cfg" | jq -r '.username // empty')
+                local m_pass=$(echo "$cfg" | jq -r '.password // empty')
+                link=$(gen_mierus_link "$ipv4" "$display_port" "$m_user" "$m_pass" "$country_code")
+                ;;
         esac
         [[ -n "$link" ]] && echo "$link"
     fi
