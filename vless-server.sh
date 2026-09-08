@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.17 [服务端]
+#  多协议代理一键部署脚本 v3.5.18 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.17"
+readonly VERSION="3.5.18"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -9815,7 +9815,7 @@ install_xray() {
         "$channel" "$force" "$version_override"
 }
 
-# 解析 xray vlessenc 输出。优先读取完整 JSON；文本回退必须各自唯一。
+# 解析 xray vlessenc 输出。优先完整 JSON；多 Authentication 按 section 配对，默认选 ML-KEM-768。
 _parse_vlessenc_output() {
     local output="$1" decryption="" encryption=""
     local -a decryptions=() encryptions=()
@@ -9825,11 +9825,72 @@ _parse_vlessenc_output() {
         decryption=$(printf '%s\n' "$output" | jq -r '.decryption')
         encryption=$(printf '%s\n' "$output" | jq -r '.encryption')
     else
-        mapfile -t decryptions < <(printf '%s\n' "$output" | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        mapfile -t encryptions < <(printf '%s\n' "$output" | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        [[ ${#decryptions[@]} -eq 1 && ${#encryptions[@]} -eq 1 ]] || return 1
-        decryption="${decryptions[0]}"
-        encryption="${encryptions[0]}"
+        # 去掉 CRLF，按 Authentication section 划分配对（禁止跨 section 混配）
+        output=$(printf '%s\n' "$output" | tr -d '\r')
+        if printf '%s\n' "$output" | grep -qE '^[[:space:]]*Authentication:'; then
+            local kind="" line="" val=""
+            local ml_dec="" ml_enc="" x_dec="" x_enc=""
+            local ml_d=0 ml_e=0 x_d=0 x_e=0 ml_seen=0 x_seen=0
+
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" =~ ^[[:space:]]*Authentication:[[:space:]]*(.*)$ ]]; then
+                    kind="${BASH_REMATCH[1]}"
+                    kind="${kind#"${kind%%[![:space:]]*}"}"
+                    if [[ "$kind" == ML-KEM-768* ]]; then
+                        kind="ML-KEM-768"
+                        ml_seen=1
+                    elif [[ "$kind" == X25519* ]]; then
+                        kind="X25519"
+                        x_seen=1
+                    else
+                        kind="OTHER"
+                    fi
+                    continue
+                fi
+                [[ -z "$kind" || "$kind" == "OTHER" ]] && continue
+
+                if [[ "$line" =~ \"decryption\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+                    val="${BASH_REMATCH[1]}"
+                    if [[ "$kind" == "ML-KEM-768" ]]; then
+                        ml_d=$((ml_d + 1))
+                        ml_dec="$val"
+                    elif [[ "$kind" == "X25519" ]]; then
+                        x_d=$((x_d + 1))
+                        x_dec="$val"
+                    fi
+                fi
+                if [[ "$line" =~ \"encryption\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+                    val="${BASH_REMATCH[1]}"
+                    if [[ "$kind" == "ML-KEM-768" ]]; then
+                        ml_e=$((ml_e + 1))
+                        ml_enc="$val"
+                    elif [[ "$kind" == "X25519" ]]; then
+                        x_e=$((x_e + 1))
+                        x_enc="$val"
+                    fi
+                fi
+            done <<< "$output"
+
+            # ML-KEM section 出现则必须完整且唯一字段；不完整则 fail-closed（不静默 fallback）
+            if [[ "$ml_seen" -eq 1 ]]; then
+                [[ "$ml_d" -eq 1 && "$ml_e" -eq 1 && -n "$ml_dec" && -n "$ml_enc" ]] || return 1
+                decryption="$ml_dec"
+                encryption="$ml_enc"
+            elif [[ "$x_seen" -eq 1 ]]; then
+                [[ "$x_d" -eq 1 && "$x_e" -eq 1 && -n "$x_dec" && -n "$x_enc" ]] || return 1
+                decryption="$x_dec"
+                encryption="$x_enc"
+            else
+                return 1
+            fi
+        else
+            # legacy：无 Authentication header，恰好一对
+            mapfile -t decryptions < <(printf '%s\n' "$output" | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            mapfile -t encryptions < <(printf '%s\n' "$output" | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            [[ ${#decryptions[@]} -eq 1 && ${#encryptions[@]} -eq 1 ]] || return 1
+            decryption="${decryptions[0]}"
+            encryption="${encryptions[0]}"
+        fi
     fi
 
     [[ -n "$decryption" && -n "$encryption" ]] || return 1

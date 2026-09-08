@@ -26,7 +26,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.17**
+当前脚本版本：**v3.5.18**
 
 ## 文档入口
 
