@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.16 [服务端]
+#  多协议代理一键部署脚本 v3.5.17 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.16"
+readonly VERSION="3.5.17"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -3704,6 +3704,81 @@ unregister_protocol() {
     db_del "singbox" "$protocol" 2>/dev/null
 }
 
+# FinalMask/mieru 单次变更备份；只覆盖本次数据库、运行时配置和服务状态。
+_limited_change_dir=""
+_limited_change_protocol=""
+_limited_change_service=""
+_limited_change_was_running=false
+
+_limited_change_begin() {
+    local protocol="$1" config_file=""
+    [[ -z "$_limited_change_dir" ]] || return 1
+    _limited_change_dir=$(mktemp -d "${TMPDIR:-/tmp}/vless-change.XXXXXX") || return 1
+    _limited_change_protocol="$protocol"
+    case "$protocol" in
+        vless-finalmask) config_file="$CFG/config.json"; _limited_change_service="vless-reality" ;;
+        mieru) config_file="$CFG/mieru.json"; _limited_change_service="vless-mieru" ;;
+        *) _limited_change_commit; return 1 ;;
+    esac
+    if [[ -f "$DB_FILE" ]]; then
+        cp -p "$DB_FILE" "$_limited_change_dir/db.json" || { _limited_change_commit; return 1; }
+    else
+        : > "$_limited_change_dir/db.missing"
+    fi
+    if [[ -f "$config_file" ]]; then
+        cp -p "$config_file" "$_limited_change_dir/runtime.json" || { _limited_change_commit; return 1; }
+    else
+        : > "$_limited_change_dir/runtime.missing"
+    fi
+    svc status "$_limited_change_service" >/dev/null 2>&1 && _limited_change_was_running=true || _limited_change_was_running=false
+}
+
+_limited_change_commit() {
+    local dir="$_limited_change_dir"
+    if [[ -n "$dir" ]]; then
+        case "$dir" in
+            "${TMPDIR:-/tmp}"/vless-change.*) rm -rf -- "$dir" ;;
+        esac
+    fi
+    _limited_change_dir=""
+    _limited_change_protocol=""
+    _limited_change_service=""
+    _limited_change_was_running=false
+}
+
+_limited_change_rollback() {
+    local dir="$_limited_change_dir" config_file="" service_ok=true
+    [[ -n "$dir" && -d "$dir" ]] || return 0
+    case "$_limited_change_protocol" in
+        vless-finalmask) config_file="$CFG/config.json" ;;
+        mieru) config_file="$CFG/mieru.json" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -f "$dir/db.json" ]]; then
+        cp -p "$dir/db.json" "$DB_FILE" || return 1
+    else
+        rm -f "$DB_FILE"
+    fi
+    if [[ -f "$dir/runtime.json" ]]; then
+        cp -p "$dir/runtime.json" "$config_file" || return 1
+    else
+        rm -f "$config_file"
+    fi
+
+    if [[ "$_limited_change_was_running" == "true" ]]; then
+        svc restart "$_limited_change_service" >/dev/null 2>&1 || svc start "$_limited_change_service" >/dev/null 2>&1 || {
+            _err "旧配置已恢复，但 $_limited_change_service 服务恢复失败"
+            service_ok=false
+        }
+    elif svc status "$_limited_change_service" >/dev/null 2>&1; then
+        svc stop "$_limited_change_service" >/dev/null 2>&1 || service_ok=false
+    fi
+    _warn "已恢复变更前的配置和服务状态"
+    _limited_change_commit
+    [[ "$service_ok" == "true" ]]
+}
+
 get_installed_protocols() {
     # 从数据库获取
     if [[ -f "$DB_FILE" ]]; then
@@ -4491,6 +4566,46 @@ generate_xray_config() {
     if [[ -n "$failed_protocols" ]]; then
         _warn "以下协议配置失败: $failed_protocols"
     fi
+
+    # FinalMask must never soft-skip: DB presence requires inbound tags + full xray -test.
+    if db_exists "xray" "vless-finalmask"; then
+        if [[ " ${failed_protocols} " == *" vless-finalmask "* ]]; then
+            _err "FinalMask 入站生成失败，拒绝提交不完整的 Xray 配置"
+            return 1
+        fi
+        local fm_cfg fm_port fm_tag
+        fm_cfg=$(db_get "xray" "vless-finalmask")
+        if echo "$fm_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            while IFS= read -r fm_port; do
+                [[ -z "$fm_port" || "$fm_port" == "null" ]] && continue
+                fm_tag="vless-finalmask-${fm_port}"
+                if ! jq -e --arg t "$fm_tag" --argjson p "$fm_port" \
+                    '[.inbounds[]? | select(.tag == $t and .port == $p and (.streamSettings.finalmask != null))] | length > 0' \
+                    "$CFG/config.json" >/dev/null 2>&1; then
+                    _err "FinalMask 端口 $fm_port 未写入最终配置 (缺 tag $fm_tag)"
+                    return 1
+                fi
+            done < <(echo "$fm_cfg" | jq -r '.[].port // empty')
+        else
+            fm_port=$(echo "$fm_cfg" | jq -r '.port // empty')
+            [[ -n "$fm_port" && "$fm_port" != "null" ]] || { _err "FinalMask 配置缺少 port"; return 1; }
+            fm_tag="vless-finalmask-${fm_port}"
+            if ! jq -e --arg t "$fm_tag" --argjson p "$fm_port" \
+                '[.inbounds[]? | select(.tag == $t and .port == $p and (.streamSettings.finalmask != null))] | length > 0' \
+                "$CFG/config.json" >/dev/null 2>&1; then
+                _err "FinalMask 端口 $fm_port 未写入最终配置 (缺 tag $fm_tag)"
+                return 1
+            fi
+        fi
+        if ! check_cmd xray; then
+            _err "xray 不可用，无法校验 FinalMask 完整配置"
+            return 1
+        fi
+        if ! xray run -test -c "$CFG/config.json" >/dev/null 2>&1 && ! xray -test -c "$CFG/config.json" >/dev/null 2>&1; then
+            _err "FinalMask 完整配置未通过 xray run -test"
+            return 1
+        fi
+    fi
     
     _ok "Xray 配置生成成功 ($success_count 个协议)"
     return 0
@@ -4682,9 +4797,70 @@ _inject_mieru_chain_bridge() {
     return 1
 }
 
-# 从数据库重建 mita 运行时配置（单端口，不写入 portRange）
+# 使用独立 protobuf 配置和控制套接字校验候选配置，不污染正式状态。
+_mieru_validate_candidate() {
+    local candidate="$1" validate_dir="" pid="" sock="" i rc=0
+    jq -e '
+        (.portBindings | type == "array" and length > 0) and
+        (.users | type == "array" and length > 0) and
+        (all(.portBindings[];
+            (.protocol == "TCP") and
+            (.port | type == "number") and
+            (.port >= 1025 and .port <= 65535))) and
+        (all(.users[];
+            ((.name // "") | type == "string" and length > 0) and
+            ((.password // "") | type == "string" and length > 0))) and
+        ([.users | group_by(.name)[] | (map(.password) | unique | length)] | all(. <= 1))
+    ' "$candidate" >/dev/null 2>&1 || {
+        _err "mieru 候选配置字段无效或存在同名异密用户"
+        return 1
+    }
+
+    check_cmd mita || { _err "mita 不可用，无法校验 mieru 配置"; return 1; }
+    validate_dir=$(mktemp -d "${TMPDIR:-/tmp}/vless-mieru-validate.XXXXXX") || return 1
+    chmod 700 "$validate_dir" 2>/dev/null || true
+    touch "$validate_dir/server.conf.pb" "$validate_dir/run.log" 2>/dev/null || true
+    # mita 3.36+ apply/describe speak to a live RPC socket; spin an ephemeral daemon first.
+    MITA_CONFIG_FILE="$validate_dir/server.conf.pb" \
+    MITA_UDS_PATH="$validate_dir/mita.sock" \
+    MITA_CONFIG_JSON_FILE="$candidate" \
+        mita run >"$validate_dir/run.log" 2>&1 &
+    pid=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+        if [[ -S "$validate_dir/mita.sock" ]]; then
+            sock=1
+            break
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    if [[ -z "$sock" ]]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -rf "$validate_dir"
+        _err "mita 校验守护进程未能打开套接字（非配置内容错误）"
+        return 1
+    fi
+    if ! MITA_CONFIG_FILE="$validate_dir/server.conf.pb" MITA_UDS_PATH="$validate_dir/mita.sock" \
+        mita apply config "$candidate" >/dev/null 2>&1; then
+        _err "mita 拒绝候选配置"
+        rc=1
+    elif ! MITA_CONFIG_FILE="$validate_dir/server.conf.pb" MITA_UDS_PATH="$validate_dir/mita.sock" \
+        mita describe config >/dev/null 2>&1; then
+        _err "mita describe config 失败"
+        rc=1
+    fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$validate_dir"
+    return "$rc"
+}
+
+# 从数据库重建 mita 运行时配置（多监听共享用户池，不写入 portRange）
 generate_mieru_config() {
-    local cfg=""
+    local cfg="" candidate=""
     if ! db_exists "xray" "mieru"; then
         _err "mieru 配置不存在"
         return 1
@@ -4693,6 +4869,7 @@ generate_mieru_config() {
     [[ -z "$cfg" || "$cfg" == "null" ]] && { _err "mieru 配置为空"; return 1; }
 
     mkdir -p "$CFG"
+    candidate=$(mktemp "$CFG/.mieru.json.XXXXXX") || { _err "创建 mieru 候选配置失败"; return 1; }
     if ! echo "$cfg" | jq '
         (if (. | type) == "array" then . else [.] end) as $items |
         {
@@ -4700,15 +4877,17 @@ generate_mieru_config() {
             users: ($items | map(select((.username // "") != "" and (.password // "") != "") | {name: .username, password: .password}) | unique),
             loggingLevel: "INFO"
         }
-    ' > "$CFG/mieru.json"; then
+    ' > "$candidate"; then
+        rm -f "$candidate"
         _err "生成 mieru.json 基础配置失败"
         return 1
     fi
 
     local has_ports has_users
-    has_ports=$(jq -r '(.portBindings // []) | length' "$CFG/mieru.json" 2>/dev/null)
-    has_users=$(jq -r '(.users // []) | length' "$CFG/mieru.json" 2>/dev/null)
+    has_ports=$(jq -r '(.portBindings // []) | length' "$candidate" 2>/dev/null)
+    has_users=$(jq -r '(.users // []) | length' "$candidate" 2>/dev/null)
     if [[ -z "$has_ports" || "$has_ports" -le 0 || -z "$has_users" || "$has_users" -le 0 ]]; then
+        rm -f "$candidate"
         _err "mieru 配置缺少有效端口或用户凭据"
         return 1
     fi
@@ -4733,6 +4912,9 @@ generate_mieru_config() {
             if [[ "$egress_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 direct_kind="ip"
                 direct_val="${egress_host}/32"
+            elif [[ "$egress_host" == *:* && "$egress_host" =~ ^[0-9a-fA-F:]+$ ]]; then
+                direct_kind="ip"
+                direct_val="${egress_host}/128"
             else
                 direct_kind="domain"
                 direct_val="$egress_host"
@@ -4753,7 +4935,7 @@ generate_mieru_config() {
 
         if [[ -n "$egress_host" && "$egress_port" =~ ^[0-9]+$ ]]; then
             local tmp
-            tmp=$(mktemp) || return 1
+            tmp=$(mktemp "$CFG/.mieru-egress.XXXXXX") || { rm -f "$candidate"; return 1; }
             if jq --arg host "$egress_host" --argjson port "$egress_port" \
                 --arg user "$egress_user" --arg pass "$egress_pass" \
                 --arg dkind "$direct_kind" --arg dval "$direct_val" '
@@ -4780,18 +4962,28 @@ generate_mieru_config() {
                         {ipRanges: ["*"], domainNames: ["*"], action: "PROXY", proxyNames: ["socks5-chain"]}
                     ]
                 }
-            ' "$CFG/mieru.json" > "$tmp" 2>/dev/null; then
-                mv "$tmp" "$CFG/mieru.json"
+            ' "$candidate" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$candidate"
             else
-                rm -f "$tmp"
+                rm -f "$tmp" "$candidate"
                 _err "mieru egress 配置生成失败"
                 return 1
             fi
         fi
     fi
 
-    if ! jq empty "$CFG/mieru.json" 2>/dev/null; then
+    if ! jq empty "$candidate" 2>/dev/null; then
+        rm -f "$candidate"
         _err "mieru 配置文件 JSON 格式错误"
+        return 1
+    fi
+    if ! _mieru_validate_candidate "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! mv -f "$candidate" "$CFG/mieru.json"; then
+        rm -f "$candidate"
+        _err "提交 mieru 配置失败"
         return 1
     fi
     _ok "mieru 配置已生成"
@@ -6191,7 +6383,7 @@ ask_port() {
     local has_master=false
     local master_port=""
     for proto in vless-vision vless trojan; do
-        master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+        master_port=$(db_get_port_config "xray" "$proto" "8443" 2>/dev/null | jq -r '.port // empty')
         if [[ "$master_port" == "8443" ]]; then
             has_master=true
             break
@@ -6277,6 +6469,11 @@ ask_port() {
             _err "无效端口: $custom_port" >&2
             _warn "端口必须是 1-65535 之间的数字" >&2
             continue # 跳过本次循环，让用户重输
+        fi
+
+        if [[ "$protocol" == "mieru" && $custom_port -lt 1025 ]]; then
+            _err "mieru 端口必须是 1025-65535" >&2
+            continue
         fi
         
         # 0.1 检查是否使用了系统保留端口
@@ -7232,10 +7429,10 @@ gen_mierus_link() {
         host="$ip"
     fi
     name=$(_share_node_name "$ip" "$country" "mieru")
-    name_q=$(urlencode "$name")
-    user_enc=$(urlencode "$username")
-    pass_enc=$(urlencode "$password")
-    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_OFF&port=${port}&profile=${name_q}&protocol=TCP#${name_q}"
+    name_q=$(urlencode_strict "$name")
+    user_enc=$(urlencode_strict "$username")
+    pass_enc=$(urlencode_strict "$password")
+    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_OFF&port=${port}&profile=${name_q}&protocol=TCP"
 }
 
 gen_mieru_link() { gen_mierus_link "$@"; }
@@ -9556,11 +9753,16 @@ _install_binary() {
     local install_ok=false
     case "$install_kind" in
         xray)
+            local xray_candidate="/usr/local/bin/.xray.new.$$"
             _archive_paths_safe "$tmp/pkg" zip &&
             unzip -oq "$tmp/pkg" -d "$tmp/" &&
-            install -m 755 "$tmp/xray" /usr/local/bin/xray &&
+            chmod 755 "$tmp/xray" &&
+            { [[ "${_XRAY_REQUIRE_FINALMASK:-false}" != "true" ]] || _xray_supports_finalmask "$tmp/xray"; } &&
+            { [[ ! -s "$CFG/config.json" ]] || "$tmp/xray" run -test -c "$CFG/config.json" >/dev/null 2>&1 || "$tmp/xray" -test -c "$CFG/config.json" >/dev/null 2>&1; } &&
+            install -m 755 "$tmp/xray" "$xray_candidate" &&
             mkdir -p /usr/local/share/xray &&
             cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null &&
+            mv -f "$xray_candidate" /usr/local/bin/xray &&
             fix_selinux_context && install_ok=true
             ;;
         singbox)
@@ -9587,6 +9789,7 @@ _install_binary() {
             ;;
     esac
     if [[ "$install_ok" != "true" ]]; then
+        [[ -n "${xray_candidate:-}" ]] && rm -f "$xray_candidate"
         rm -rf "$tmp"
         _err "安装 $name 失败（解压、文件校验或安装错误）"
         return 1
@@ -9612,38 +9815,89 @@ install_xray() {
         "$channel" "$force" "$version_override"
 }
 
-# FinalMask/Sudoku 需要足够新的 Xray；探测 streamSettings.finalmask，过旧则覆盖安装。
-_xray_finalmask_min_version="26.3.27"
+# 解析 xray vlessenc 输出。优先读取完整 JSON；文本回退必须各自唯一。
+_parse_vlessenc_output() {
+    local output="$1" decryption="" encryption=""
+    local -a decryptions=() encryptions=()
+    [[ -n "$output" ]] || return 1
 
-_xray_version_ge() {
-    local v1="$1" v2="$2"
-    [[ "$v1" == "$v2" ]] && return 0
-    local IFS=.
-    local i v1_arr=($v1) v2_arr=($v2)
-    for ((i=0; i<${#v1_arr[@]} || i<${#v2_arr[@]}; i++)); do
-        local n1=${v1_arr[i]:-0} n2=${v2_arr[i]:-0}
-        ((n1 > n2)) && return 0
-        ((n1 < n2)) && return 1
-    done
-    return 0
+    if printf '%s\n' "$output" | jq -e 'type == "object" and (.decryption | type == "string") and (.encryption | type == "string")' >/dev/null 2>&1; then
+        decryption=$(printf '%s\n' "$output" | jq -r '.decryption')
+        encryption=$(printf '%s\n' "$output" | jq -r '.encryption')
+    else
+        mapfile -t decryptions < <(printf '%s\n' "$output" | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        mapfile -t encryptions < <(printf '%s\n' "$output" | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        [[ ${#decryptions[@]} -eq 1 && ${#encryptions[@]} -eq 1 ]] || return 1
+        decryption="${decryptions[0]}"
+        encryption="${encryptions[0]}"
+    fi
+
+    [[ -n "$decryption" && -n "$encryption" ]] || return 1
+    ! printf '%s' "$decryption" | LC_ALL=C grep -q '[[:cntrl:]]' || return 1
+    ! printf '%s' "$encryption" | LC_ALL=C grep -q '[[:cntrl:]]' || return 1
+    printf '%s\n%s\n' "$decryption" "$encryption"
 }
 
+# FinalMask/Sudoku 需要足够新的 Xray；版本号只用于选择候选核心。
+_xray_finalmask_min_version="26.3.27"
+
 _xray_supports_finalmask() {
-    check_cmd xray || return 1
+    local xray_bin="${1:-}"
+    if [[ -z "$xray_bin" ]]; then
+        check_cmd xray || return 1
+        xray_bin=$(command -v xray)
+    fi
+    [[ -x "$xray_bin" ]] || return 1
     local stub
-    stub=$(mktemp) || return 1
+    # Xray 26+ requires a recognizable config suffix (bare mktemp fails with "Failed to get format").
+    stub=$(mktemp --suffix=.json) || stub=$(mktemp -t xrayfm.XXXXXX.json) || return 1
     cat > "$stub" << 'EOF'
 {"inbounds":[{"port":1,"protocol":"vless","settings":{"clients":[{"id":"00000000-0000-0000-0000-000000000000"}],"decryption":"none"},"streamSettings":{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{"password":"x","ascii":"prefer_entropy"}}]}}}],"outbounds":[{"protocol":"freedom"}]}
 EOF
-    if xray run -test -c "$stub" >/dev/null 2>&1 || xray -test -c "$stub" >/dev/null 2>&1; then
+    if "$xray_bin" run -test -c "$stub" >/dev/null 2>&1 || "$xray_bin" -test -c "$stub" >/dev/null 2>&1; then
         rm -f "$stub"
         return 0
     fi
     rm -f "$stub"
-    local ver
-    ver=$(_get_core_version xray)
-    [[ "$ver" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
-    _xray_version_ge "$ver" "$_xray_finalmask_min_version"
+    return 1
+}
+
+_install_xray_for_finalmask() {
+    local version_override="${1:-}" backup_file="" was_running=false install_ok=false
+    if check_cmd xray; then
+        backup_file=$(_backup_core_binary "xray") || {
+            _err "无法备份当前 Xray，已终止 FinalMask 核心更新"
+            return 1
+        }
+    fi
+    svc status vless-reality >/dev/null 2>&1 && was_running=true
+
+    _XRAY_REQUIRE_FINALMASK=true
+    if [[ -n "$version_override" ]]; then
+        install_xray "stable" "true" "$version_override" && install_ok=true
+    else
+        install_xray "stable" "true" && install_ok=true
+    fi
+    unset _XRAY_REQUIRE_FINALMASK
+
+    if [[ "$install_ok" == "true" ]] && _xray_supports_finalmask; then
+        if [[ "$was_running" != "true" ]] || svc restart vless-reality >/dev/null 2>&1; then
+            return 0
+        fi
+        _err "新 Xray 无法重启现有服务"
+    fi
+
+    if [[ -n "$backup_file" ]]; then
+        _rollback_core_binary "xray" "$backup_file" || return 1
+        if [[ "$was_running" == "true" ]] &&
+           ! svc restart vless-reality >/dev/null 2>&1 &&
+           ! svc start vless-reality >/dev/null 2>&1; then
+            _err "旧 Xray 已恢复，但原服务状态恢复失败"
+        fi
+    else
+        rm -f /usr/local/bin/xray
+    fi
+    return 1
 }
 
 _ensure_xray_finalmask() {
@@ -9652,11 +9906,14 @@ _ensure_xray_finalmask() {
         return 0
     fi
     _warn "当前 Xray 不支持 FinalMask，尝试安装兼容版本..."
-    install_xray "stable" "true" || true
+    _install_xray_for_finalmask || _warn "最新稳定版 Xray 未通过 FinalMask 校验"
     if _xray_supports_finalmask; then
         return 0
     fi
-    install_xray "stable" "true" "$_xray_finalmask_min_version" || true
+    _install_xray_for_finalmask "$_xray_finalmask_min_version" || {
+        _err "安装最低兼容版本 Xray 失败"
+        return 1
+    }
     if _xray_supports_finalmask; then
         return 0
     fi
@@ -10092,8 +10349,17 @@ _update_core_to_version() {
     # 备份当前版本
     local backup_file
     if ! backup_file=$(_backup_core_binary "$binary_name"); then
-        # 备份失败但继续更新（可能是首次安装）
-        _warn "备份失败，继续更新（无法回滚）"
+        if [[ "$core" == "Xray" || "$core" == "Mieru" ]]; then
+            if check_cmd "$binary_name"; then
+                _err "无法备份当前 ${core}，已终止更新"
+                return 1
+            fi
+            # Xray/mita 首次安装没有可备份的旧核心。
+            _warn "没有可用的旧核心备份"
+        else
+            # 保持其他核心原有更新行为。
+            _warn "备份失败，继续更新（无法回滚）"
+        fi
         backup_file=""
     fi
 
@@ -10109,13 +10375,48 @@ _update_core_to_version() {
 
     # 执行更新
     if "$install_func" "$channel" "true" "$version"; then
+        local validation_ok=true
+        if [[ "$core" == "Xray" ]]; then
+            if [[ -s "$CFG/config.json" ]] &&
+               ! xray run -test -c "$CFG/config.json" >/dev/null 2>&1 &&
+               ! xray -test -c "$CFG/config.json" >/dev/null 2>&1; then
+                _err "新 Xray 无法加载现有完整配置"
+                validation_ok=false
+            fi
+            if [[ "$validation_ok" == "true" ]] && db_exists "xray" "vless-finalmask" && ! _xray_supports_finalmask; then
+                _err "新 Xray 不支持现有 FinalMask 配置"
+                validation_ok=false
+            fi
+        elif [[ "$core" == "Mieru" && -s "$CFG/mieru.json" ]] && ! _mieru_validate_candidate "$CFG/mieru.json"; then
+            _err "新 mita 无法加载现有配置"
+            validation_ok=false
+        fi
+
+        if [[ "$validation_ok" != "true" ]]; then
+            if [[ -n "$backup_file" ]] && ! _rollback_core_binary "$binary_name" "$backup_file"; then
+                _err "旧核心回滚失败，未尝试恢复服务"
+                return 1
+            fi
+            if [[ "$need_restart" == "true" ]] && ! svc start "$service" >/dev/null 2>&1; then
+                _err "旧核心已恢复，但服务启动失败"
+            fi
+            return 1
+        fi
+
         _ok "${core} 内核已更新 (v${version})"
 
         # 重启服务
         if [[ "$need_restart" == "true" ]]; then
             _info "重新启动服务..."
             if ! svc start "$service" 2>/dev/null; then
-                _err "服务启动失败，请手动检查: svc start $service"
+                if [[ "$core" == "Xray" || "$core" == "Mieru" ]]; then
+                    _err "新核心启动服务失败，正在恢复旧核心"
+                    if [[ -n "$backup_file" ]] && _rollback_core_binary "$binary_name" "$backup_file"; then
+                        svc start "$service" >/dev/null 2>&1 || _err "旧核心已恢复，但服务启动失败"
+                    fi
+                else
+                    _err "服务启动失败，请手动检查: svc start $service"
+                fi
                 return 1
             fi
             _ok "服务已启动"
@@ -10128,10 +10429,6 @@ _update_core_to_version() {
             "Snell v5") _show_changelog_summary "surge-networks/snell" "$version" 8 ;;
             Mieru) _show_changelog_summary "enfein/mieru" "$version" 8 ;;
         esac
-        if [[ "$core" == "Xray" ]] && db_exists "xray" "vless-finalmask"; then
-            _ensure_xray_finalmask || _warn "当前 Xray 可能不支持 FinalMask"
-        fi
-
         # 清理旧备份 (保留最近 3 个)
         if [[ -n "$backup_file" ]]; then
             local backup_dir=$(dirname "$backup_file")
@@ -10773,17 +11070,35 @@ update_mieru_core() {
         is_new_install=true
     fi
 
+    local backup_file=""
+    if [[ "$is_new_install" != "true" ]]; then
+        backup_file=$(_backup_core_binary "mita") || {
+            _err "无法备份当前 mita，已终止更新"
+            return 1
+        }
+    fi
+
     local need_restart=false service_running=false
     if svc status vless-mieru 2>/dev/null; then
         service_running=true
         need_restart=true
         _info "停止 vless-mieru 服务..."
         if ! svc stop vless-mieru 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
+            _err "停止服务失败，为避免风险已终止更新"
+            return 1
         fi
     fi
 
     if install_mieru "$channel" "true"; then
+        if [[ -s "$CFG/mieru.json" ]] && ! _mieru_validate_candidate "$CFG/mieru.json"; then
+            _err "新 mita 无法加载现有配置，正在回滚"
+            if [[ -n "$backup_file" ]] && ! _rollback_core_binary "mita" "$backup_file"; then
+                _err "旧 mita 回滚失败，未尝试恢复服务"
+                return 1
+            fi
+            [[ "$service_running" == "true" ]] && { svc start vless-mieru >/dev/null 2>&1 || _err "旧 mita 已恢复，但服务启动失败"; }
+            return 1
+        fi
         _ok "mita 内核已更新"
         local new_version
         new_version=$(_get_core_version mita)
@@ -10795,7 +11110,10 @@ update_mieru_core() {
             if svc start vless-mieru 2>/dev/null; then
                 _ok "服务已启动"
             else
-                _err "服务启动失败，请手动检查: svc start vless-mieru"
+                _err "新 mita 启动失败，正在恢复旧核心"
+                if [[ -n "$backup_file" ]] && _rollback_core_binary "mita" "$backup_file"; then
+                    svc start vless-mieru >/dev/null 2>&1 || _err "旧 mita 已恢复，但服务启动失败"
+                fi
                 return 1
             fi
         fi
@@ -10803,6 +11121,10 @@ update_mieru_core() {
     fi
 
     _err "mita 内核更新失败"
+    if [[ -n "$backup_file" ]] && ! _rollback_core_binary "mita" "$backup_file"; then
+        _err "旧 mita 回滚失败，未尝试恢复服务"
+        return 1
+    fi
     if [[ "$service_running" == "true" ]]; then
         _warn "尝试恢复服务..."
         if svc start vless-mieru 2>/dev/null; then
@@ -12581,7 +12903,17 @@ install_mieru() {
     fi
 
     chmod +x "$mita_bin"
-    if ! install -m 755 "$mita_bin" /usr/local/bin/mita; then
+    if ! "$mita_bin" version >/dev/null 2>&1 &&
+       ! "$mita_bin" --version >/dev/null 2>&1 &&
+       ! "$mita_bin" help >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        _err "候选 mita 二进制无法运行"
+        return 1
+    fi
+
+    local mita_candidate="/usr/local/bin/.mita.new.$$"
+    if ! install -m 755 "$mita_bin" "$mita_candidate" || ! mv -f "$mita_candidate" /usr/local/bin/mita; then
+        rm -f "$mita_candidate"
         rm -rf "$tmp"
         _err "安装 mita 失败"
         return 1
@@ -12677,13 +13009,23 @@ gen_vless_xhttp_server_config() {
 gen_vless_finalmask_server_config() {
     local uuid="$1" port="$2" decryption="$3" encryption="$4"
     local fm_password="$5" fm_ascii="${6:-prefer_entropy}" fm_padding_min="${7:-0}" fm_padding_max="${8:-3}"
+    local new_config stored_config
     mkdir -p "$CFG"
 
-    register_protocol "vless-finalmask" "$(build_config \
+    new_config=$(build_config \
         uuid "$uuid" port "$port" decryption "$decryption" \
         encryption "$encryption" security_mode "encryption" \
         password "$fm_password" ascii "$fm_ascii" \
-        padding_min "$fm_padding_min" padding_max "$fm_padding_max")"
+        padding_min "$fm_padding_min" padding_max "$fm_padding_max") || return 1
+    _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
+    register_protocol "vless-finalmask" "$new_config"
+    stored_config=$(db_get_port_config "xray" "vless-finalmask" "$port" 2>/dev/null) || stored_config=""
+    if [[ -z "$stored_config" ]] ||
+       ! printf '%s\n' "$stored_config" | jq -e --argjson expected "$new_config" '. == $expected' >/dev/null 2>&1; then
+        _err "FinalMask 数据库写入校验失败，正在恢复原配置"
+        _limited_change_rollback
+        return 1
+    fi
     echo "server" > "$CFG/role"
 }
 
@@ -13117,10 +13459,41 @@ EOF
 }
 
 # mieru 服务端意图（只写 db.json，运行时文件由 generate_mieru_config 重建）
+_mieru_entry_is_valid() {
+    local username="$1" password="$2" port="$3" existing=""
+    [[ -n "$username" && -n "$password" ]] || { _err "mieru 用户名和密码不能为空"; return 1; }
+    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1025 && "$port" -le 65535 ]] || {
+        _err "mieru 端口必须是 1025-65535"
+        return 1
+    }
+    if db_exists "xray" "mieru"; then
+        existing=$(db_get "xray" "mieru")
+        if echo "$existing" | jq -e --arg user "$username" --arg pass "$password" '
+            (if type == "array" then . else [.] end)
+            | any(.[]; .username == $user and .password != $pass)
+        ' >/dev/null 2>&1; then
+            _err "mieru 用户名 $username 已使用其他密码"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 gen_mieru_server_config() {
     local username="$1" password="$2" port="$3"
+    local new_config stored_config
     mkdir -p "$CFG"
-    register_protocol "mieru" "$(build_config username "$username" password "$password" port "$port")"
+    _mieru_entry_is_valid "$username" "$password" "$port" || return 1
+    new_config=$(build_config username "$username" password "$password" port "$port") || return 1
+    _limited_change_begin "mieru" || { _err "无法备份 mieru 现有配置"; return 1; }
+    register_protocol "mieru" "$new_config"
+    stored_config=$(db_get_port_config "xray" "mieru" "$port" 2>/dev/null) || stored_config=""
+    if [[ -z "$stored_config" ]] ||
+       ! printf '%s\n' "$stored_config" | jq -e --argjson expected "$new_config" '. == $expected' >/dev/null 2>&1; then
+        _err "mieru 数据库写入校验失败，正在恢复原配置"
+        _limited_change_rollback
+        return 1
+    fi
     echo "server" > "$CFG/role"
 }
 
@@ -20506,10 +20879,14 @@ show_single_protocol_info() {
             local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // empty')
             local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // empty')
             local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
-            local enc_show="$encryption"
-            [[ ${#enc_show} -gt 48 ]] && enc_show="${enc_show:0:48}..."
             echo -e "  UUID: ${G}$uuid${NC}"
-            echo -e "  Encryption: ${G}${enc_show}${NC}"
+            # Show full client encryption (xray vlessenc strings can be very long).
+            if [[ ${#encryption} -le 72 ]]; then
+                echo -e "  Encryption: ${G}${encryption}${NC}"
+            else
+                echo -e "  Encryption:"
+                echo -e "  ${G}${encryption}${NC}"
+            fi
             echo -e "  ascii: ${G}${fm_ascii:-prefer_entropy}${NC}  padding: ${G}${fm_pmin:-0}-${fm_pmax:-3}${NC}"
             ;;
         vless-xhttp-cdn)
@@ -20930,7 +21307,7 @@ show_single_protocol_info() {
             if [[ -n "$link" ]]; then
                 echo -e "  ${G}$link${NC}"
                 echo ""
-                echo -e "  ${D}仅新版 v2rayN 识别 fm=；码较密，扫丢字段时用 JSON${NC}"
+                echo -e "  ${D}仅新版 v2rayN 识别 fm=；二维码较密，失败时请复制完整分享链接${NC}"
                 echo ""
                 echo -e "  ${C}二维码:${NC}"
                 echo -e "  ${G}$(gen_qr "$link")${NC}"
@@ -21542,7 +21919,13 @@ uninstall_specific_protocol() {
         else
             # mieru 支持单端口移除并重建聚合配置
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            db_remove_port "xray" "$selected_protocol" "$SELECTED_PORT"
+            _limited_change_begin "mieru" || { _err "无法备份 mieru 现有配置"; _pause; return 1; }
+            if ! db_remove_port "xray" "$selected_protocol" "$SELECTED_PORT"; then
+                _limited_change_rollback
+                _err "删除 mieru 监听失败"
+                _pause
+                return 1
+            fi
             
             local remaining_ports=$(db_list_ports "xray" "$selected_protocol")
             if [[ -z "$remaining_ports" ]]; then
@@ -21558,14 +21941,20 @@ uninstall_specific_protocol() {
                     rm -f "/etc/systemd/system/${service_name}.service"
                     systemctl daemon-reload
                 fi
+                _limited_change_commit
             else
                 echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行，正在重建配置并重启服务...${NC}"
-                rm -f "$CFG/mieru.json"
                 if generate_mieru_config; then
-                    svc restart "$service_name" 2>/dev/null || svc start "$service_name" 2>/dev/null
-                    _ok "mieru 配置已更新"
+                    if svc restart "$service_name" 2>/dev/null || svc start "$service_name" 2>/dev/null; then
+                        _limited_change_commit
+                        _ok "mieru 配置已更新"
+                    else
+                        _err "mieru 服务重启失败"
+                        _limited_change_rollback
+                    fi
                 else
                     _err "mieru 配置生成失败"
+                    _limited_change_rollback
                 fi
             fi
         fi
@@ -22010,8 +22399,8 @@ do_install_server() {
         fi
     fi
     
-    # 只有 SS2022 需要时间同步
-    if [[ "$protocol" == "ss2022" || "$protocol" == "ss2022-shadowtls" ]]; then
+    # SS2022 与 mieru 的认证都依赖准确系统时间。
+    if [[ "$protocol" == "ss2022" || "$protocol" == "ss2022-shadowtls" || "$protocol" == "mieru" ]]; then
         sync_time
     fi
 
@@ -22170,12 +22559,12 @@ do_install_server() {
         vless)
             if [[ "${VLESS_SECURITY_MODE:-reality}" == "encryption" ]]; then
                 local uuid=$(gen_uuid)
-                local vlessenc_output decryption_config encryption_config
+                local vlessenc_output parsed_vlessenc decryption_config encryption_config
                 vlessenc_output=$(xray vlessenc 2>/dev/null)
                 [[ -z "$vlessenc_output" ]] && { _err "VLESS Encryption 参数生成失败"; _pause; return 1; }
-                decryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"decryption": "\([^"]*\)".*/\1/p' | head -n1)
-                encryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"encryption": "\([^"]*\)".*/\1/p' | head -n1)
-                [[ -z "$decryption_config" || -z "$encryption_config" ]] && { _err "无法解析 VLESS Encryption 参数"; _pause; return 1; }
+                parsed_vlessenc=$(_parse_vlessenc_output "$vlessenc_output") || { _err "无法唯一解析 VLESS Encryption 参数"; _pause; return 1; }
+                decryption_config="${parsed_vlessenc%%$'\n'*}"
+                encryption_config="${parsed_vlessenc#*$'\n'}"
 
                 echo ""
                 _line
@@ -22366,12 +22755,12 @@ do_install_server() {
             ;;
         vless-finalmask)
             local uuid=$(gen_uuid)
-            local vlessenc_output decryption_config encryption_config
+            local vlessenc_output parsed_vlessenc decryption_config encryption_config
             vlessenc_output=$(xray vlessenc 2>/dev/null)
             [[ -z "$vlessenc_output" ]] && { _err "VLESS Encryption 参数生成失败"; _pause; return 1; }
-            decryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"decryption": "\([^"]*\)".*/\1/p' | head -n1)
-            encryption_config=$(printf '%s\n' "$vlessenc_output" | sed -n 's/.*"encryption": "\([^"]*\)".*/\1/p' | head -n1)
-            [[ -z "$decryption_config" || -z "$encryption_config" ]] && { _err "无法解析 VLESS Encryption 参数"; _pause; return 1; }
+            parsed_vlessenc=$(_parse_vlessenc_output "$vlessenc_output") || { _err "无法唯一解析 VLESS Encryption 参数"; _pause; return 1; }
+            decryption_config="${parsed_vlessenc%%$'\n'*}"
+            encryption_config="${parsed_vlessenc#*$'\n'}"
 
             local fm_password
             fm_password=$(ask_password 16 "FinalMask密码")
@@ -22414,7 +22803,7 @@ do_install_server() {
 
             _info "生成配置..."
             gen_vless_finalmask_server_config "$uuid" "$port" "$decryption_config" "$encryption_config" \
-                "$fm_password" "$fm_ascii" "$fm_padding_min" "$fm_padding_max"
+                "$fm_password" "$fm_ascii" "$fm_padding_min" "$fm_padding_max" || { _pause; return 1; }
             ;;
         vless-ws)
             # 子菜单：选择 TLS 模式或 CF Tunnel 模式
@@ -22478,11 +22867,13 @@ do_install_server() {
                 local master_domain=""
                 local master_protocol=""
                 local master_port=""
+                local master_cfg=""
                 for proto in vless vless-vision trojan; do
                     if db_exists "xray" "$proto"; then
-                        master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+                        master_cfg=$(db_get_port_config "xray" "$proto" "8443" 2>/dev/null)
+                        master_port=$(echo "$master_cfg" | jq -r '.port // empty' 2>/dev/null)
                         if [[ "$master_port" == "8443" ]]; then
-                            master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
+                            master_domain=$(echo "$master_cfg" | jq -r '.sni // empty' 2>/dev/null)
                             master_protocol="$proto"
                             break
                         fi
@@ -22559,11 +22950,13 @@ do_install_server() {
             local master_domain=""
             local master_protocol=""
             local master_port=""
+            local master_cfg=""
             for proto in vless vless-vision trojan; do
                 if db_exists "xray" "$proto"; then
-                    master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
+                    master_cfg=$(db_get_port_config "xray" "$proto" "8443" 2>/dev/null)
+                    master_port=$(echo "$master_cfg" | jq -r '.port // empty' 2>/dev/null)
                     if [[ "$master_port" == "8443" ]]; then
-                        master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
+                        master_domain=$(echo "$master_cfg" | jq -r '.sni // empty' 2>/dev/null)
                         master_protocol="$proto"
                         break
                     fi
@@ -23410,14 +23803,14 @@ do_install_server() {
             read -rp "  确认安装? [Y/n]: " confirm
             [[ "$confirm" =~ ^[nN]$ ]] && return
             _info "生成配置..."
-            gen_mieru_server_config "$username" "$password" "$port"
+            gen_mieru_server_config "$username" "$password" "$port" || { _pause; return 1; }
             ;;
     esac
     
     _info "创建服务..."
     create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
     if [[ "$protocol" == "mieru" ]]; then
-        generate_mieru_config || { _err "mieru 配置生成失败"; _pause; return 1; }
+        generate_mieru_config || { _err "mieru 配置生成失败"; _limited_change_rollback; _pause; return 1; }
     fi
     create_service "$protocol"
     _info "启动服务..."
@@ -23429,16 +23822,17 @@ do_install_server() {
     # 不能只依赖数据库枚举，否则数据库结构异常时会出现 unit 已创建但从未启动的情况。
     if [[ " $STANDALONE_PROTOCOLS " == *" $current_protocol "* ]]; then
         local current_service="${PROTO_SVC[$current_protocol]:-vless-${current_protocol}}"
-        svc enable "$current_service" || { _err "$current_service 设置开机启动失败"; _pause; return 1; }
+        svc enable "$current_service" || { _err "$current_service 设置开机启动失败"; _limited_change_rollback; _pause; return 1; }
         if svc status "$current_service" >/dev/null 2>&1; then
-            svc restart "$current_service" || { _err "$current_service 重启失败"; _pause; return 1; }
+            svc restart "$current_service" || { _err "$current_service 重启失败"; _limited_change_rollback; _pause; return 1; }
         else
-            svc start "$current_service" || { _err "$current_service 启动失败"; _pause; return 1; }
+            svc start "$current_service" || { _err "$current_service 启动失败"; _limited_change_rollback; _pause; return 1; }
         fi
         sleep 1
         if ! svc status "$current_service" >/dev/null 2>&1; then
             _err "$current_service 启动后未保持运行"
             [[ "$DISTRO" != "alpine" ]] && systemctl status "$current_service" --no-pager -l || true
+            _limited_change_rollback
             _pause
             return 1
         fi
@@ -23446,6 +23840,7 @@ do_install_server() {
     fi
     
     if start_services; then
+        _limited_change_commit
         create_shortcut   # 安装成功才创建快捷命令
 
         # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
@@ -23544,6 +23939,7 @@ do_install_server() {
         _pause
     else
         _err "安装失败"
+        _limited_change_rollback
         _pause
     fi
 }
@@ -27781,7 +28177,7 @@ _gen_user_share_link() {
                 local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
                 local fm_pmin=$(echo "$cfg" | jq -r '.padding_min // 0')
                 local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // 3')
-                link=$(gen_vless_finalmask_link "$ipv4" "$display_port" "$uuid" "$encryption" "$fm_password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$country_code")
+                link=$(gen_vless_finalmask_link "$ipv4" "$display_port" "$uuid" "$encryption" "$fm_password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$remark")
                 ;;
             mieru)
                 local m_user=$(echo "$cfg" | jq -r '.username // empty')
@@ -28159,6 +28555,12 @@ _add_user() {
     read -rp "  确认添加? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
+    local used_backup=0
+    if [[ "$proto" == "vless-finalmask" ]]; then
+        _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
+        used_backup=1
+    fi
+
     # 添加到数据库 (包含 expire_date)
     if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date"; then
         _ok "用户 $name 添加成功"
@@ -28169,12 +28571,19 @@ _add_user() {
             _ok "路由配置: $routing_display"
         fi
         
-        # 重新生成配置
         _info "更新配置..."
-        _regenerate_config "$core" "$proto"
-        
-        _ok "配置已更新"
+        if _regenerate_config "$core" "$proto"; then
+            [[ "$used_backup" == "1" ]] && _limited_change_commit
+            _ok "配置已更新"
+        else
+            _err "配置更新失败"
+            if [[ "$used_backup" == "1" ]]; then
+                _limited_change_rollback || true
+            fi
+            return 1
+        fi
     else
+        [[ "$used_backup" == "1" ]] && _limited_change_commit
         _err "添加失败"
     fi
 }
@@ -28222,15 +28631,26 @@ _delete_user() {
             read -rp "  确认删除用户 $name? [y/N]: " confirm
             [[ ! "$confirm" =~ ^[yY]$ ]] && return
             
+            local used_backup=0
+            if [[ "$proto" == "vless-finalmask" ]]; then
+                _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
+                used_backup=1
+            fi
             if db_del_user "$core" "$proto" "$name"; then
                 _ok "用户 $name 已删除"
-                
-                # 重新生成配置
                 _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
-                _ok "配置已更新"
+                if _regenerate_config "$core" "$proto"; then
+                    [[ "$used_backup" == "1" ]] && _limited_change_commit
+                    _ok "配置已更新"
+                else
+                    _err "配置更新失败"
+                    if [[ "$used_backup" == "1" ]]; then
+                        _limited_change_rollback || true
+                    fi
+                    return 1
+                fi
             else
+                [[ "$used_backup" == "1" ]] && _limited_change_commit
                 _err "删除失败"
             fi
             return
@@ -28401,15 +28821,26 @@ _toggle_user() {
                 action="禁用"
             fi
             
+            local used_backup=0
+            if [[ "$proto" == "vless-finalmask" ]]; then
+                _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
+                used_backup=1
+            fi
             if db_set_user_enabled "$core" "$proto" "$name" "$new_state"; then
                 _ok "用户 $name 已${action}"
-                
-                # 重新生成配置
                 _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
-                _ok "配置已更新"
+                if _regenerate_config "$core" "$proto"; then
+                    [[ "$used_backup" == "1" ]] && _limited_change_commit
+                    _ok "配置已更新"
+                else
+                    _err "配置更新失败"
+                    if [[ "$used_backup" == "1" ]]; then
+                        _limited_change_rollback || true
+                    fi
+                    return 1
+                fi
             else
+                [[ "$used_backup" == "1" ]] && _limited_change_commit
                 _err "操作失败"
             fi
             return
@@ -28490,9 +28921,27 @@ _set_user_expire_date() {
                 if [[ "$enabled" != "true" && -n "$new_expire" ]]; then
                     read -rp "  用户当前已禁用，是否启用? [y/N]: " enable_now
                     if [[ "$enable_now" =~ ^[yY]$ ]]; then
-                        db_set_user_enabled "$core" "$proto" "$name" true
-                        _regenerate_config "$core" "$proto"
-                        _ok "用户已启用"
+                        local used_backup=0
+                        if [[ "$proto" == "vless-finalmask" ]]; then
+                            _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
+                            used_backup=1
+                        fi
+                        if db_set_user_enabled "$core" "$proto" "$name" true; then
+                            _info "更新配置..."
+                            if _regenerate_config "$core" "$proto"; then
+                                [[ "$used_backup" == "1" ]] && _limited_change_commit
+                                _ok "用户已启用"
+                            else
+                                _err "配置更新失败"
+                                if [[ "$used_backup" == "1" ]]; then
+                                    _limited_change_rollback || true
+                                fi
+                                return 1
+                            fi
+                        else
+                            [[ "$used_backup" == "1" ]] && _limited_change_commit
+                            _err "启用失败"
+                        fi
                     fi
                 fi
             else
@@ -28516,7 +28965,7 @@ _regenerate_config() {
         if [[ "$proto" == "mieru" ]]; then
             generate_mieru_config || { _err "mieru 配置生成失败"; return 1; }
             if svc status vless-mieru 2>/dev/null; then
-                svc restart vless-mieru 2>/dev/null || true
+                svc restart vless-mieru 2>/dev/null || { _err "mieru 服务重启失败"; return 1; }
             fi
         fi
         return 0
