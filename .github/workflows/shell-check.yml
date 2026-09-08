@@ -1,0 +1,62 @@
+name: shell-check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: bash-n and version sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax (blocking)
+        run: bash -n vless-server.sh
+
+      - name: Version consistency (blocking)
+        run: |
+          set -euo pipefail
+          SCRIPT_VER=$(grep -m1 '^readonly VERSION=' vless-server.sh | cut -d'"' -f2)
+          if [[ -z "$SCRIPT_VER" ]]; then
+            echo "Failed to extract readonly VERSION from vless-server.sh"
+            exit 1
+          fi
+          echo "SCRIPT_VERSION=${SCRIPT_VER}"
+
+          README_VER=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' README.md | head -n1)
+          README_CN_VER=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' README_CN.md | head -n1)
+          echo "README_VERSION=${README_VER}"
+          echo "README_CN_VERSION=${README_CN_VER}"
+
+          if [[ -z "$README_VER" || -z "$README_CN_VER" ]]; then
+            echo "Failed to extract current version fields from README.md / README_CN.md"
+            exit 1
+          fi
+          if [[ "$README_VER" != "$SCRIPT_VER" ]]; then
+            echo "README.md current version (${README_VER}) != script VERSION (${SCRIPT_VER})"
+            exit 1
+          fi
+          if [[ "$README_CN_VER" != "$SCRIPT_VER" ]]; then
+            echo "README_CN.md current version (${README_CN_VER}) != script VERSION (${SCRIPT_VER})"
+            exit 1
+          fi
+          echo "VERSION_SYNC=PASS"
+
+      - name: ShellCheck (informational, non-blocking)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Historical fat script: record findings but never fail the job.
+          set +e
+          shellcheck -f gcc vless-server.sh | tee shellcheck-report.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "SHELLCHECK_EXIT=${rc} (non-blocking)"
+          exit 0
