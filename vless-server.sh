@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.18 [服务端]
+#  多协议代理一键部署脚本 v3.5.19 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.18"
+readonly VERSION="3.5.19"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -7256,11 +7256,18 @@ EOF
 gen_qr() {
     local text="$1"
     local margin="${2:-2}"
-    if command -v qrencode &>/dev/null; then
-        echo "$text" | qrencode -t UTF8 -l M -m "$margin" 2>/dev/null && return 0
-        echo "$text" | qrencode -t UTF8 -l L -m "$margin" 2>/dev/null && return 0
+    if ! command -v qrencode &>/dev/null; then
+        echo "[需安装 qrencode 才能显示二维码]"
+        return 1
     fi
-    echo "[需安装 qrencode 才能显示二维码]"
+    if echo "$text" | qrencode -t UTF8 -l M -m "$margin" 2>/dev/null; then
+        return 0
+    fi
+    if echo "$text" | qrencode -t UTF8 -l L -m "$margin" 2>/dev/null; then
+        return 0
+    fi
+    # qrencode 已安装但仍失败：常见于分享链接过长，超出单 QR 容量
+    echo "[二维码生成失败：分享链接过长或 qrencode 无法编码，请复制完整分享链接]"
     return 1
 }
 
@@ -9815,7 +9822,7 @@ install_xray() {
         "$channel" "$force" "$version_override"
 }
 
-# 解析 xray vlessenc 输出。优先完整 JSON；多 Authentication 按 section 配对，默认选 ML-KEM-768。
+# 解析 xray vlessenc 输出。优先完整 JSON；多 Authentication 按 section 配对，默认选 X25519。
 _parse_vlessenc_output() {
     local output="$1" decryption="" encryption=""
     local -a decryptions=() encryptions=()
@@ -9871,15 +9878,16 @@ _parse_vlessenc_output() {
                 fi
             done <<< "$output"
 
-            # ML-KEM section 出现则必须完整且唯一字段；不完整则 fail-closed（不静默 fallback）
-            if [[ "$ml_seen" -eq 1 ]]; then
-                [[ "$ml_d" -eq 1 && "$ml_e" -eq 1 && -n "$ml_dec" && -n "$ml_enc" ]] || return 1
-                decryption="$ml_dec"
-                encryption="$ml_enc"
-            elif [[ "$x_seen" -eq 1 ]]; then
+            # 默认优先完整 X25519（短分享/QR）；X25519 section 出现但不完整则 fail-closed。
+            # 仅当完全没有 X25519 section 时，才选用完整 ML-KEM-768。禁止跨 section 混配。
+            if [[ "$x_seen" -eq 1 ]]; then
                 [[ "$x_d" -eq 1 && "$x_e" -eq 1 && -n "$x_dec" && -n "$x_enc" ]] || return 1
                 decryption="$x_dec"
                 encryption="$x_enc"
+            elif [[ "$ml_seen" -eq 1 ]]; then
+                [[ "$ml_d" -eq 1 && "$ml_e" -eq 1 && -n "$ml_dec" && -n "$ml_enc" ]] || return 1
+                decryption="$ml_dec"
+                encryption="$ml_enc"
             else
                 return 1
             fi
@@ -20941,13 +20949,8 @@ show_single_protocol_info() {
             local fm_pmax=$(echo "$cfg" | jq -r '.padding_max // empty')
             local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
             echo -e "  UUID: ${G}$uuid${NC}"
-            # Show full client encryption (xray vlessenc strings can be very long).
-            if [[ ${#encryption} -le 72 ]]; then
-                echo -e "  Encryption: ${G}${encryption}${NC}"
-            else
-                echo -e "  Encryption:"
-                echo -e "  ${G}${encryption}${NC}"
-            fi
+            # 配置详情显示完整 encryption（DB/分享/二维码同值）
+            echo -e "  Encryption: ${G}${encryption}${NC}"
             echo -e "  ascii: ${G}${fm_ascii:-prefer_entropy}${NC}  padding: ${G}${fm_pmin:-0}-${fm_pmax:-3}${NC}"
             ;;
         vless-xhttp-cdn)
