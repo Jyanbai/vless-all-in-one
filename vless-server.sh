@@ -3692,6 +3692,24 @@ register_protocol() {
         _err "拒绝注册 ${protocol}：端口无效 (需要 1-65535)，未写入数据库"
         return 1
     fi
+
+    # ssh-tunnel：同端口视为更新（D→R 等 mode/bind 变更），禁止 db_add_port 跳过导致 drop-in 不重建
+    if [[ "$protocol" == "ssh-tunnel" ]]; then
+        local _st_ports
+        _st_ports=$(db_list_ports "$core" "$protocol" 2>/dev/null || true)
+        if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+            echo -e "  ${CYAN}覆盖端口 $REPLACE_PORT 的 SSH Tunnel 配置...${NC}"
+            db_update_port "$core" "$protocol" "$REPLACE_PORT" "$config_json"
+            unset INSTALL_MODE REPLACE_PORT
+            return 0
+        fi
+        if echo "$_st_ports" | grep -q "^${port}$"; then
+            echo -e "  ${CYAN}更新端口 $port 的 SSH Tunnel 配置 (mode/bind/keys)...${NC}"
+            db_update_port "$core" "$protocol" "$port" "$config_json"
+            unset INSTALL_MODE REPLACE_PORT
+            return 0
+        fi
+    fi
     
     # 根据安装模式处理
     if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
