@@ -6516,6 +6516,14 @@ force_cleanup() {
     services+=" snell-shadowtls snell-v5-shadowtls ss2022-shadowtls naive mieru"
     services+=" snell-shadowtls-backend snell-v5-shadowtls-backend ss2022-shadowtls-backend"
     for s in $services; do svc stop "vless-$s" 2>/dev/null; done
+
+    # SSH Tunnel leftovers (drop-in + keys); never stop system sshd
+    if declare -F _ssh_tunnel_remove_runtime >/dev/null 2>&1; then
+        _ssh_tunnel_remove_runtime
+    else
+        rm -f "/etc/ssh/sshd_config.d/99-vless-ssh-tunnel.conf" 2>/dev/null || true
+        rm -rf "${CFG:-/etc/vless}/ssh-tunnel" 2>/dev/null || true
+    fi
     
     # 清理 iptables NAT 规则
     cleanup_hy2_nat_rules
@@ -14179,6 +14187,22 @@ _ssh_tunnel_authorized_keys_path() {
     printf '%s\n' "$CFG/ssh-tunnel/${user}/authorized_keys"
 }
 
+
+_ssh_tunnel_ensure_keys_parent() {
+    # Parent must be 0755: sshd opens AuthorizedKeysFile as the Match user
+    mkdir -p "$CFG/ssh-tunnel" || return 1
+    chmod 755 "$CFG/ssh-tunnel" || return 1
+}
+
+_ssh_tunnel_remove_runtime() {
+    # Unregister alone is not enough — remove drop-in + key tree and reload sshd
+    local live
+    live=$(_ssh_tunnel_dropin_live)
+    [[ -n "$live" ]] && rm -f "$live"
+    rm -rf "$CFG/ssh-tunnel"
+    _ssh_tunnel_reload || true
+}
+
 _ssh_tunnel_dropin_live() {
     if [[ -d /etc/ssh/sshd_config.d ]]; then
         printf '%s\n' "/etc/ssh/sshd_config.d/${SSH_TUNNEL_DROPIN_NAME}"
@@ -14215,6 +14239,7 @@ _ssh_tunnel_write_authorized_keys() {
     local user="$1" pubkey="$2" dir path
     dir=$(_ssh_tunnel_keys_dir "$user")
     path=$(_ssh_tunnel_authorized_keys_path "$user")
+    _ssh_tunnel_ensure_keys_parent || return 1
     mkdir -p "$dir" || return 1
     # 拒绝把私钥特征写进 authorized_keys
     if printf '%s' "$pubkey" | grep -qE 'BEGIN .*PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY'; then
@@ -14352,7 +14377,7 @@ _ssh_tunnel_admin_verify() {
 
 apply_ssh_tunnel_config() {
     local live cand bak="" built
-    mkdir -p "$CFG/ssh-tunnel"
+    _ssh_tunnel_ensure_keys_parent || return 1
     live=$(_ssh_tunnel_dropin_live)
     cand=$(mktemp "$CFG/ssh-tunnel/.dropin.XXXXXX") || return 1
     built=$(_ssh_tunnel_build_dropin) || { rm -f "$cand"; _err "无有效 ssh-tunnel 配置"; return 1; }
@@ -22885,8 +22910,8 @@ uninstall_specific_protocol() {
         # 根据选择的端口进行卸载
         if [[ "$SELECTED_PORT" == "all" || "$selected_protocol" != "mieru" ]]; then
             echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            # 停止主服务
-            svc stop "$service_name" 2>/dev/null
+            # 停止主服务（ssh-tunnel 无独立 unit，勿碰系统 sshd）
+            [[ "$selected_protocol" != "ssh-tunnel" ]] && svc stop "$service_name" 2>/dev/null
             unregister_protocol "$selected_protocol"
             rm -f "$CFG/${selected_protocol}.join"
             
@@ -22899,8 +22924,11 @@ uninstall_specific_protocol() {
                 snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
                 ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
                 mieru) rm -f "$CFG/mieru.json" ;;
+                ssh-tunnel) _ssh_tunnel_remove_runtime ;;
             esac
             
+            # SSH Tunnel 无独立 vless unit；勿 disable/rm 系统 sshd
+            if [[ "$selected_protocol" != "ssh-tunnel" ]]; then
             # 删除服务文件
             if [[ "$DISTRO" == "alpine" ]]; then
                 rc-update del "$service_name" default 2>/dev/null
@@ -22919,6 +22947,7 @@ uninstall_specific_protocol() {
                     rm -f "/etc/systemd/system/${BACKEND_NAME[$selected_protocol]}.service"
                 fi
                 systemctl daemon-reload
+            fi
             fi
         else
             # mieru 支持单端口移除并重建聚合配置
