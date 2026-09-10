@@ -3670,9 +3670,13 @@ register_protocol() {
         core="singbox"
     fi
     
-    # 获取端口
+    # 获取端口（fail-closed：拒绝空/非法端口写入）
     local port
-    port=$(echo "$config_json" | jq -r '.port')
+    port=$(echo "$config_json" | jq -r '.port // empty')
+    if [[ -z "$port" || "$port" == "null" ]] || ! _is_valid_port "$port"; then
+        _err "拒绝注册 ${protocol}：端口无效 (需要 1-65535)，未写入数据库"
+        return 1
+    fi
     
     # 根据安装模式处理
     if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
@@ -4463,7 +4467,14 @@ generate_xray_config() {
 
             while [[ $i -lt $port_count ]]; do
                 local single_cfg=$(echo "$cfg" | jq ".[$i]")
-                local port=$(echo "$single_cfg" | jq -r '.port')
+                local port=$(echo "$single_cfg" | jq -r '.port // empty')
+
+                # 遗留空端口：只报告并跳过，绝不自动删除原配置。
+                if [[ -z "$port" || "$port" == "null" ]] || ! _is_valid_port "$port"; then
+                    _report_legacy_empty_port "$p" "$i"
+                    ((i++))
+                    continue
+                fi
 
                 # 临时存储单端口配置
                 local tmp_protocol="${p}_port_${port}"
@@ -4488,7 +4499,12 @@ generate_xray_config() {
             fi
         else
             # 单端口模式：使用原有逻辑
-            if add_xray_inbound_v2 "$p"; then
+            local single_port
+            single_port=$(echo "$cfg" | jq -r '.port // empty')
+            if [[ -z "$single_port" || "$single_port" == "null" ]] || ! _is_valid_port "$single_port"; then
+                _report_legacy_empty_port "$p"
+                # 不计入 failed_protocols，避免把遗留脏数据当成本次生成失败去清理。
+            elif add_xray_inbound_v2 "$p"; then
                 ((success_count++))
             else
                 _warn "协议 $p 配置生成失败，跳过"
@@ -5037,7 +5053,10 @@ add_xray_inbound_v2() {
     local username=$(echo "$cfg" | jq -r '.username // empty')
     local method=$(echo "$cfg" | jq -r '.method // empty')
     
-    [[ -z "$port" ]] && return 1
+    if [[ -z "$port" || "$port" == "null" ]] || ! _is_valid_port "$port"; then
+        _report_legacy_empty_port "${base_protocol:-$protocol}"
+        return 1
+    fi
 
     # 生成唯一的 inbound tag（基础协议名 + 端口）
     local inbound_tag="${base_protocol}-${port}"
@@ -13266,6 +13285,8 @@ gen_vless_vision_server_config() {
 gen_ss2022_server_config() {
     local password="$1" port="$2" method="${3:-2022-blake3-aes-128-gcm}"
     mkdir -p "$CFG"
+    _is_valid_port "$port" || { _err "SS2022 端口无效 (需要 1-65535): ${port:-空}"; return 1; }
+    [[ -n "$password" && -n "$method" ]] || { _err "SS2022 参数不完整"; return 1; }
 
     register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")"
     _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
@@ -13649,6 +13670,9 @@ EOF
 gen_ss2022_shadowtls_server_config() {
     local password="$1" port="$2" method="${3:-2022-blake3-aes-256-gcm}" sni="${4:-www.microsoft.com}" stls_password="$5" custom_backend_port="${6:-}"
     mkdir -p "$CFG"
+    # port = ShadowTLS 对外端口；ss_backend_port = SS2022 内部端口
+    _is_valid_port "$port" || { _err "ShadowTLS 对外端口无效 (需要 1-65535): ${port:-空}"; return 1; }
+    [[ -n "$password" && -n "$method" && -n "$stls_password" ]] || { _err "SS2022+ShadowTLS 参数不完整"; return 1; }
     
     # SS2022 后端端口
     local ss_backend_port
@@ -13658,6 +13682,8 @@ gen_ss2022_shadowtls_server_config() {
         ss_backend_port=$((port + 10000))
         [[ $ss_backend_port -gt 65535 ]] && ss_backend_port=$((port - 10000))
     fi
+    _is_valid_port "$ss_backend_port" || { _err "SS2022 内部端口无效 (需要 1-65535): ${ss_backend_port:-空}"; return 1; }
+    [[ "$ss_backend_port" != "$port" ]] || { _err "SS2022 内部端口不能与 ShadowTLS 对外端口相同"; return 1; }
     
     cat > "$CFG/ss2022-shadowtls-backend.json" << EOF
 {
@@ -23298,6 +23324,7 @@ do_install_server() {
             echo ""
             
             local method key_len
+            local stls_protocol="ss2022-shadowtls"
             while true; do
                 read -rp "  选择加密 [1-3]: " enc_choice
                 case $enc_choice in
@@ -23310,8 +23337,8 @@ do_install_server() {
             
             local password=$(head -c $key_len /dev/urandom 2>/dev/null | base64 -w 0)
             
-            # 使用前面询问的结果
-            if [[ -n "$stls_protocol" && "$enable_stls_pre" =~ ^[yY]$ ]]; then
+            # ShadowTLS=Y → 必须走 ss2022-shadowtls（对外端口 / 内部端口分离）
+            if [[ "$enable_stls_pre" =~ ^[yY]$ ]]; then
                 # 安装 ShadowTLS
                 _info "安装 ShadowTLS..."
                 install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
@@ -23328,10 +23355,14 @@ do_install_server() {
                 # ShadowTLS 监听端口（对外暴露）
                 echo ""
                 echo -e "  ${D}ShadowTLS 监听端口 (对外暴露，建议 443)${NC}"
-                local stls_port=$(ask_port "ss2022-shadowtls")
+                local stls_port
+                stls_port=$(ask_port "$stls_protocol") || { _warn "已取消端口配置"; return 1; }
+                _is_valid_port "$stls_port" || { _err "ShadowTLS 对外端口无效 (需要 1-65535)"; return 1; }
                 
-                # SS2022 内部端口（自动随机生成）
-                local internal_port=$(gen_port)
+                # SS2022 内部端口（自动随机生成，不对外暴露）
+                local internal_port
+                internal_port=$(gen_port)
+                _is_valid_port "$internal_port" || { _err "SS2022 内部端口生成失败"; return 1; }
                 
                 echo ""
                 _line
@@ -23351,9 +23382,10 @@ do_install_server() {
                 SELECTED_PROTOCOL="ss2022-shadowtls"
                 
                 _info "生成配置..."
-                gen_ss2022_shadowtls_server_config "$password" "$stls_port" "$method" "$final_sni" "$stls_password" "$internal_port"
+                gen_ss2022_shadowtls_server_config "$password" "$stls_port" "$method" "$final_sni" "$stls_password" "$internal_port"                     || { _err "SS2022+ShadowTLS 配置生成失败"; _pause; return 1; }
             else
-                # 普通 SS2022 模式
+                # 普通 SS2022 模式：端口 fail-closed 1-65535
+                _is_valid_port "$port" || { _err "SS2022 端口无效 (需要 1-65535): ${port:-空}"; return 1; }
                 echo ""
                 _line
                 echo -e "  ${C}Shadowsocks 2022 配置${NC}"
@@ -23367,7 +23399,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_ss2022_server_config "$password" "$port" "$method"
+                gen_ss2022_server_config "$password" "$port" "$method"                     || { _err "SS2022 配置生成失败"; _pause; return 1; }
             fi
             ;;
         ss-legacy)
@@ -25361,6 +25393,16 @@ reset_sub_uuid() {
 _is_valid_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+# 报告历史遗留的空端口实例；只告警，绝不自动删除数据库条目。
+_report_legacy_empty_port() {
+    local protocol="$1" idx="${2:-}"
+    if [[ -n "$idx" ]]; then
+        _warn "检测到 ${protocol} 遗留空端口实例 (index=${idx})，已跳过写入配置；请人工检查 db.json，脚本不会自动删除"
+    else
+        _warn "检测到 ${protocol} 遗留空端口实例，已跳过写入配置；请人工检查 db.json，脚本不会自动删除"
+    fi
 }
 
 _is_valid_ipv4_literal() {
