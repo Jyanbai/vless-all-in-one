@@ -3670,6 +3670,19 @@ register_protocol() {
         core="singbox"
     fi
     
+    # mieru v2：整段数组写入，不走通用单端口 fail-closed。
+    if [[ "$protocol" == "mieru" ]]; then
+        if echo "$config_json" | jq -e 'type=="array"' >/dev/null 2>&1; then
+            if ! _mieru_validate_schema_v2 "$config_json"; then
+                _err "拒绝注册 mieru：schema v2 无效，未写入数据库"
+                return 1
+            fi
+            db_add "$core" "$protocol" "$config_json"
+            unset INSTALL_MODE REPLACE_PORT
+            return 0
+        fi
+    fi
+
     # 获取端口（fail-closed：拒绝空/非法端口写入）
     local port
     port=$(echo "$config_json" | jq -r '.port // empty')
@@ -4820,13 +4833,22 @@ _mieru_validate_candidate() {
         (.portBindings | type == "array" and length > 0) and
         (.users | type == "array" and length > 0) and
         (all(.portBindings[];
-            (.protocol == "TCP") and
-            (.port | type == "number") and
-            (.port >= 1025 and .port <= 65535))) and
+            ((.protocol == "TCP") or (.protocol == "UDP")) and
+            (
+                ((.port | type) == "number" and .port >= 1025 and .port <= 65535)
+                or
+                (
+                    ((.portRange // "") | type) == "string" and
+                    ((.portRange // "") | test("^[0-9]+-[0-9]+$"))
+                )
+            ))) and
         (all(.users[];
             ((.name // "") | type == "string" and length > 0) and
             ((.password // "") | type == "string" and length > 0))) and
-        ([.users | group_by(.name)[] | (map(.password) | unique | length)] | all(. <= 1))
+        ([.users | group_by(.name)[] | (map(.password) | unique | length)] | all(. <= 1)) and
+        ((.trafficPattern == null) or
+         ((.trafficPattern.seed | type) == "number" and
+          ((.trafficPattern.unlockAll | type) == "boolean")))
     ' "$candidate" >/dev/null 2>&1 || {
         _err "mieru 候选配置字段无效或存在同名异密用户"
         return 1
@@ -4874,7 +4896,480 @@ _mieru_validate_candidate() {
     return "$rc"
 }
 
-# 从数据库重建 mita 运行时配置（多监听共享用户池，不写入 portRange）
+
+#═══════════════════════════════════════════════════════════════════════════════
+# mieru schema v2 helpers (TCP/UDP, port|port_range, trafficPattern Advanced)
+#═══════════════════════════════════════════════════════════════════════════════
+_mieru_today() { date '+%Y-%m-%d'; }
+
+_mieru_new_seed() {
+    local s
+    s=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [[ "$s" =~ ^[0-9]+$ ]] || s="$RANDOM"
+    echo "$s"
+}
+
+_mieru_valid_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && [[ "$p" -ge 1025 && "$p" -le 65535 ]]
+}
+
+_mieru_valid_port_range() {
+    local r="$1" a b
+    [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+    a="${BASH_REMATCH[1]}"
+    b="${BASH_REMATCH[2]}"
+    _mieru_valid_port "$a" && _mieru_valid_port "$b" && [[ "$a" -le "$b" ]]
+}
+
+_mieru_valid_transport() {
+    [[ "$1" == "TCP" || "$1" == "UDP" ]]
+}
+
+_mieru_valid_traffic_pattern() {
+    case "$1" in
+        off|conservative|unlocked) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_mieru_valid_multiplexing() {
+    case "$1" in
+        MULTIPLEXING_OFF|MULTIPLEXING_LOW|MULTIPLEXING_MIDDLE|MULTIPLEXING_HIGH) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_mieru_valid_handshake() {
+    case "$1" in
+        HANDSHAKE_STANDARD|HANDSHAKE_NO_WAIT) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_mieru_dns_policies() {
+    printf '%s\n' "USE_FIRST_IP" "PREFER_IPv4" "PREFER_IPv6" "ONLY_IPv4" "ONLY_IPv6"
+}
+
+_mieru_valid_dns_policy() {
+    local p="$1"
+    _mieru_dns_policies | grep -qx "$p"
+}
+
+_mieru_valid_mtu() {
+    local m="$1"
+    [[ "$m" =~ ^[0-9]+$ ]] && [[ "$m" -ge 1280 && "$m" -le 1400 ]]
+}
+
+_mieru_valid_expire_date() {
+    local d="$1"
+    [[ -z "$d" ]] && return 0
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    date -d "$d" '+%Y-%m-%d' >/dev/null 2>&1 || date -j -f '%Y-%m-%d' "$d" '+%Y-%m-%d' >/dev/null 2>&1
+}
+
+_mieru_validate_quotas() {
+    local quotas="$1"
+    echo "$quotas" | jq -e '
+        type=="array" and
+        (map(.days) | unique | length) == length and
+        all(.[]; (.days|type)=="number" and .days > 0 and (.megabytes|type)=="number" and .megabytes > 0)
+    ' >/dev/null 2>&1
+}
+
+_mieru_legacy_settings() {
+    jq -n --argjson seed "$(_mieru_new_seed)" '{
+        mtu: 1400,
+        multiplexing: "MULTIPLEXING_OFF",
+        handshake: "HANDSHAKE_NO_WAIT",
+        dns_dualstack: "USE_FIRST_IP",
+        user_hint_mandatory: false,
+        traffic_pattern_mode: "off",
+        traffic_pattern_seed: $seed
+    }'
+}
+
+_mieru_new_settings() {
+    local tp_mode="${1:-off}" tp_seed="${2:-}"
+    [[ -n "$tp_seed" ]] || tp_seed=$(_mieru_new_seed)
+    _mieru_valid_traffic_pattern "$tp_mode" || tp_mode="off"
+    jq -n --argjson seed "$tp_seed" --arg mode "$tp_mode" '{
+        mtu: 1400,
+        multiplexing: "MULTIPLEXING_LOW",
+        handshake: "HANDSHAKE_STANDARD",
+        dns_dualstack: "USE_FIRST_IP",
+        user_hint_mandatory: false,
+        traffic_pattern_mode: $mode,
+        traffic_pattern_seed: $seed
+    }'
+}
+
+_mieru_validate_binding() {
+    local b="$1" port prange transport
+    port=$(echo "$b" | jq -r '.port // empty')
+    prange=$(echo "$b" | jq -r '.port_range // empty')
+    transport=$(echo "$b" | jq -r '.transport // "TCP"')
+    _mieru_valid_transport "$transport" || return 1
+    if [[ -n "$port" && -n "$prange" ]]; then
+        return 1
+    fi
+    if [[ -n "$port" ]]; then
+        _mieru_valid_port "$port"
+        return
+    fi
+    if [[ -n "$prange" ]]; then
+        _mieru_valid_port_range "$prange"
+        return
+    fi
+    return 1
+}
+
+_mieru_binding_span() {
+    local b="$1" port prange
+    port=$(echo "$b" | jq -r '.port // empty')
+    prange=$(echo "$b" | jq -r '.port_range // empty')
+    if [[ -n "$port" ]]; then
+        printf '%s %s\n' "$port" "$port"
+        return 0
+    fi
+    if [[ "$prange" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# Same-transport numeric overlap is invalid. TCP and UDP may share a number.
+_mieru_bindings_overlap() {
+    local arr="$1" n i j ti tj a1 a2 b1 b2
+    n=$(echo "$arr" | jq 'length')
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    for ((i=0; i<n; i++)); do
+        ti=$(echo "$arr" | jq -r ".[$i].transport // \"TCP\"")
+        read -r a1 a2 < <(_mieru_binding_span "$(echo "$arr" | jq -c ".[$i]")") || continue
+        for ((j=i+1; j<n; j++)); do
+            tj=$(echo "$arr" | jq -r ".[$j].transport // \"TCP\"")
+            [[ "$ti" == "$tj" ]] || continue
+            read -r b1 b2 < <(_mieru_binding_span "$(echo "$arr" | jq -c ".[$j]")") || continue
+            if [[ "$a1" -le "$b2" && "$b1" -le "$a2" ]]; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+_mieru_validate_schema_v2() {
+    local arr="$1" n i item users names name pw quotas expire settings mtu mux hs dns hint tp
+    echo "$arr" | jq -e 'type=="array" and length>0' >/dev/null 2>&1 || return 1
+    n=$(echo "$arr" | jq 'length')
+    for ((i=0; i<n; i++)); do
+        item=$(echo "$arr" | jq -c ".[$i]")
+        _mieru_validate_binding "$item" || return 1
+    done
+    if _mieru_bindings_overlap "$arr"; then
+        return 1
+    fi
+    users=$(echo "$arr" | jq -c '.[0].users // []')
+    echo "$users" | jq -e 'type=="array" and length>0' >/dev/null 2>&1 || return 1
+    names=$(echo "$users" | jq -r '.[].name')
+    if [[ "$(echo "$names" | sed '/^$/d' | wc -l)" != "$(echo "$names" | sed '/^$/d' | sort -u | wc -l)" ]]; then
+        return 1
+    fi
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        name=$(echo "$item" | jq -r '.name // empty')
+        pw=$(echo "$item" | jq -r '.password // empty')
+        [[ -n "$name" && -n "$pw" ]] || return 1
+        expire=$(echo "$item" | jq -r '.expire_date // empty')
+        _mieru_valid_expire_date "$expire" || return 1
+        quotas=$(echo "$item" | jq -c '.quotas // []')
+        _mieru_validate_quotas "$quotas" || return 1
+    done < <(echo "$users" | jq -c '.[]')
+    settings=$(echo "$arr" | jq -c '.[0].mieru_settings // {}')
+    mtu=$(echo "$settings" | jq -r '.mtu // 1400')
+    mux=$(echo "$settings" | jq -r '.multiplexing // empty')
+    hs=$(echo "$settings" | jq -r '.handshake // empty')
+    dns=$(echo "$settings" | jq -r '.dns_dualstack // empty')
+    hint=$(echo "$settings" | jq -r '.user_hint_mandatory // false')
+    tp=$(echo "$settings" | jq -r '.traffic_pattern_mode // "off"')
+    _mieru_valid_mtu "$mtu" || return 1
+    _mieru_valid_multiplexing "$mux" || return 1
+    _mieru_valid_handshake "$hs" || return 1
+    _mieru_valid_dns_policy "$dns" || return 1
+    [[ "$hint" == "true" || "$hint" == "false" ]] || return 1
+    _mieru_valid_traffic_pattern "$tp" || return 1
+    return 0
+}
+
+_mieru_migrate_to_v2() {
+    local cfg="$1"
+    [[ -n "$cfg" && "$cfg" != "null" ]] || return 1
+    if echo "$cfg" | jq -e 'type=="array" and (.[0].schema_version == 2)' >/dev/null 2>&1; then
+        local folded users_json item un pw existing
+        users_json=$(echo "$cfg" | jq -c '.[0].users // []')
+        folded="[]"
+        while IFS= read -r item; do
+            [[ -z "$item" ]] && continue
+            un=$(echo "$item" | jq -r '.username // empty')
+            pw=$(echo "$item" | jq -r '.password // empty')
+            if [[ -n "$un" && -n "$pw" ]]; then
+                existing=$(echo "$users_json" | jq -r --arg n "$un" '.[] | select(.name==$n) | .password' | head -n1)
+                if [[ -n "$existing" && "$existing" != "$pw" ]]; then
+                    return 2
+                fi
+                if [[ -z "$existing" ]]; then
+                    users_json=$(echo "$users_json" | jq -c --arg n "$un" --arg p "$pw" --arg c "$(_mieru_today)" \
+                        '. + [{name:$n, password:$p, enabled:true, created:$c, expire_date:"", quotas:[]}]')
+                fi
+                item=$(echo "$item" | jq -c 'del(.username,.password,.users,.mieru_settings,.schema_version)')
+            fi
+            folded=$(echo "$folded" | jq -c --argjson i "$item" '. + [$i]')
+        done < <(echo "$cfg" | jq -c '.[]')
+        folded=$(echo "$folded" | jq -c --argjson u "$users_json" '.[0].users=$u | .[0].schema_version=2')
+        # ensure mieru_settings present
+        if ! echo "$folded" | jq -e '.[0].mieru_settings|type=="object"' >/dev/null 2>&1; then
+            folded=$(echo "$folded" | jq -c --argjson s "$(_mieru_legacy_settings)" '.[0].mieru_settings=$s')
+        fi
+        _mieru_validate_schema_v2 "$folded" || return 1
+        echo "$folded"
+        return 0
+    fi
+    local items users_json="[]" bindings_json="[]" item un pw port prange transport existing folded
+    items=$(echo "$cfg" | jq -c 'if type=="array" then .[] else . end')
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        # legacy empty port: report, never delete
+        port=$(echo "$item" | jq -r '.port // empty')
+        prange=$(echo "$item" | jq -r '.port_range // empty')
+        if [[ -z "$port" && -z "$prange" ]]; then
+            _report_legacy_empty_port "mieru"
+            continue
+        fi
+        un=$(echo "$item" | jq -r '.username // empty')
+        pw=$(echo "$item" | jq -r '.password // empty')
+        if [[ -n "$un" && -n "$pw" ]]; then
+            existing=$(echo "$users_json" | jq -r --arg n "$un" '.[] | select(.name==$n) | .password' | head -n1)
+            if [[ -n "$existing" && "$existing" != "$pw" ]]; then
+                return 2
+            fi
+            if [[ -z "$existing" ]]; then
+                users_json=$(echo "$users_json" | jq -c --arg n "$un" --arg p "$pw" --arg c "$(_mieru_today)" \
+                    '. + [{name:$n, password:$p, enabled:true, created:$c, expire_date:"", quotas:[]}]')
+            fi
+        fi
+        if echo "$item" | jq -e '.users|type=="array"' >/dev/null 2>&1; then
+            local ujson uname upass
+            while IFS= read -r ujson; do
+                [[ -z "$ujson" ]] && continue
+                uname=$(echo "$ujson" | jq -r '.name // .username // empty')
+                upass=$(echo "$ujson" | jq -r '.password // empty')
+                [[ -n "$uname" && -n "$upass" ]] || continue
+                existing=$(echo "$users_json" | jq -r --arg n "$uname" '.[] | select(.name==$n) | .password' | head -n1)
+                if [[ -n "$existing" && "$existing" != "$upass" ]]; then
+                    return 2
+                fi
+                if [[ -z "$existing" ]]; then
+                    users_json=$(echo "$users_json" | jq -c --argjson u "$ujson" --arg n "$uname" --arg p "$upass" --arg c "$(_mieru_today)" \
+                        '. + [($u + {name:$n, password:$p, enabled:($u.enabled // true), created:($u.created // $c), expire_date:($u.expire_date // ""), quotas:($u.quotas // [])})]')
+                fi
+            done < <(echo "$item" | jq -c '.users[]')
+        fi
+        transport=$(echo "$item" | jq -r '.transport // .protocol // "TCP" | ascii_upcase')
+        [[ "$transport" == "TCP" || "$transport" == "UDP" ]] || transport="TCP"
+        if [[ -n "$port" && -n "$prange" ]]; then
+            return 1
+        fi
+        if [[ -n "$port" ]]; then
+            _mieru_valid_port "$port" || { _report_legacy_empty_port "mieru"; continue; }
+            bindings_json=$(echo "$bindings_json" | jq -c --argjson p "$port" --arg t "$transport" \
+                '. + [{port:$p, transport:$t}]')
+        elif [[ -n "$prange" ]]; then
+            _mieru_valid_port_range "$prange" || { _report_legacy_empty_port "mieru"; continue; }
+            bindings_json=$(echo "$bindings_json" | jq -c --arg r "$prange" --arg t "$transport" \
+                '. + [{port_range:$r, transport:$t}]')
+        fi
+    done <<< "$items"
+
+    local nbind
+    nbind=$(echo "$bindings_json" | jq 'length')
+    [[ "$nbind" -gt 0 ]] || return 1
+    if _mieru_bindings_overlap "$bindings_json"; then
+        return 1
+    fi
+    local settings
+    settings=$(_mieru_legacy_settings)
+    echo "$users_json" | jq -e 'length>0' >/dev/null 2>&1 || return 1
+    folded=$(echo "$bindings_json" | jq -c --argjson users "$users_json" --argjson settings "$settings" '
+        .[0] = (.[0] + {schema_version:2, users:$users, mieru_settings:$settings})
+    ')
+    _mieru_validate_schema_v2 "$folded" || return 1
+    echo "$folded"
+}
+
+_mieru_active_users_json() {
+    local users="$1" today
+    today=$(_mieru_today)
+    echo "$users" | jq -c --arg t "$today" \
+        '[.[] | select((.enabled != false) and ((.expire_date // "") == "" or .expire_date >= $t))]'
+}
+
+_mieru_new_install_json() {
+    local username="$1" password="$2" port="$3" transport="${4:-TCP}" tp_mode="${5:-off}" tp_seed="${6:-}"
+    local settings users binding
+    _mieru_valid_transport "$transport" || return 1
+    settings=$(_mieru_new_settings "$tp_mode" "$tp_seed")
+    users=$(jq -nc --arg n "$username" --arg p "$password" --arg c "$(_mieru_today)" \
+        '[{name:$n, password:$p, enabled:true, created:$c, expire_date:"", quotas:[]}]')
+    if [[ "$port" == *-* ]]; then
+        _mieru_valid_port_range "$port" || return 1
+        binding=$(jq -nc --arg range "$port" --arg t "$transport" \
+            --argjson users "$users" --argjson settings "$settings" \
+            '{schema_version:2, port_range:$range, transport:$t, users:$users, mieru_settings:$settings}')
+    else
+        _mieru_valid_port "$port" || return 1
+        binding=$(jq -nc --argjson port "$port" --arg t "$transport" \
+            --argjson users "$users" --argjson settings "$settings" \
+            '{schema_version:2, port:$port, transport:$t, users:$users, mieru_settings:$settings}')
+    fi
+    echo "[$binding]"
+}
+
+_mieru_runtime_from_db() {
+    local cfg="$1" migrated rc
+    migrated=$(_mieru_migrate_to_v2 "$cfg")
+    rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    local users settings
+    users=$(echo "$migrated" | jq -c '.[0].users // []')
+    users=$(_mieru_active_users_json "$users")
+    settings=$(echo "$migrated" | jq -c '.[0].mieru_settings // {}')
+    echo "$migrated" | jq -c --argjson users "$users" --argjson s "$settings" '
+        def bind:
+            (if .port != null and .port != "" then {port:(.port|tonumber), protocol:(.transport // "TCP")}
+             else {portRange:.port_range, protocol:(.transport // "TCP")} end);
+        {
+            portBindings: (map(bind) | unique),
+            users: ($users | map({name, password} + (if (.quotas // []) == [] then {} else {quotas} end))),
+            loggingLevel: "INFO",
+            mtu: ($s.mtu // 1400)
+        }
+        + (if ($s.dns_dualstack // "") != "" then {dns:{dualStack: $s.dns_dualstack}} else {} end)
+        + (if $s.user_hint_mandatory == true then {advancedSettings:{allowHandshakeWithoutUserHint:false}} else {} end)
+        + (if ($s.traffic_pattern_mode // "off") == "off" then {}
+           elif $s.traffic_pattern_mode == "unlocked" then {trafficPattern:{seed:($s.traffic_pattern_seed // 1), unlockAll:true}}
+           else {trafficPattern:{seed:($s.traffic_pattern_seed // 1), unlockAll:false}} end)
+    '
+}
+
+_mieru_db_arr() {
+    local cfg migrated rc
+    db_exists "xray" "mieru" || return 1
+    cfg=$(db_get "xray" "mieru")
+    migrated=$(_mieru_migrate_to_v2 "$cfg")
+    rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    echo "$migrated"
+}
+
+_mieru_db_set_arr() {
+    _db_apply --argjson c "$1" '.xray.mieru=$c'
+}
+
+_mieru_db_settings() {
+    local arr
+    arr=$(_mieru_db_arr) || { _mieru_new_settings; return 1; }
+    echo "$arr" | jq -c '.[0].mieru_settings // {}'
+}
+
+_mieru_norm_bindings() {
+    local raw="${1:-[]}"
+    echo "$raw" | jq -c 'map(
+        (if .protocol then .protocol else (.transport // "TCP") end) as $p |
+        if ((.portRange // .port_range // "") | tostring | length) > 0 then
+            {portRange:(.portRange // .port_range), protocol:$p}
+        else
+            {port:(.port|tonumber), protocol:$p}
+        end
+    )'
+}
+
+_mieru_db_bindings() {
+    local arr
+    arr=$(_mieru_db_arr) || { echo '[]'; return 1; }
+    _mieru_norm_bindings "$arr"
+}
+
+_mieru_add_listener() {
+    local spec="$1" transport="${2:-TCP}" arr binding json
+    [[ -n "$spec" ]] || return 1
+    _mieru_valid_transport "$transport" || return 1
+    if [[ "$spec" == *-* ]]; then
+        _mieru_valid_port_range "$spec" || return 1
+        binding=$(jq -nc --arg r "$spec" --arg t "$transport" '{port_range:$r, transport:$t}')
+    else
+        _mieru_valid_port "$spec" || return 1
+        binding=$(jq -nc --argjson p "$spec" --arg t "$transport" '{port:$p, transport:$t}')
+    fi
+    arr=$(_mieru_db_arr) || return 1
+    json=$(echo "$arr" | jq -c --argjson b "$binding" '. + [$b]')
+    _mieru_validate_schema_v2 "$json" || return 1
+    _mieru_db_set_arr "$json"
+}
+
+
+_mieru_share_user_pass() {
+    local cfg_user="$1" cfg_pass="$2" arr u
+    if [[ -n "$cfg_user" && -n "$cfg_pass" ]]; then
+        printf '%s\t%s\n' "$cfg_user" "$cfg_pass"
+        return 0
+    fi
+    arr=$(_mieru_db_arr 2>/dev/null) || return 1
+    u=$(echo "$arr" | jq -c '.[0].users[0] // empty')
+    [[ -n "$u" && "$u" != "null" ]] || return 1
+    printf '%s\t%s\n' "$(echo "$u" | jq -r '.name')" "$(echo "$u" | jq -r '.password')"
+}
+
+_mieru_share_bindings_arg() {
+    local port="$1" extra="${2:-}"
+    if [[ -n "$extra" && "$extra" == [* ]]; then
+        _mieru_norm_bindings "$extra"
+        return
+    fi
+    local db
+    db=$(_mieru_db_bindings 2>/dev/null) && [[ "$db" != "[]" && -n "$db" ]] && { echo "$db"; return; }
+    if [[ -n "$port" && "$port" != "null" ]]; then
+        if [[ "$port" == *-* ]]; then
+            jq -nc --arg r "$port" '[{portRange:$r, protocol:"TCP"}]'
+        else
+            jq -nc --argjson p "$port" '[{port:($p|tonumber), protocol:"TCP"}]'
+        fi
+        return
+    fi
+    echo '[]'
+}
+
+_mieru_share_settings_arg() {
+    local extra="${1:-}"
+    if [[ -n "$extra" && "$extra" == {* ]]; then
+        echo "$extra"
+        return
+    fi
+    _mieru_db_settings 2>/dev/null || _mieru_new_settings
+}
+
+_mieru_share_server_fields() {
+    local ip="$1"
+    ip="${ip#[}"
+    ip="${ip%]}"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$ip" == *:* ]]; then
+        jq -nc --arg ip "$ip" '{ipAddress:$ip, domainName:""}'
+    else
+        jq -nc --arg d "$ip" '{ipAddress:"", domainName:$d}'
+    fi
+}
+
+# 从数据库重建 mita 运行时配置（v2：TCP/UDP、port|portRange、trafficPattern）
 generate_mieru_config() {
     local cfg="" candidate=""
     if ! db_exists "xray" "mieru"; then
@@ -4886,14 +5381,15 @@ generate_mieru_config() {
 
     mkdir -p "$CFG"
     candidate=$(mktemp "$CFG/.mieru.json.XXXXXX") || { _err "创建 mieru 候选配置失败"; return 1; }
-    if ! echo "$cfg" | jq '
-        (if (. | type) == "array" then . else [.] end) as $items |
-        {
-            portBindings: ($items | map(select(.port != null and .port != "") | {port: (.port | tonumber), protocol: "TCP"}) | unique),
-            users: ($items | map(select((.username // "") != "" and (.password // "") != "") | {name: .username, password: .password}) | unique),
-            loggingLevel: "INFO"
-        }
-    ' > "$candidate"; then
+    local runtime rc
+    runtime=$(_mieru_runtime_from_db "$cfg")
+    rc=$?
+    if [[ $rc -eq 2 ]]; then
+        rm -f "$candidate"
+        _err "mieru 用户名冲突（同名不同密码），未改动运行配置"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]] || ! printf '%s\n' "$runtime" | jq '.' > "$candidate"; then
         rm -f "$candidate"
         _err "生成 mieru.json 基础配置失败"
         return 1
@@ -7433,32 +7929,42 @@ gen_naive_link() {
 # 官方 mieru:// 是 protobuf ClientConfig（mieru export config），这里不伪造。
 gen_mieru_client_json() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
-    local name
+    local bindings settings name server mtu mux hs
     ip="${ip#[}"
     ip="${ip%]}"
+    bindings=$(_mieru_share_bindings_arg "$port" "${6:-}")
+    settings=$(_mieru_share_settings_arg "${7:-}")
     name=$(_share_node_name "$ip" "$country" "mieru")
+    server=$(_mieru_share_server_fields "$ip")
+    mtu=$(echo "$settings" | jq -r '.mtu // 1400')
+    mux=$(echo "$settings" | jq -r '.multiplexing // "MULTIPLEXING_LOW"')
+    hs=$(echo "$settings" | jq -r '.handshake // "HANDSHAKE_STANDARD"')
     jq -n \
-        --arg ip "$ip" \
-        --arg port "$port" \
         --arg username "$username" \
         --arg password "$password" \
         --arg name "$name" \
+        --argjson server "$server" \
+        --argjson bindings "$bindings" \
+        --argjson mtu "$mtu" \
+        --arg mux "$mux" \
+        --arg hs "$hs" \
+        --argjson settings "$settings" \
         '{
             profiles: [
                 {
                     profileName: $name,
                     user: { name: $username, password: $password },
                     servers: [
-                        {
-                            ipAddress: $ip,
-                            domainName: "",
-                            portBindings: [{ port: ($port | tonumber), protocol: "TCP" }]
-                        }
+                        ($server + {portBindings: $bindings})
                     ],
-                    mtu: 1400,
-                    multiplexing: { level: "MULTIPLEXING_OFF" },
-                    handshakeMode: "HANDSHAKE_NO_WAIT"
+                    mtu: $mtu,
+                    multiplexing: { level: $mux },
+                    handshakeMode: $hs
                 }
+                + (if ($settings.traffic_pattern_mode // "off") == "off" then {}
+                   elif $settings.traffic_pattern_mode == "unlocked" then
+                        {trafficPattern:{seed:($settings.traffic_pattern_seed // 1), unlockAll:true}}
+                   else {trafficPattern:{seed:($settings.traffic_pattern_seed // 1), unlockAll:false}} end)
             ],
             activeProfile: $name,
             rpcPort: 8964,
@@ -7470,7 +7976,8 @@ gen_mieru_client_json() {
 
 gen_mierus_link() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
-    local host user_enc pass_enc name name_q
+    local bindings settings host user_enc pass_enc name name_q mtu mux hs
+    local pairs_q item pval pcol
     ip="${ip#[}"
     ip="${ip%]}"
     if [[ "$ip" == *:* ]]; then
@@ -7478,41 +7985,79 @@ gen_mierus_link() {
     else
         host="$ip"
     fi
+    bindings=$(_mieru_share_bindings_arg "$port" "${6:-}")
+    settings=$(_mieru_share_settings_arg "${7:-}")
     name=$(_share_node_name "$ip" "$country" "mieru")
-    name_q=$(urlencode_strict "$name")
-    user_enc=$(urlencode_strict "$username")
-    pass_enc=$(urlencode_strict "$password")
-    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_OFF&port=${port}&profile=${name_q}&protocol=TCP"
+    if declare -F urlencode_strict >/dev/null 2>&1; then
+        name_q=$(urlencode_strict "$name")
+        user_enc=$(urlencode_strict "$username")
+        pass_enc=$(urlencode_strict "$password")
+    else
+        name_q=$(urlencode "$name")
+        user_enc=$(urlencode "$username")
+        pass_enc=$(urlencode "$password")
+    fi
+    mtu=$(echo "$settings" | jq -r '.mtu // 1400')
+    mux=$(echo "$settings" | jq -r '.multiplexing // "MULTIPLEXING_LOW"')
+    hs=$(echo "$settings" | jq -r '.handshake // "HANDSHAKE_STANDARD"')
+    pairs_q=""
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        pval=$(echo "$item" | jq -r '.portRange // (.port|tostring)')
+        pcol=$(echo "$item" | jq -r '.protocol // "TCP"')
+        pairs_q+="&port=${pval}&protocol=${pcol}"
+    done < <(echo "$bindings" | jq -c '.[]')
+    printf '%s\n' "mierus://${user_enc}:${pass_enc}@${host}?handshake-mode=${hs}&mtu=${mtu}&multiplexing=${mux}${pairs_q}&profile=${name_q}"
 }
 
 gen_mieru_link() { gen_mierus_link "$@"; }
 
 gen_mieru_clash_yaml() {
     local name="${1:-mieru-mita-tcp}" ip="$2" port="$3" username="$4" password="$5"
+    local bindings settings mux hs item transport port_line entry_name label
     ip="${ip#[}"
     ip="${ip%]}"
+    bindings=$(_mieru_share_bindings_arg "$port" "${6:-}")
+    settings=$(_mieru_share_settings_arg "${7:-}")
+    mux=$(echo "$settings" | jq -r '.multiplexing // "MULTIPLEXING_LOW"')
+    hs=$(echo "$settings" | jq -r '.handshake // "HANDSHAKE_STANDARD"')
     name="${name//\"/\\\"}"
     username="${username//\"/\\\"}"
     password="${password//\"/\\\"}"
-    printf '%s\n' "  - name: \"${name}\"
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        transport=$(echo "$item" | jq -r '.protocol // "TCP"')
+        if echo "$item" | jq -e '.portRange != null and .portRange != ""' >/dev/null; then
+            label=$(echo "$item" | jq -r '.portRange')
+            port_line="    port-range: ${label}"
+        else
+            label=$(echo "$item" | jq -r '.port|tostring')
+            port_line="    port: ${label}"
+        fi
+        entry_name="${name}-${transport}-${label}"
+        entry_name="${entry_name//\"/\\\"}"
+        printf '%s\n' "  - name: \"${entry_name}\"
     type: mieru
     server: \"${ip}\"
-    port: ${port}
-    transport: TCP
+${port_line}
+    transport: ${transport}
     udp: true
     username: \"${username}\"
     password: \"${password}\"
-    multiplexing: MULTIPLEXING_OFF
-    handshake-mode: HANDSHAKE_NO_WAIT"
+    multiplexing: ${mux}
+    handshake-mode: ${hs}"
+    done < <(echo "$bindings" | jq -c '.[]')
 }
 
 _print_mieru_share() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
-    local link json clash _line name
+    local bindings settings link json clash _line name
+    bindings=$(_mieru_share_bindings_arg "$port" "${6:-}")
+    settings=$(_mieru_share_settings_arg "${7:-}")
     name=$(_share_node_name "$ip" "$country" "mieru")
-    link=$(gen_mierus_link "$ip" "$port" "$username" "$password" "$country")
-    json=$(gen_mieru_client_json "$ip" "$port" "$username" "$password" "$country")
-    clash=$(gen_mieru_clash_yaml "$name" "$ip" "$port" "$username" "$password")
+    link=$(gen_mierus_link "$ip" "$port" "$username" "$password" "$country" "$bindings" "$settings")
+    json=$(gen_mieru_client_json "$ip" "$port" "$username" "$password" "$country" "$bindings" "$settings")
+    clash=$(gen_mieru_clash_yaml "$name" "$ip" "$port" "$username" "$password" "$bindings" "$settings")
     echo -e "  ${C}分享链接:${NC}"
     echo -e "  ${G}${link}${NC}"
     echo ""
@@ -7526,12 +8071,10 @@ _print_mieru_share() {
     while IFS= read -r _line || [[ -n "$_line" ]]; do
         echo -e "  ${C}${_line}${NC}"
     done <<< "$clash"
-
     echo ""
     echo -e "  ${C}二维码:${NC}"
     echo -e "  ${G}$(gen_qr "$link")${NC}"
 }
-
 
 gen_shadowtls_link() {
     local ip="$1" port="$2" password="$3" method="$4" sni="$5" stls_password="$6" country="${7:-}"
@@ -13574,39 +14117,45 @@ EOF
 
 # mieru 服务端意图（只写 db.json，运行时文件由 generate_mieru_config 重建）
 _mieru_entry_is_valid() {
-    local username="$1" password="$2" port="$3" existing=""
+    local username="$1" password="$2" port="$3" transport="${4:-TCP}"
     [[ -n "$username" && -n "$password" ]] || { _err "mieru 用户名和密码不能为空"; return 1; }
-    [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1025 && "$port" -le 65535 ]] || {
-        _err "mieru 端口必须是 1025-65535"
-        return 1
-    }
-    if db_exists "xray" "mieru"; then
-        existing=$(db_get "xray" "mieru")
-        if echo "$existing" | jq -e --arg user "$username" --arg pass "$password" '
-            (if type == "array" then . else [.] end)
-            | any(.[]; .username == $user and .password != $pass)
-        ' >/dev/null 2>&1; then
-            _err "mieru 用户名 $username 已使用其他密码"
+    _mieru_valid_transport "$transport" || { _err "mieru transport 只允许 TCP 或 UDP"; return 1; }
+    if [[ "$port" == *-* ]]; then
+        _mieru_valid_port_range "$port" || {
+            _err "mieru 端口范围端点必须在 1025-65535，且起点不得大于终点"
             return 1
-        fi
+        }
+    else
+        _mieru_valid_port "$port" || {
+            _err "mieru 端口必须是 1025-65535"
+            return 1
+        }
     fi
     return 0
 }
 
 gen_mieru_server_config() {
-    local username="$1" password="$2" port="$3"
-    local new_config stored_config
+    local username="$1" password="$2" port="$3" transport="${4:-TCP}" tp_mode="${5:-off}" tp_seed="${6:-}"
+    local new_config
     mkdir -p "$CFG"
-    _mieru_entry_is_valid "$username" "$password" "$port" || return 1
-    new_config=$(build_config username "$username" password "$password" port "$port") || return 1
+    _mieru_entry_is_valid "$username" "$password" "$port" "$transport" || return 1
+    _mieru_valid_traffic_pattern "$tp_mode" || tp_mode="off"
     _limited_change_begin "mieru" || { _err "无法备份 mieru 现有配置"; return 1; }
-    register_protocol "mieru" "$new_config"
-    stored_config=$(db_get_port_config "xray" "mieru" "$port" 2>/dev/null) || stored_config=""
-    if [[ -z "$stored_config" ]] ||
-       ! printf '%s\n' "$stored_config" | jq -e --argjson expected "$new_config" '. == $expected' >/dev/null 2>&1; then
-        _err "mieru 数据库写入校验失败，正在恢复原配置"
-        _limited_change_rollback
-        return 1
+    if db_exists "xray" "mieru"; then
+        if ! _mieru_add_listener "$port" "$transport"; then
+            _err "mieru 添加监听失败（可能重叠或无效）"
+            _limited_change_rollback
+            return 1
+        fi
+    else
+        new_config=$(_mieru_new_install_json "$username" "$password" "$port" "$transport" "$tp_mode" "$tp_seed") || {
+            _limited_change_rollback
+            return 1
+        }
+        if ! register_protocol "mieru" "$new_config"; then
+            _limited_change_rollback
+            return 1
+        fi
     fi
     echo "server" > "$CFG/role"
 }
@@ -20747,7 +21296,11 @@ show_all_share_links() {
                     anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
                     socks) link=$(gen_socks_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
-                    mieru) link=$(gen_mierus_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
+                    mieru)
+                        local mu mp
+                        IFS=$'\t' read -r mu mp < <(_mieru_share_user_pass "$username" "$password") || true
+                        [[ -n "$mu" ]] && link=$(gen_mierus_link "$ipv4" "$display_port" "$mu" "$mp" "$country_code")
+                        ;;
                     vless-finalmask)
                         local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
                         local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
@@ -20807,7 +21360,11 @@ show_all_share_links() {
                     anytls) link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
                     socks) link=$(gen_socks_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
-                    mieru) link=$(gen_mierus_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
+                    mieru)
+                        local mu mp
+                        IFS=$'\t' read -r mu mp < <(_mieru_share_user_pass "$username" "$password") || true
+                        [[ -n "$mu" ]] && link=$(gen_mierus_link "$ip6" "$display_port" "$mu" "$mp" "$country_code")
+                        ;;
                     vless-finalmask)
                         local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
                         local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
@@ -23928,16 +24485,84 @@ do_install_server() {
             gen_naive_server_config "$username" "$password" "$port" "$domain"
             ;;
         mieru)
-            local username password
+            local username password transport="TCP" binding="$port" tp_mode="off" tp_seed="" tp_choice tchoice bchoice
             username=$(ask_password 8 "mieru用户名")
             password=$(ask_password 16 "mieru密码")
+
+            echo ""
+            _line
+            echo -e "  ${W}传输协议${NC}"
+            _line
+            _item "1" "TCP ${D}(默认)${NC}"
+            _item "2" "UDP"
+            while true; do
+                read -rp "  选择 [1-2]: " tchoice
+                tchoice="${tchoice:-1}"
+                case "$tchoice" in
+                    1) transport="TCP"; break ;;
+                    2) transport="UDP"; break ;;
+                    *) _err "无效选择" ;;
+                esac
+            done
+
+            echo ""
+            _line
+            echo -e "  ${W}端口绑定${NC}"
+            _line
+            _item "1" "单端口 ${D}(当前建议: $port)${NC}"
+            _item "2" "端口范围 portRange ${D}(如 2012-2022)${NC}"
+            while true; do
+                read -rp "  选择 [1-2]: " bchoice
+                bchoice="${bchoice:-1}"
+                case "$bchoice" in
+                    1)
+                        binding=$(ask_port "mieru") || { _warn "已取消端口配置"; return 1; }
+                        _mieru_valid_port "$binding" || { _err "mieru 端口必须是 1025-65535"; return 1; }
+                        break
+                        ;;
+                    2)
+                        read -rp "  端口范围 lo-hi [1025-65535]: " binding
+                        if _mieru_valid_port_range "$binding"; then
+                            break
+                        fi
+                        _err "端口范围无效（需有序且两端 1025-65535）"
+                        ;;
+                    *) _err "无效选择" ;;
+                esac
+            done
+
+            echo ""
+            _line
+            echo -e "  ${W}Traffic Pattern (Advanced)${NC}"
+            _line
+            echo -e "  ${D}默认关闭；Custom 映射为 unlocked${NC}"
+            _item "1" "Off ${D}(默认)${NC}"
+            _item "2" "Conservative"
+            _item "3" "Custom → unlocked"
+            while true; do
+                read -rp "  选择 [1-3]: " tp_choice
+                tp_choice="${tp_choice:-1}"
+                case "$tp_choice" in
+                    1) tp_mode="off"; break ;;
+                    2) tp_mode="conservative"; break ;;
+                    3) tp_mode="unlocked"; break ;;
+                    *) _err "无效选择" ;;
+                esac
+            done
+            if [[ "$tp_mode" != "off" ]]; then
+                read -rp "  traffic_pattern_seed [回车随机]: " tp_seed
+                [[ -z "$tp_seed" ]] && tp_seed=$(_mieru_new_seed)
+                [[ "$tp_seed" =~ ^[0-9]+$ ]] || { _err "seed 必须是整数"; return 1; }
+            fi
+
             echo ""
             _line
             echo -e "  ${C}mieru 配置${NC}"
             _line
-            echo -e "  端口: ${G}$port${NC}"
+            echo -e "  绑定: ${G}$binding${NC}  传输: ${G}$transport${NC}"
             echo -e "  用户名: ${G}$username${NC}"
             echo -e "  密码: ${G}$password${NC}"
+            echo -e "  Traffic Pattern: ${G}$tp_mode${NC}${tp_seed:+ seed=$tp_seed}"
             local _mieru_inherit
             _mieru_inherit=$(_infer_global_chain_node 2>/dev/null || true)
             if [[ -n "$_mieru_inherit" ]]; then
@@ -23945,13 +24570,13 @@ do_install_server() {
             else
                 echo -e "  链式出口: ${D}跟随全局${NC}"
             fi
-            echo -e "  ${D}多端口实例，运行时文件由数据库重建${NC}"
+            echo -e "  ${D}共享用户池；无 port→user ACL；运行时由数据库重建${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
             [[ "$confirm" =~ ^[nN]$ ]] && return
             _info "生成配置..."
-            gen_mieru_server_config "$username" "$password" "$port" || { _pause; return 1; }
+            gen_mieru_server_config "$username" "$password" "$binding" "$transport" "$tp_mode" "$tp_seed" || { _pause; return 1; }
             ;;
     esac
     
@@ -28354,9 +28979,12 @@ _gen_user_share_link() {
             link=$(gen_vless_finalmask_link "$server_addr" "$display_port" "$credential" "$encryption" "$fm_password" "$fm_ascii" "$fm_pmin" "$fm_pmax" "$remark")
             ;;
         mieru)
-            local m_user=$(echo "$cfg" | jq -r '.username // empty')
-            local m_pass=$(echo "$cfg" | jq -r '.password // empty')
-            # mieru 分享备注沿用 country_code；端口绑定到所选实例。
+            local m_user m_pass
+            m_user=$(echo "$cfg" | jq -r '.username // empty')
+            m_pass=$(echo "$cfg" | jq -r '.password // empty')
+            IFS=$'\t' read -r m_user m_pass < <(_mieru_share_user_pass "$m_user" "$m_pass") || true
+            [[ -n "$m_user" ]] || return 1
+            # 无 port→user ACL：分享用共享用户池；绑定列表来自 db。
             link=$(gen_mierus_link "$server_addr" "$display_port" "$m_user" "$m_pass" "$country_code")
             ;;
     esac
