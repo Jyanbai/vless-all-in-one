@@ -4660,17 +4660,53 @@ generate_xray_config() {
     return 0
 }
 
-# mieru 链式出口：跟随全局链式节点（菜单 1 添加节点 / 分流规则）
+# mieru egress：编译 db.json routing_rules → egress.proxies/rules；legacy 单链保留 socks5-chain
 
-# 解析全局链式节点名（或空）
+# SOCKS 直连出口分类：IPv4=/32，IPv6=/128，名称→domain
+_mieru_egress_classify() {
+    local host="$1"
+    host="${host#[}"
+    host="${host%]}"
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s %s\n' "ip" "${host}/32"
+    elif [[ "$host" == *:* && "$host" =~ ^[0-9A-Fa-f:]+$ ]]; then
+        printf '%s %s\n' "ip" "${host}/128"
+    else
+        printf '%s %s\n' "domain" "$host"
+    fi
+}
+
+_mieru_proxy_slug() {
+    local n="$1"
+    n=$(printf '%s' "$n" | tr -c 'A-Za-z0-9._-' '_')
+    [[ -n "$n" ]] || n="node"
+    printf '%s\n' "$n"
+}
+
+# 规则 match 是否可被 mita egress 原生表达（无 geosite/geoip）
+_mieru_rule_match_safe() {
+    local rule="$1" rule_type domains
+    rule_type=$(echo "$rule" | jq -r '.type // empty')
+    [[ "$rule_type" == "all" ]] && return 0
+    domains=$(echo "$rule" | jq -r '.domains // ""')
+    [[ -z "$domains" ]] && return 0
+    if [[ "$domains" == geosite:* || "$domains" == geoip:* ]]; then
+        return 1
+    fi
+    if [[ "$domains" =~ (^|,)(geosite:|geoip:) ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# 解析全局链式节点名（legacy 单链）
 # 顺序: a) 分流规则唯一 chain:<name> b) 用户路由唯一 chain: c) 仅1个节点 d) chain_proxy.active e) 空
-# $1=unique_only 时跳过 d（导入路径只用无歧义结果）
+# $1=unique_only 时跳过 d
 _infer_global_chain_node() {
     [[ -f "$DB_FILE" ]] || return 0
     local unique_only="${1:-}"
     local name="" node=""
 
-    # a) unique chain:<name> across db routing rules
     name=$(jq -r '
         [.routing_rules[]? | .outbound // empty
          | select(type == "string" and startswith("chain:") and length > 6)
@@ -4686,7 +4722,6 @@ _infer_global_chain_node() {
         fi
     fi
 
-    # b) unique chain: from user routing (xray/singbox .users[].routing)
     name=$(jq -r '
         [
             [.xray // {}, .singbox // {}][]
@@ -4709,7 +4744,6 @@ _infer_global_chain_node() {
         fi
     fi
 
-    # c) exactly one chain node
     name=$(jq -r '
         (.chain_proxy.nodes // [])
         | if length == 1 then (.[0].name // empty) else empty end
@@ -4722,7 +4756,6 @@ _infer_global_chain_node() {
         fi
     fi
 
-    # d) chain_proxy.active if the node still exists (skip when unique_only)
     if [[ "$unique_only" != "unique_only" ]]; then
         name=$(db_get_chain_active 2>/dev/null)
         if [[ -n "$name" && "$name" != "null" ]]; then
@@ -4733,12 +4766,33 @@ _infer_global_chain_node() {
             fi
         fi
     fi
-
-    # e) empty (ambiguous multiple nodes, no routing)
     return 0
 }
 
-# mieru 链式出口：只跟随全局推断
+# true = 走 multi-egress 编译器；false = legacy 单 socks5-chain / 直连
+_mieru_needs_multi_egress() {
+    [[ -f "$DB_FILE" ]] || return 1
+    local rules chains outs n
+    rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
+    [[ -z "$rules" || "$rules" == "[]" || "$rules" == "null" ]] && return 1
+    n=$(echo "$rules" | jq 'length' 2>/dev/null || echo 0)
+    [[ "${n:-0}" -le 0 ]] && return 1
+    chains=$(echo "$rules" | jq -r '[.[] | .outbound // empty | select(startswith("chain:"))] | unique | length' 2>/dev/null || echo 0)
+    outs=$(echo "$rules" | jq -r '[.[] | .outbound // empty] | unique | length' 2>/dev/null || echo 0)
+    # 多条 outbound 或 >1 个 chain，或含 block/reject/direct 与 chain 混用
+    if [[ "${chains:-0}" -gt 1 ]]; then
+        return 0
+    fi
+    if [[ "${outs:-0}" -gt 1 ]]; then
+        return 0
+    fi
+    # 单条 outbound 但是 block/reject/direct 且还有 type!=all 的细分 → 仍 multi
+    if echo "$rules" | jq -e 'length > 1' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 _mieru_chain_node_name() {
     [[ -f "$DB_FILE" ]] || return 1
     db_exists "xray" "mieru" || return 1
@@ -4751,7 +4805,6 @@ _mieru_chain_node_name() {
     printf '%s\n' "$name"
 }
 
-# 菜单1添加节点后：重建 mieru（及所需 Xray SOCKS 适配）
 _refresh_mieru_chain_egress() {
     db_exists "xray" "mieru" || return 0
     if _mieru_chain_needs_xray_bridge; then
@@ -4760,17 +4813,28 @@ _refresh_mieru_chain_egress() {
     _regenerate_proxy_configs
 }
 
-# 导入路径：仅当全局节点无歧义（唯一分流 chain: 或仅1个节点）时重建
 _maybe_refresh_mieru_chain_after_import() {
     db_exists "xray" "mieru" || return 0
+    # 分流/节点导入后：有 routing 或可推断单链时重建
+    if _mieru_needs_multi_egress; then
+        _refresh_mieru_chain_egress
+        return 0
+    fi
     local inferred=""
     inferred=$(_infer_global_chain_node unique_only 2>/dev/null || true)
     [[ -z "$inferred" ]] && return 0
     _refresh_mieru_chain_egress
 }
 
-# 非 socks 链式节点需要本地 Xray SOCKS 适配器（http/ss/vless/vmess/trojan）
+# 是否需要任一 Xray SOCKS 桥（非 socks 节点或 routing-fallback）
 _mieru_chain_needs_xray_bridge() {
+    db_exists "xray" "mieru" || return 1
+    if _mieru_needs_multi_egress; then
+        local plan
+        plan=$(_mieru_compile_egress_plan 2>/dev/null) || return 1
+        echo "$plan" | jq -e '(.bridges | length) > 0' >/dev/null 2>&1
+        return $?
+    fi
     local name node type
     name=$(_mieru_chain_node_name) || return 1
     node=$(db_get_chain_node "$name") || return 1
@@ -4803,47 +4867,402 @@ _ensure_mieru_xray_adapter() {
     return 0
 }
 
-# 向已生成的 Xray config.json 注入 127.0.0.1 SOCKS 适配 inbound + 链式 outbound
-# 幂等：替换 tag=mieru-chain-in；outbound 缺 tag 才追加；规则插在 api inboundTag 之后
+# 为 chain 节点分配 SOCKS 桥：返回 host port user pass proxy_name loop_direct_kind loop_direct_val needs_bridge
+_mieru_resolve_proxy_endpoint() {
+    local node_name="$1" idx="$2"
+    local node type host port user pass slug kind val base
+    node=$(db_get_chain_node "$node_name" 2>/dev/null) || return 1
+    type=$(echo "$node" | jq -r '.type // empty')
+    slug=$(_mieru_proxy_slug "$node_name")
+    base="${MIERU_CHAIN_SOCKS_PORT:-40100}"
+    case "$type" in
+        socks|socks5)
+            host=$(echo "$node" | jq -r '.server // empty')
+            port=$(echo "$node" | jq -r '.port // empty' | tr -d '"' | tr -d ' ')
+            user=$(echo "$node" | jq -r '.username // empty')
+            pass=$(echo "$node" | jq -r '.password // empty')
+            host="${host#[}"; host="${host%]}"
+            [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
+            read -r kind val < <(_mieru_egress_classify "$host")
+            printf '%s\n' "$host" "$port" "$user" "$pass" "proxy-${slug}" "$kind" "$val" "0"
+            ;;
+        *)
+            host="127.0.0.1"
+            port=$((base + idx))
+            printf '%s\n' "$host" "$port" "" "" "proxy-${slug}" "ip" "127.0.0.1/32" "1"
+            ;;
+    esac
+}
+
+# 编译计划 JSON:
+# { mode:"legacy"|"multi", proxies:[], rules:[], bridges:[{name,port,tag,inbound}],
+#   allowLoopbackIP:bool, fallback_rules:[], legacy_name:"" }
+_mieru_compile_egress_plan() {
+    local rules proxies='[]' erules='[]' bridges='[]' allow_loop=false
+    local fallback_rules='[]' seen_nodes='' node_idx=0
+    local rule outbound action proxy_name host port user pass slug kind val needs_br
+    local domains rule_type item domain_list ip_list hit_unsafe=0
+    local -A node_port_map=()
+    local -A node_proxy_map=()
+
+    rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
+    if ! _mieru_needs_multi_egress; then
+        local legacy
+        legacy=$(_infer_global_chain_node 2>/dev/null || true)
+        jq -n --arg n "${legacy:-}" '{mode:"legacy", legacy_name:$n, proxies:[], rules:[], bridges:[], allowLoopbackIP:false, fallback_rules:[]}'
+        return 0
+    fi
+
+    # 预扫描 chain 节点，稳定排序后分配 40100+N
+    local sorted_nodes
+    sorted_nodes=$(echo "$rules" | jq -r '[.[] | .outbound // empty | select(startswith("chain:")) | .[6:]] | unique | sort | .[]' 2>/dev/null)
+    while IFS= read -r node_name; do
+        [[ -z "$node_name" ]] && continue
+        if ! mapfile -t _ep < <(_mieru_resolve_proxy_endpoint "$node_name" "$node_idx"); then
+            continue
+        fi
+        host="${_ep[0]}"; port="${_ep[1]}"; user="${_ep[2]}"; pass="${_ep[3]}"
+        proxy_name="${_ep[4]}"; kind="${_ep[5]}"; val="${_ep[6]}"; needs_br="${_ep[7]}"
+        node_proxy_map["$node_name"]="$proxy_name"
+        node_port_map["$node_name"]="$port"
+        proxies=$(echo "$proxies" | jq -c --arg name "$proxy_name" --arg host "$host" --argjson port "$port" \
+            --arg user "$user" --arg pass "$pass" '
+            . + [ {
+                name: $name, protocol: "SOCKS5_PROXY_PROTOCOL", host: $host, port: $port
+            } + (if ($user|length)>0 and ($pass|length)>0 then {socks5Authentication:{user:$user,password:$pass}} else {} end) ]')
+        # loop prevention DIRECT for upstream
+        if [[ "$kind" == "ip" ]]; then
+            erules=$(echo "$erules" | jq -c --arg v "$val" '. + [{ipRanges:[$v], action:"DIRECT"}]')
+        else
+            erules=$(echo "$erules" | jq -c --arg v "$val" '. + [{domainNames:[$v], action:"DIRECT"}]')
+        fi
+        if [[ "$needs_br" == "1" ]]; then
+            allow_loop=true
+            bridges=$(echo "$bridges" | jq -c --arg name "$node_name" --argjson port "$port" --arg slug "$(_mieru_proxy_slug "$node_name")" '
+                . + [{name:$name, port:$port, inbound:("mieru-bridge-"+$slug), tag:("chain-"+$name+"-prefer-ipv4")}]')
+            node_idx=$((node_idx + 1))
+        elif [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
+            allow_loop=true
+        fi
+    done <<< "$sorted_nodes"
+
+    # 逐条 routing_rules（保序）；遇首个 unsafe → 其余进 fallback
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        if [[ "$hit_unsafe" == "1" ]]; then
+            fallback_rules=$(echo "$fallback_rules" | jq -c --argjson r "$rule" '. + [$r]')
+            continue
+        fi
+        if ! _mieru_rule_match_safe "$rule"; then
+            hit_unsafe=1
+            fallback_rules=$(echo "$fallback_rules" | jq -c --argjson r "$rule" '. + [$r]')
+            continue
+        fi
+        rule_type=$(echo "$rule" | jq -r '.type // empty')
+        outbound=$(echo "$rule" | jq -r '.outbound // empty')
+        domains=$(echo "$rule" | jq -r '.domains // ""')
+        case "$outbound" in
+            direct) action="DIRECT"; proxy_name="" ;;
+            block|reject) action="REJECT"; proxy_name="" ;;
+            chain:*)
+                action="PROXY"
+                node_name="${outbound#chain:}"
+                proxy_name="${node_proxy_map[$node_name]:-}"
+                [[ -n "$proxy_name" ]] || continue
+                ;;
+            *)
+                # warp/balancer 等：unsafe 走 fallback
+                hit_unsafe=1
+                fallback_rules=$(echo "$fallback_rules" | jq -c --argjson r "$rule" '. + [$r]')
+                continue
+                ;;
+        esac
+        if [[ "$rule_type" == "all" ]]; then
+            if [[ "$action" == "PROXY" ]]; then
+                erules=$(echo "$erules" | jq -c --arg p "$proxy_name" \
+                    '. + [{ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:[$p]}]')
+            else
+                erules=$(echo "$erules" | jq -c --arg a "$action" \
+                    '. + [{ipRanges:["*"], domainNames:["*"], action:$a}]')
+            fi
+            continue
+        fi
+        domain_list=""; ip_list=""
+        for item in $(echo "$domains" | tr ',' ' '); do
+            [[ -z "$item" ]] && continue
+            if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
+                [[ -n "$ip_list" ]] && ip_list+=","
+                # bare IPv4 → /32
+                if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    ip_list+="${item}/32"
+                elif [[ "$item" == *:* && "$item" != */* ]]; then
+                    ip_list+="${item}/128"
+                else
+                    ip_list+="$item"
+                fi
+            else
+                [[ -n "$domain_list" ]] && domain_list+=","
+                domain_list+="$item"
+            fi
+        done
+        if [[ -n "$domain_list" ]]; then
+            local djson
+            djson=$(echo "$domain_list" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
+            if [[ "$action" == "PROXY" ]]; then
+                erules=$(echo "$erules" | jq -c --argjson d "$djson" --arg p "$proxy_name" \
+                    '. + [{domainNames:$d, action:"PROXY", proxyNames:[$p]}]')
+            else
+                erules=$(echo "$erules" | jq -c --argjson d "$djson" --arg a "$action" \
+                    '. + [{domainNames:$d, action:$a}]')
+            fi
+        fi
+        if [[ -n "$ip_list" ]]; then
+            local ijson
+            ijson=$(echo "$ip_list" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
+            if [[ "$action" == "PROXY" ]]; then
+                erules=$(echo "$erules" | jq -c --argjson i "$ijson" --arg p "$proxy_name" \
+                    '. + [{ipRanges:$i, action:"PROXY", proxyNames:[$p]}]')
+            else
+                erules=$(echo "$erules" | jq -c --argjson i "$ijson" --arg a "$action" \
+                    '. + [{ipRanges:$i, action:$a}]')
+            fi
+        fi
+    done < <(echo "$rules" | jq -c '.[]')
+
+    # fallback bridge：剩余规则经独立 SOCKS（40100+N）
+    if echo "$fallback_rules" | jq -e 'length > 0' >/dev/null 2>&1; then
+        local fb_port fb_name
+        fb_port=$(( ${MIERU_CHAIN_SOCKS_PORT:-40100} + node_idx ))
+        fb_name="routing-fallback"
+        allow_loop=true
+        proxies=$(echo "$proxies" | jq -c --argjson port "$fb_port" '
+            . + [{name:"proxy-routing-fallback", protocol:"SOCKS5_PROXY_PROTOCOL", host:"127.0.0.1", port:$port}]')
+        erules=$(echo "$erules" | jq -c '
+            . + [{ipRanges:["127.0.0.1/32"], action:"DIRECT"}]
+             + [{ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-routing-fallback"]}]')
+        bridges=$(echo "$bridges" | jq -c --argjson port "$fb_port" '
+            . + [{name:"routing-fallback", port:$port, inbound:"mieru-routing-fallback", tag:"mieru-routing-fallback-out", fallback:true}]')
+    fi
+
+    jq -n --argjson proxies "$proxies" --argjson rules "$erules" --argjson bridges "$bridges" \
+        --argjson fb "$fallback_rules" --argjson loop "$allow_loop" \
+        '{mode:"multi", legacy_name:"", proxies:$proxies, rules:$rules, bridges:$bridges, allowLoopbackIP:$loop, fallback_rules:$fb}'
+}
+
+# 把 compile plan 的 egress 写入 candidate mieru.json
+_mieru_apply_egress_to_candidate() {
+    local candidate="$1" plan="$2" mode
+    mode=$(echo "$plan" | jq -r '.mode // "legacy"')
+    if [[ "$mode" != "multi" ]]; then
+        # legacy single socks5-chain
+        local chain_name node node_type egress_host egress_port egress_user egress_pass direct_kind direct_val tmp
+        chain_name=$(echo "$plan" | jq -r '.legacy_name // empty')
+        [[ -z "$chain_name" ]] && return 0
+        node=$(db_get_chain_node "$chain_name") || return 0
+        node_type=$(echo "$node" | jq -r '.type // empty')
+        [[ -z "$node_type" ]] && return 0
+        if [[ "$node_type" == "socks" || "$node_type" == "socks5" ]]; then
+            egress_host=$(echo "$node" | jq -r '.server // empty')
+            egress_port=$(echo "$node" | jq -r '.port // empty' | tr -d '"' | tr -d ' ')
+            egress_user=$(echo "$node" | jq -r '.username // empty')
+            egress_pass=$(echo "$node" | jq -r '.password // empty')
+            egress_host="${egress_host#[}"; egress_host="${egress_host%]}"
+            read -r direct_kind direct_val < <(_mieru_egress_classify "$egress_host")
+        else
+            if ! check_cmd xray; then
+                _warn "链式出口需要 Xray 适配，Xray 不可用，mieru 使用直连" >&2
+                return 0
+            fi
+            egress_host="127.0.0.1"
+            egress_port="${MIERU_CHAIN_SOCKS_PORT:-40100}"
+            egress_user=""; egress_pass=""
+            direct_kind="ip"; direct_val="127.0.0.1/32"
+        fi
+        [[ -n "$egress_host" && "$egress_port" =~ ^[0-9]+$ ]] || return 0
+        tmp=$(mktemp "$CFG/.mieru-egress.XXXXXX") || return 1
+        if jq --arg host "$egress_host" --argjson port "$egress_port" \
+            --arg user "$egress_user" --arg pass "$egress_pass" \
+            --arg dkind "$direct_kind" --arg dval "$direct_val" '
+            .egress = (
+                {
+                    proxies: [ (
+                        {name:"socks5-chain", protocol:"SOCKS5_PROXY_PROTOCOL", host:$host, port:$port}
+                        + (if ($user|length)>0 and ($pass|length)>0 then {socks5Authentication:{user:$user,password:$pass}} else {} end)
+                    ) ],
+                    rules: [
+                        (if $dkind == "ip" then {ipRanges:[$dval], action:"DIRECT"} else {domainNames:[$dval], action:"DIRECT"} end),
+                        {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["socks5-chain"]}
+                    ]
+                }
+                + (if $host == "127.0.0.1" or $host == "::1" then {allowLoopbackIP:true} else {} end)
+            )
+        ' "$candidate" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$candidate"
+        else
+            rm -f "$tmp"
+            _err "mieru egress 配置生成失败"
+            return 1
+        fi
+        return 0
+    fi
+
+    local proxies rules allow_loop tmp
+    proxies=$(echo "$plan" | jq -c '.proxies // []')
+    rules=$(echo "$plan" | jq -c '.rules // []')
+    allow_loop=$(echo "$plan" | jq -r '.allowLoopbackIP // false')
+    [[ "$(echo "$proxies" | jq 'length')" -gt 0 || "$(echo "$rules" | jq 'length')" -gt 0 ]] || return 0
+    tmp=$(mktemp "$CFG/.mieru-egress.XXXXXX") || return 1
+    if jq --argjson proxies "$proxies" --argjson rules "$rules" --argjson loop "$allow_loop" '
+        .egress = ({proxies:$proxies, rules:$rules} + (if $loop then {allowLoopbackIP:true} else {} end))
+    ' "$candidate" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$candidate"
+    else
+        rm -f "$tmp"
+        _err "mieru multi-egress 配置生成失败"
+        return 1
+    fi
+}
+
+# 注入隔离 SOCKS 桥：inboundTag→该 chain outbound only；fallback 用剩余分流规则
 _inject_mieru_chain_bridge() {
     [[ -f "$CFG/config.json" ]] || return 1
     _mieru_chain_needs_xray_bridge || return 1
-    local node_name out_tag chain_out inbound tmp
-    node_name=$(_mieru_chain_node_name) || return 1
-    out_tag="chain-${node_name}-prefer-ipv4"
-    chain_out=$(gen_xray_chain_outbound "$node_name" "$out_tag" "prefer_ipv4")
-    [[ -n "$chain_out" ]] || { _err "mieru 链式出口 outbound 生成失败: $node_name"; return 1; }
-    inbound=$(jq -n --argjson port "${MIERU_CHAIN_SOCKS_PORT:-40100}" '{
-        listen: "127.0.0.1",
-        port: $port,
-        protocol: "socks",
-        settings: {auth: "noauth", udp: true},
-        tag: "mieru-chain-in"
-    }')
-    tmp=$(mktemp) || return 1
-    if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" '
-        .inbounds = (([.inbounds[]? | select(.tag != "mieru-chain-in")]) + [$inbound])
-        | if ([.outbounds[]? | .tag] | index($tag)) then . else
-            .outbounds = ((.outbounds // []) + [$outbound])
-          end
-        | if .routing then . else .routing = {domainStrategy: "IPIfNonMatch", rules: []} end
-        | (.routing.rules // []) as $rules
-        | ($rules | map(select((.inboundTag // []) != ["mieru-chain-in"]))) as $filtered
-        | {type: "field", inboundTag: ["mieru-chain-in"], outboundTag: $tag} as $bridge_rule
-        | ($filtered | to_entries | map(select(.value.inboundTag == ["api"])) | .[0].key) as $api_idx
-        | .routing.rules = (
-            if $api_idx == null then
-                [$bridge_rule] + $filtered
-            else
-                $filtered[0:($api_idx+1)] + [$bridge_rule] + $filtered[($api_idx+1):]
-            end
-          )
-    ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$CFG/config.json"
-        return 0
+    local plan bridges tmp
+    plan=$(_mieru_compile_egress_plan) || return 1
+
+    if [[ "$(echo "$plan" | jq -r '.mode')" != "multi" ]]; then
+        # legacy 单桥
+        local node_name out_tag chain_out inbound
+        node_name=$(_mieru_chain_node_name) || return 1
+        out_tag="chain-${node_name}-prefer-ipv4"
+        chain_out=$(gen_xray_chain_outbound "$node_name" "$out_tag" "prefer_ipv4")
+        [[ -n "$chain_out" ]] || { _err "mieru 链式出口 outbound 生成失败: $node_name"; return 1; }
+        inbound=$(jq -n --argjson port "${MIERU_CHAIN_SOCKS_PORT:-40100}" '{
+            listen:"127.0.0.1", port:$port, protocol:"socks",
+            settings:{auth:"noauth", udp:true}, tag:"mieru-chain-in"
+        }')
+        tmp=$(mktemp) || return 1
+        if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" '
+            .inbounds = (([.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]) + [$inbound])
+            | if ([.outbounds[]? | .tag] | index($tag)) then . else .outbounds = ((.outbounds // []) + [$outbound]) end
+            | if .routing then . else .routing = {domainStrategy:"IPIfNonMatch", rules:[]} end
+            | (.routing.rules // []) as $rules
+            | ($rules | map(select((.inboundTag // []) != ["mieru-chain-in"]
+                and ((.inboundTag // [""]) | map(startswith("mieru-bridge-") or . == "mieru-routing-fallback") | any | not)))) as $filtered
+            | {type:"field", inboundTag:["mieru-chain-in"], outboundTag:$tag} as $bridge_rule
+            | ($filtered | to_entries | map(select(.value.inboundTag == ["api"])) | .[0].key) as $api_idx
+            | .routing.rules = (if $api_idx == null then [$bridge_rule] + $filtered else $filtered[0:($api_idx+1)] + [$bridge_rule] + $filtered[($api_idx+1):] end)
+        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$CFG/config.json"
+            return 0
+        fi
+        rm -f "$tmp"
+        return 1
     fi
-    rm -f "$tmp"
-    return 1
+
+    bridges=$(echo "$plan" | jq -c '.bridges // []')
+    [[ "$(echo "$bridges" | jq 'length')" -gt 0 ]] || return 1
+
+    # strip old mieru bridge inbounds/rules
+    tmp=$(mktemp) || return 1
+    jq '
+        .inbounds = [.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]
+        | if .routing then . else .routing = {domainStrategy:"IPIfNonMatch", rules:[]} end
+        | .routing.rules = ((.routing.rules // []) | map(select(
+            ((.inboundTag // []) | map(startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | any) | not
+          )))
+    ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+
+    local bridge name port inbound_tag out_tag chain_out inbound fb_rules
+    while IFS= read -r bridge; do
+        [[ -z "$bridge" ]] && continue
+        name=$(echo "$bridge" | jq -r '.name')
+        port=$(echo "$bridge" | jq -r '.port')
+        inbound_tag=$(echo "$bridge" | jq -r '.inbound')
+        out_tag=$(echo "$bridge" | jq -r '.tag')
+        if echo "$bridge" | jq -e '.fallback == true' >/dev/null 2>&1; then
+            # fallback outbound = freedom; rules from fallback_rules with inboundTag
+            fb_rules=$(echo "$plan" | jq -c '.fallback_rules // []')
+            inbound=$(jq -n --argjson port "$port" --arg tag "$inbound_tag" '{
+                listen:"127.0.0.1", port:$port, protocol:"socks",
+                settings:{auth:"noauth", udp:true}, tag:$tag
+            }')
+            # ensure freedom outbound tag
+            local freedom='{"tag":"mieru-routing-fallback-out","protocol":"freedom","settings":{}}'
+            tmp=$(mktemp) || return 1
+            # build scoped routing rules from fallback_rules (simplified: chain/direct/block only)
+            local scoped='[]' fr outbound tag domains rtype
+            while IFS= read -r fr; do
+                [[ -z "$fr" ]] && continue
+                outbound=$(echo "$fr" | jq -r '.outbound // empty')
+                rtype=$(echo "$fr" | jq -r '.type // empty')
+                domains=$(echo "$fr" | jq -r '.domains // ""')
+                case "$outbound" in
+                    direct) tag="direct-prefer-ipv4" ;;
+                    block|reject) tag="block" ;;
+                    chain:*) tag="chain-${outbound#chain:}-prefer-ipv4"
+                        # ensure outbound exists
+                        local n="${outbound#chain:}" co
+                        co=$(gen_xray_chain_outbound "$n" "$tag" "prefer_ipv4")
+                        if [[ -n "$co" ]]; then
+                            local t2
+                            t2=$(mktemp)
+                            jq --argjson o "$co" --arg t "$tag" 'if ([.outbounds[]?|.tag]|index($t)) then . else .outbounds=(.outbounds//[])+[$o] end' "$CFG/config.json" > "$t2" && mv "$t2" "$CFG/config.json"
+                        fi
+                        ;;
+                    *) tag="direct-prefer-ipv4" ;;
+                esac
+                if [[ "$rtype" == "all" ]]; then
+                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --arg t "$tag" \
+                        '. + [{type:"field", inboundTag:[$in], network:"tcp,udp", outboundTag:$t}]')
+                elif [[ "$domains" == geosite:* ]]; then
+                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --arg d "$domains" --arg t "$tag" \
+                        '. + [{type:"field", inboundTag:[$in], domain:[$d], outboundTag:$t}]')
+                elif [[ "$domains" == geoip:* || "$domains" =~ ^geoip: ]]; then
+                    local ips
+                    ips=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
+                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ips "$ips" --arg t "$tag" \
+                        '. + [{type:"field", inboundTag:[$in], ip:$ips, outboundTag:$t}]')
+                elif [[ -n "$domains" ]]; then
+                    local ds
+                    ds=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
+                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ds "$ds" --arg t "$tag" \
+                        '. + [{type:"field", inboundTag:[$in], domain:$ds, outboundTag:$t}]')
+                fi
+            done < <(echo "$fb_rules" | jq -c '.[]')
+            # default catch-all on fallback inbound → freedom
+            scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" \
+                '. + [{type:"field", inboundTag:[$in], network:"tcp,udp", outboundTag:"mieru-routing-fallback-out"}]')
+            if jq --argjson inbound "$inbound" --argjson outbound "$freedom" --argjson scoped "$scoped" '
+                .inbounds = ((.inbounds // []) + [$inbound])
+                | if ([.outbounds[]?|.tag]|index("mieru-routing-fallback-out")) then . else .outbounds=(.outbounds//[])+[$outbound] end
+                | .routing.rules = ((.routing.rules // []) + $scoped)
+            ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$CFG/config.json"
+            else
+                rm -f "$tmp"; return 1
+            fi
+            continue
+        fi
+
+        chain_out=$(gen_xray_chain_outbound "$name" "$out_tag" "prefer_ipv4")
+        [[ -n "$chain_out" ]] || { _err "mieru 链式出口 outbound 生成失败: $name"; return 1; }
+        inbound=$(jq -n --argjson port "$port" --arg tag "$inbound_tag" '{
+            listen:"127.0.0.1", port:$port, protocol:"socks",
+            settings:{auth:"noauth", udp:true}, tag:$tag
+        }')
+        tmp=$(mktemp) || return 1
+        if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" --arg in_tag "$inbound_tag" '
+            .inbounds = ((.inbounds // []) + [$inbound])
+            | if ([.outbounds[]?|.tag]|index($tag)) then . else .outbounds=(.outbounds//[])+[$outbound] end
+            | .routing.rules = ((.routing.rules // []) + [{type:"field", inboundTag:[$in_tag], outboundTag:$tag}])
+        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$CFG/config.json"
+        else
+            rm -f "$tmp"; return 1
+        fi
+    done < <(echo "$bridges" | jq -c '.[]')
+    return 0
 }
 
 # 使用独立 protobuf 配置和控制套接字校验候选配置，不污染正式状态。
@@ -5424,84 +5843,16 @@ generate_mieru_config() {
         return 1
     fi
 
-    local chain_name="" node="" node_type=""
-    chain_name=$(_mieru_chain_node_name 2>/dev/null || true)
-    if [[ -n "$chain_name" ]]; then
-        node=$(db_get_chain_node "$chain_name")
-        node_type=$(echo "$node" | jq -r '.type // empty')
-    fi
-
-    if [[ -n "$node" && -n "$node_type" ]]; then
-        local egress_host="" egress_port="" egress_user="" egress_pass="" direct_kind="" direct_val=""
-        if [[ "$node_type" == "socks" || "$node_type" == "socks5" ]]; then
-            egress_host=$(echo "$node" | jq -r '.server // empty')
-            egress_port=$(echo "$node" | jq -r '.port // empty')
-            egress_port=$(echo "$egress_port" | tr -d '"' | tr -d ' ')
-            egress_user=$(echo "$node" | jq -r '.username // empty')
-            egress_pass=$(echo "$node" | jq -r '.password // empty')
-            egress_host="${egress_host#[}"
-            egress_host="${egress_host%]}"
-            if [[ "$egress_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                direct_kind="ip"
-                direct_val="${egress_host}/32"
-            elif [[ "$egress_host" == *:* && "$egress_host" =~ ^[0-9a-fA-F:]+$ ]]; then
-                direct_kind="ip"
-                direct_val="${egress_host}/128"
-            else
-                direct_kind="domain"
-                direct_val="$egress_host"
-            fi
-        elif _mieru_chain_needs_xray_bridge; then
-            if ! check_cmd xray; then
-                _warn "链式出口需要 Xray 适配，Xray 不可用，mieru 使用直连" >&2
-                egress_host=""
-            else
-                egress_host="127.0.0.1"
-                egress_port="${MIERU_CHAIN_SOCKS_PORT:-40100}"
-                egress_user=""
-                egress_pass=""
-                direct_kind="ip"
-                direct_val="127.0.0.1/32"
-            fi
-        fi
-
-        if [[ -n "$egress_host" && "$egress_port" =~ ^[0-9]+$ ]]; then
-            local tmp
-            tmp=$(mktemp "$CFG/.mieru-egress.XXXXXX") || { rm -f "$candidate"; return 1; }
-            if jq --arg host "$egress_host" --argjson port "$egress_port" \
-                --arg user "$egress_user" --arg pass "$egress_pass" \
-                --arg dkind "$direct_kind" --arg dval "$direct_val" '
-                .egress = {
-                    proxies: [
-                        (
-                            {
-                                name: "socks5-chain",
-                                protocol: "SOCKS5_PROXY_PROTOCOL",
-                                host: $host,
-                                port: $port
-                            }
-                            + (if ($user | length) > 0 and ($pass | length) > 0 then
-                                {socks5Authentication: {user: $user, password: $pass}}
-                               else {} end)
-                        )
-                    ],
-                    rules: [
-                        (if $dkind == "ip" then
-                            {ipRanges: [$dval], action: "DIRECT"}
-                         else
-                            {domainNames: [$dval], action: "DIRECT"}
-                         end),
-                        {ipRanges: ["*"], domainNames: ["*"], action: "PROXY", proxyNames: ["socks5-chain"]}
-                    ]
-                }
-            ' "$candidate" > "$tmp" 2>/dev/null; then
-                mv "$tmp" "$candidate"
-            else
-                rm -f "$tmp" "$candidate"
-                _err "mieru egress 配置生成失败"
-                return 1
-            fi
-        fi
+    # 分流管理 → mieru egress（multi 编译器；legacy 单链保留 socks5-chain）
+    local egress_plan
+    egress_plan=$(_mieru_compile_egress_plan) || {
+        rm -f "$candidate"
+        _err "mieru egress 编译失败"
+        return 1
+    }
+    if ! _mieru_apply_egress_to_candidate "$candidate" "$egress_plan"; then
+        rm -f "$candidate"
+        return 1
     fi
 
     if ! jq empty "$candidate" 2>/dev/null; then
@@ -20739,9 +21090,9 @@ manage_chain_proxy() {
             local mieru_inferred
             mieru_inferred=$(_infer_global_chain_node 2>/dev/null || true)
             if [[ -n "$mieru_inferred" ]]; then
-                echo -e "  mieru 链式出口: ${C}${mieru_inferred}${NC} ${D}(跟随全局)${NC}"
+                echo -e "  mieru 出口: ${C}${mieru_inferred}${NC} ${D}(分流规则)${NC}"
             else
-                echo -e "  mieru 链式出口: ${D}直连${NC} ${D}(跟随全局)${NC}"
+                echo -e "  mieru 出口: ${D}直连/分流${NC}"
             fi
         fi
         _line
@@ -22111,9 +22462,9 @@ show_single_protocol_info() {
             local mieru_inferred
             mieru_inferred=$(_infer_global_chain_node 2>/dev/null || true)
             if [[ -n "$mieru_inferred" ]]; then
-                echo -e "  链式: ${G}$mieru_inferred${NC} ${D}(跟随全局)${NC}"
+                echo -e "  出口: ${G}$mieru_inferred${NC} ${D}(分流规则)${NC}"
             else
-                echo -e "  链式: ${D}直连${NC} ${D}(跟随全局)${NC}"
+                echo -e "  出口: ${D}直连/分流${NC}"
             fi
             ;;
         snell-shadowtls)
@@ -24925,9 +25276,9 @@ do_install_server() {
             local _mieru_inherit
             _mieru_inherit=$(_infer_global_chain_node 2>/dev/null || true)
             if [[ -n "$_mieru_inherit" ]]; then
-                echo -e "  链式出口: ${G}$_mieru_inherit${NC} ${D}(跟随全局)${NC}"
+                echo -e "  出口: ${G}$_mieru_inherit${NC} ${D}(分流规则)${NC}"
             else
-                echo -e "  链式出口: ${D}跟随全局${NC}"
+                echo -e "  出口: ${D}分流管理${NC}"
             fi
             echo -e "  ${D}共享用户池；无 port→user ACL；运行时由数据库重建${NC}"
             _line
