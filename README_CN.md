@@ -4,7 +4,7 @@
 
 Linux 服务器一体化代理部署脚本。
 
-它可以帮助你快速部署和管理多种协议，包括 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5**、**SS2022**、**VLESS Encryption + FinalMask (Sudoku)** 和 **mieru**。
+它可以帮助你快速部署和管理多种协议，包括 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5**、**SS2022**、**VLESS Encryption + FinalMask (Sudoku)**、**mieru** 和 **SSH Tunnel**。
 
 ## 文档
 
@@ -19,6 +19,8 @@ Linux 服务器一体化代理部署脚本。
 - 适配 Debian、Ubuntu、CentOS 和 Alpine
 - 基于 Xray + Sing-box 双核心架构
 - 提供用户管理、路由、订阅与故障排查文档
+- **mieru：** TCP/UDP 传输、原生 `port` 或 `portRange` 绑定、流量模式（高级）默认关闭（关闭 / 保守 / 自定义）；官方 `mierus://` 分享链接
+- **SSH Tunnel：** 仅使用服务器已有 OpenSSH — 仅公钥认证、TCP `-L` / `-D` / `-R`、无 shell/exec/TTY/SFTP、无原生 UDP、无 `ssh://` URI
 
 ## 快速安装
 
@@ -26,7 +28,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.19**
+当前脚本版本：**v3.5.20**
 
 ## 文档入口
 

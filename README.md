@@ -4,7 +4,7 @@
 
 An all-in-one proxy deployment script for Linux servers.
 
-It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, and **mieru**.
+It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, **mieru**, and **SSH Tunnel**.
 
 ## Documentation
 
@@ -19,6 +19,8 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - Built for Debian, Ubuntu, CentOS, and Alpine
 - Xray + Sing-box dual-core architecture
 - User management, routing, subscriptions, and troubleshooting docs
+- **mieru:** TCP/UDP transport, native `port` or `portRange` bindings, Traffic Pattern (Advanced) default Off (Off / Conservative / Custom); official `mierus://` share links
+- **SSH Tunnel:** uses the server’s existing OpenSSH only — key-only auth, TCP `-L` / `-D` / `-R`, no shell/exec/TTY/SFTP, no native UDP, no `ssh://` URI
 
 ## Quick Install
 
@@ -26,7 +28,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.19**
+Current script version: **v3.5.20**
 
 ## Documents
 
