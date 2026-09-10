@@ -14278,6 +14278,13 @@ _ssh_tunnel_build_dropin() {
                 out+="    PermitOpen ${target}\\n"
             fi
         fi
+        # bind_addr: R 模式写 PermitListen；L 为客户端绑定不落 drop-in
+        # port: 仅存 db 供分享/UI（sshd Port 全局，不进 Match）
+        if [[ "$mode" == "R" && -n "$bind_addr" ]]; then
+            if [[ "$bind_addr" =~ ^(\*|\[?[0-9a-fA-F:.]+\]?)$ ]]; then
+                out+="    PermitListen ${bind_addr}:*\\n"
+            fi
+        fi
         out+="\\n"
     done <<< "$items"
     out+="Match Group ${SSH_TUNNEL_GROUP}\\n"
@@ -14399,13 +14406,20 @@ apply_ssh_tunnel_config() {
         return 1
     fi
 
-    # Admin verify first user if present
+    # Admin verify first user — fail-closed: rollback drop-in (Reviewer)
     local first_user
     first_user=$(db_get "xray" "ssh-tunnel" | jq -r 'if type=="array" then .[0].username // empty else .username // empty end')
-    if [[ -n "$first_user" ]]; then
-        if ! _ssh_tunnel_admin_verify "$first_user"; then
-            _warn "sshd -T 用户校验未完全通过（继续保留配置，请人工复查）"
+    if [[ -n "$first_user" ]] && ! _ssh_tunnel_admin_verify "$first_user"; then
+        if [[ -n "$bak" && -f "$bak" ]]; then
+            cp -f "$bak" "$live"
+            _ssh_tunnel_reload || true
+        else
+            rm -f "$live"
+            _ssh_tunnel_reload || true
         fi
+        rm -f "$bak"
+        _err "sshd -T 用户校验失败，已回滚 drop-in"
+        return 1
     fi
     rm -f "$bak"
     _ok "SSH Tunnel (OpenSSH) 配置已应用"
