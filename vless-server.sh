@@ -274,6 +274,9 @@ db_get_field() {
 
 # 参数: $1=core(xray/singbox), $2=protocol
 # 返回: 端口列表，每行一个端口号
+# 实例键：数值 port 或 mieru v2 port_range 字符串（不含 null）
+_db_port_key_jq='def port_key: (if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring) else ((.port_range // .portRange // "")|tostring) end);'
+
 db_list_ports() {
     local core="$1" protocol="$2"
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -283,17 +286,16 @@ db_list_ports() {
 
     [[ -z "$config" || "$config" == "null" ]] && return 1
 
-    # 检查是否为数组
+    # port 或 port_range（mieru v2）；过滤空/null
     if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo "$config" | jq -r '.[].port'
+        echo "$config" | jq -r "$_db_port_key_jq"' .[] | port_key | select(length > 0 and . != "null")'
     else
-        # 兼容旧格式（单个对象）
-        echo "$config" | jq -r '.port // empty'
+        echo "$config" | jq -r "$_db_port_key_jq"' port_key | select(length > 0 and . != "null")'
     fi
 }
 
 # 获取指定端口的配置
-# 参数: $1=core, $2=protocol, $3=port
+# 参数: $1=core, $2=protocol, $3=port 或 port_range 字符串
 # 返回: JSON配置对象
 db_get_port_config() {
     local core="$1" protocol="$2" port="$3"
@@ -305,10 +307,10 @@ db_get_port_config() {
     [[ -z "$config" || "$config" == "null" ]] && return 1
 
     if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo "$config" | jq --arg port "$port" '.[] | select(.port == ($port | tonumber))'
+        echo "$config" | jq --arg port "$port" "$_db_port_key_jq"' .[] | select(port_key == $port)'
     else
-        # 兼容旧格式
-        local existing_port=$(echo "$config" | jq -r '.port')
+        local existing_port
+        existing_port=$(echo "$config" | jq -r "$_db_port_key_jq"' port_key')
         [[ "$existing_port" == "$port" ]] && echo "$config"
     fi
 }
@@ -319,8 +321,13 @@ db_add_port() {
     local core="$1" protocol="$2" port_config="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    # 提取要添加的端口号
-    local new_port=$(echo "$port_config" | jq -r '.port')
+    # 提取实例键：port 或 port_range
+    local new_port
+    new_port=$(echo "$port_config" | jq -r "$_db_port_key_jq"' port_key')
+    [[ -z "$new_port" || "$new_port" == "null" ]] && {
+        _err "db_add_port: 缺少 port/port_range"
+        return 1
+    }
     
     # 检查端口是否已存在
     local existing_ports=$(db_list_ports "$core" "$protocol")
@@ -350,16 +357,16 @@ db_remove_port() {
     local core="$1" protocol="$2" port="$3"
     [[ ! -f "$DB_FILE" ]] && return 1
     
+    # 匹配数值 port 或 mieru port_range 字符串
     _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" '
+        def port_key:
+            if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+            else ((.port_range // .portRange // "")|tostring) end;
         .[$c][$p] = (
             if (.[$c][$p] | type) == "array" then
-                .[$c][$p] | map(select(.port != ($port | tonumber)))
+                .[$c][$p] | map(select(port_key != $port))
             else
-                if .[$c][$p].port == ($port | tonumber) then
-                    null
-                else
-                    .[$c][$p]
-                end
+                if (.[$c][$p] | port_key) == $port then null else .[$c][$p] end
             end
         ) | if .[$c][$p] == [] or .[$c][$p] == null then
             del(.[$c][$p])
@@ -370,21 +377,20 @@ db_remove_port() {
 }
 
 # 更新指定端口的配置
-# 参数: $1=core, $2=protocol, $3=port, $4=new_config_json
+# 参数: $1=core, $2=protocol, $3=port 或 port_range, $4=new_config_json
 db_update_port() {
     local core="$1" protocol="$2" port="$3" new_config="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
     _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
+        def port_key:
+            if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+            else ((.port_range // .portRange // "")|tostring) end;
         .[$c][$p] = (
             if (.[$c][$p] | type) == "array" then
-                .[$c][$p] | map(if .port == ($port | tonumber) then $cfg else . end)
+                .[$c][$p] | map(if port_key == $port then $cfg else . end)
             else
-                if .[$c][$p].port == ($port | tonumber) then
-                    $cfg
-                else
-                    .[$c][$p]
-                end
+                if (.[$c][$p] | port_key) == $port then $cfg else .[$c][$p] end
             end
         )
     '
@@ -4918,11 +4924,19 @@ _mieru_compile_egress_plan() {
     sorted_nodes=$(echo "$rules" | jq -r '[.[] | .outbound // empty | select(startswith("chain:")) | .[6:]] | unique | sort | .[]' 2>/dev/null)
     while IFS= read -r node_name; do
         [[ -z "$node_name" ]] && continue
-        if ! mapfile -t _ep < <(_mieru_resolve_proxy_endpoint "$node_name" "$node_idx"); then
+        local _ep_raw=""
+        if ! _ep_raw=$(_mieru_resolve_proxy_endpoint "$node_name" "$node_idx"); then
+            _warn "跳过缺失或不支持的链式节点: $node_name" >&2
             continue
         fi
+        local _ep=()
+        mapfile -t _ep <<< "$_ep_raw"
         host="${_ep[0]}"; port="${_ep[1]}"; user="${_ep[2]}"; pass="${_ep[3]}"
         proxy_name="${_ep[4]}"; kind="${_ep[5]}"; val="${_ep[6]}"; needs_br="${_ep[7]}"
+        [[ -n "$host" && "$port" =~ ^[0-9]+$ && -n "$proxy_name" ]] || {
+            _warn "跳过无效链式节点端点: $node_name" >&2
+            continue
+        }
         node_proxy_map["$node_name"]="$proxy_name"
         node_port_map["$node_name"]="$port"
         proxies=$(echo "$proxies" | jq -c --arg name "$proxy_name" --arg host "$host" --argjson port "$port" \
@@ -5094,7 +5108,6 @@ _mieru_apply_egress_to_candidate() {
                         {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["socks5-chain"]}
                     ]
                 }
-                + (if $host == "127.0.0.1" or $host == "::1" then {allowLoopbackIP:true} else {} end)
             )
         ' "$candidate" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$candidate"
@@ -5112,8 +5125,9 @@ _mieru_apply_egress_to_candidate() {
     allow_loop=$(echo "$plan" | jq -r '.allowLoopbackIP // false')
     [[ "$(echo "$proxies" | jq 'length')" -gt 0 || "$(echo "$rules" | jq 'length')" -gt 0 ]] || return 0
     tmp=$(mktemp "$CFG/.mieru-egress.XXXXXX") || return 1
-    if jq --argjson proxies "$proxies" --argjson rules "$rules" --argjson loop "$allow_loop" '
-        .egress = ({proxies:$proxies, rules:$rules} + (if $loop then {allowLoopbackIP:true} else {} end))
+    # mita 3.36 rejects allowLoopbackIP — never emit that field
+    if jq --argjson proxies "$proxies" --argjson rules "$rules" '
+        .egress = {proxies:$proxies, rules:$rules}
     ' "$candidate" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$candidate"
     else
@@ -5123,10 +5137,33 @@ _mieru_apply_egress_to_candidate() {
     fi
 }
 
+# 清除孤儿 mieru SOCKS 桥（multi→direct/legacy 或不再需要桥时）
+_mieru_strip_orphan_bridges() {
+    [[ -f "$CFG/config.json" ]] || return 0
+    local tmp
+    tmp=$(mktemp) || return 1
+    if jq '
+        .inbounds = [.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]
+        | if .routing then . else . end
+        | .routing.rules = ((.routing.rules // []) | map(select(
+            ((.inboundTag // []) | map(startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | any) | not
+          )))
+    ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$CFG/config.json"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # 注入隔离 SOCKS 桥：inboundTag→该 chain outbound only；fallback 用剩余分流规则
 _inject_mieru_chain_bridge() {
     [[ -f "$CFG/config.json" ]] || return 1
-    _mieru_chain_needs_xray_bridge || return 1
+    # 无桥需求时仍必须剥离孤儿桥（P1）
+    if ! _mieru_chain_needs_xray_bridge; then
+        _mieru_strip_orphan_bridges
+        return 0
+    fi
     local plan bridges tmp
     plan=$(_mieru_compile_egress_plan) || return 1
 
@@ -5161,7 +5198,10 @@ _inject_mieru_chain_bridge() {
     fi
 
     bridges=$(echo "$plan" | jq -c '.bridges // []')
-    [[ "$(echo "$bridges" | jq 'length')" -gt 0 ]] || return 1
+    if [[ "$(echo "$bridges" | jq 'length')" -le 0 ]]; then
+        _mieru_strip_orphan_bridges
+        return 0
+    fi
 
     # strip old mieru bridge inbounds/rules
     tmp=$(mktemp) || return 1
@@ -14587,21 +14627,39 @@ _ssh_tunnel_valid_mode() {
     esac
 }
 
+_ssh_tunnel_reserved_username() {
+    case "$1" in
+        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|sshd|mita|ubuntu|admin|debian|ec2-user|centos|fedora|nfsnobody|systemd-network|systemd-resolve|messagebus)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Fail-closed: regex + denylist; reject ANY existing account (only brand-new nologin under tunnel group)
 _ssh_tunnel_valid_username() {
     local u="$1"
-    [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+    [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+    _ssh_tunnel_reserved_username "$u" && return 1
+    if id -u "$u" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
 }
 
 _ssh_tunnel_ensure_group_user() {
     local user="$1"
+    _ssh_tunnel_valid_username "$user" || {
+        _err "拒绝用户名 $user（保留名/已存在账户；仅允许新建 nologin 隧道用户）"
+        return 1
+    }
     getent group "$SSH_TUNNEL_GROUP" >/dev/null 2>&1 || groupadd -r "$SSH_TUNNEL_GROUP" 2>/dev/null || true
-    if ! id -u "$user" >/dev/null 2>&1; then
-        useradd -r -M -s /usr/sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
-            || useradd -r -M -s /sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
-            || { _err "无法创建系统用户 $user"; return 1; }
-    else
-        usermod -a -G "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null || true
+    if id -u "$user" >/dev/null 2>&1; then
+        _err "拒绝使用已存在用户 $user"
+        return 1
     fi
+    useradd -r -M -s /usr/sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
+        || useradd -r -M -s /sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
+        || { _err "无法创建系统用户 $user"; return 1; }
 }
 
 _ssh_tunnel_write_authorized_keys() {
@@ -25339,7 +25397,18 @@ do_install_server() {
     if [[ "$protocol" == "mieru" ]]; then
         generate_mieru_config || { _err "mieru 配置生成失败"; _limited_change_rollback; _pause; return 1; }
     fi
-    create_service "$protocol"
+    if ! create_service "$protocol"; then
+        _err "创建服务失败: $protocol"
+        if [[ "$protocol" == "ssh-tunnel" ]]; then
+            # fail-closed: gen 已写 keys+db，必须回滚
+            unregister_protocol "ssh-tunnel" 2>/dev/null || true
+            _ssh_tunnel_remove_runtime 2>/dev/null || true
+        else
+            _limited_change_rollback 2>/dev/null || true
+        fi
+        _pause
+        return 1
+    fi
     _info "启动服务..."
     
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
@@ -25365,6 +25434,7 @@ do_install_server() {
         fi
         _ok "$current_service 已启用并启动"
     elif [[ "$current_protocol" == "ssh-tunnel" ]]; then
+        # 仅 create_service/apply 成功后才宣称已应用
         _ok "SSH Tunnel 已通过系统 sshd 应用（无独立 vless unit）"
     fi
     
