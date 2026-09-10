@@ -594,6 +594,7 @@ get_protocol_name() {
         anytls) echo "AnyTLS" ;;
         naive) echo "NaïveProxy" ;;
         mieru) echo "mieru" ;;
+        ssh-tunnel) echo "SSH Tunnel" ;;
         *) echo "$proto" ;;
     esac
 }
@@ -3591,7 +3592,7 @@ XRAY_PROTOCOLS="vless vless-xhttp vless-finalmask vless-xhttp-cdn vless-ws vless
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic anytls"
 # 仍需独立进程的协议 (Snell 等闭源协议)
-STANDALONE_PROTOCOLS="snell snell-v5 snell-v6 snell-shadowtls snell-v5-shadowtls ss2022-shadowtls naive mieru"
+STANDALONE_PROTOCOLS="snell snell-v5 snell-v6 snell-shadowtls snell-v5-shadowtls ss2022-shadowtls naive mieru ssh-tunnel"
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
@@ -3622,6 +3623,7 @@ PROTO_SVC[snell-v6]="vless-snell-v6"; PROTO_EXEC[snell-v6]="/usr/local/bin/snell
 PROTO_SVC[anytls]="vless-anytls"; PROTO_KIND[anytls]="anytls"
 PROTO_SVC[naive]="vless-naive"; PROTO_KIND[naive]="naive"
 PROTO_SVC[mieru]="vless-mieru"; PROTO_EXEC[mieru]="/usr/local/bin/mita run"; PROTO_BIN[mieru]="mita"; PROTO_KIND[mieru]="mieru"
+PROTO_SVC[ssh-tunnel]="sshd"; PROTO_EXEC[ssh-tunnel]="/usr/sbin/sshd"; PROTO_BIN[ssh-tunnel]="sshd"; PROTO_KIND[ssh-tunnel]="ssh-tunnel"
 
 # ShadowTLS：主服务 shadow-tls + 额外 backend 服务
 for _p in snell-shadowtls snell-v5-shadowtls ss2022-shadowtls; do
@@ -14160,6 +14162,284 @@ gen_mieru_server_config() {
     echo "server" > "$CFG/role"
 }
 
+
+#═══════════════════════════════════════════════════════════════════════════════
+# SSH Tunnel（系统 OpenSSH）：Match Group、仅公钥、-N -L/-D/-R、无 shell/URI
+#═══════════════════════════════════════════════════════════════════════════════
+SSH_TUNNEL_GROUP="vless-ssh-tunnel"
+SSH_TUNNEL_DROPIN_NAME="99-vless-ssh-tunnel.conf"
+
+_ssh_tunnel_keys_dir() {
+    local user="$1"
+    printf '%s\n' "$CFG/ssh-tunnel/${user}"
+}
+
+_ssh_tunnel_authorized_keys_path() {
+    local user="$1"
+    printf '%s\n' "$CFG/ssh-tunnel/${user}/authorized_keys"
+}
+
+_ssh_tunnel_dropin_live() {
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        printf '%s\n' "/etc/ssh/sshd_config.d/${SSH_TUNNEL_DROPIN_NAME}"
+    else
+        printf '%s\n' "$CFG/ssh-tunnel/${SSH_TUNNEL_DROPIN_NAME}"
+    fi
+}
+
+_ssh_tunnel_valid_mode() {
+    case "$1" in
+        L|D|R) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_ssh_tunnel_valid_username() {
+    local u="$1"
+    [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+_ssh_tunnel_ensure_group_user() {
+    local user="$1"
+    getent group "$SSH_TUNNEL_GROUP" >/dev/null 2>&1 || groupadd -r "$SSH_TUNNEL_GROUP" 2>/dev/null || true
+    if ! id -u "$user" >/dev/null 2>&1; then
+        useradd -r -M -s /usr/sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
+            || useradd -r -M -s /sbin/nologin -g "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null \
+            || { _err "无法创建系统用户 $user"; return 1; }
+    else
+        usermod -a -G "$SSH_TUNNEL_GROUP" "$user" 2>/dev/null || true
+    fi
+}
+
+_ssh_tunnel_write_authorized_keys() {
+    local user="$1" pubkey="$2" dir path
+    dir=$(_ssh_tunnel_keys_dir "$user")
+    path=$(_ssh_tunnel_authorized_keys_path "$user")
+    mkdir -p "$dir" || return 1
+    # 拒绝把私钥特征写进 authorized_keys
+    if printf '%s' "$pubkey" | grep -qE 'BEGIN .*PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY'; then
+        _err "拒绝写入私钥内容；请仅粘贴公钥"
+        return 1
+    fi
+    [[ "$pubkey" =~ ^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]] ]] \
+        || { _err "公钥格式无效"; return 1; }
+    printf '%s\n' "$pubkey" > "$path" || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    chmod 600 "$path" || return 1
+    chown -R "${user}:${SSH_TUNNEL_GROUP}" "$dir" 2>/dev/null || true
+    printf '%s\n' "$path"
+}
+
+_ssh_tunnel_build_dropin() {
+    local cfg items=""
+    cfg=$(db_get "xray" "ssh-tunnel" 2>/dev/null) || cfg=""
+    [[ -n "$cfg" && "$cfg" != "null" ]] || { echo ""; return 1; }
+    items=$(echo "$cfg" | jq -c 'if type=="array" then .[] else . end')
+    local out="# Managed by vless-server.sh — SSH Tunnel (key-only, no shell)\\n"
+    out+="# Do not store private keys in db.json; AuthorizedKeysFile only.\\n"
+    local item user port mode bind_addr target akpath permit
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        user=$(echo "$item" | jq -r '.username // empty')
+        port=$(echo "$item" | jq -r '.port // empty')
+        mode=$(echo "$item" | jq -r '.mode // "D"')
+        bind_addr=$(echo "$item" | jq -r '.bind_addr // empty')
+        target=$(echo "$item" | jq -r '.target // empty')
+        akpath=$(echo "$item" | jq -r '.authorized_keys_path // empty')
+        if [[ -z "$user" || -z "$akpath" ]]; then
+            _report_legacy_empty_port "ssh-tunnel"
+            continue
+        fi
+        if [[ -z "$port" || "$port" == "null" ]] || ! _is_valid_port "$port"; then
+            _report_legacy_empty_port "ssh-tunnel"
+            continue
+        fi
+        _ssh_tunnel_valid_mode "$mode" || mode="D"
+        out+="Match User ${user}\\n"
+        out+="    AuthorizedKeysFile ${akpath}\\n"
+        out+="    PasswordAuthentication no\\n"
+        out+="    KbdInteractiveAuthentication no\\n"
+        out+="    AuthenticationMethods publickey\\n"
+        out+="    PermitTTY no\\n"
+        out+="    X11Forwarding no\\n"
+        out+="    AllowAgentForwarding no\\n"
+        out+="    PermitTunnel no\\n"
+        out+="    AllowStreamLocalForwarding no\\n"
+        out+="    ForceCommand /bin/false\\n"
+        # TCP forwarding only (client -N -L/-D/-R); no native UDP.
+        case "$mode" in
+            R) out+="    AllowTcpForwarding remote\\n"; out+="    GatewayPorts clientspecified\\n" ;;
+            L) out+="    AllowTcpForwarding local\\n"; out+="    GatewayPorts no\\n" ;;
+            *) out+="    AllowTcpForwarding local\\n"; out+="    GatewayPorts no\\n" ;;
+        esac
+        if [[ -n "$target" && ("$mode" == "L" || "$mode" == "R") ]]; then
+            # PermitOpen host:port — target 形如 host:port
+            if [[ "$target" =~ ^[^[:space:]]+:[0-9]+$ ]]; then
+                out+="    PermitOpen ${target}\\n"
+            fi
+        fi
+        out+="\\n"
+    done <<< "$items"
+    out+="Match Group ${SSH_TUNNEL_GROUP}\\n"
+    out+="    PasswordAuthentication no\\n"
+    out+="    AuthenticationMethods publickey\\n"
+    out+="    PermitTTY no\\n"
+    out+="    ForceCommand /bin/false\\n"
+    printf '%b' "$out"
+}
+
+_ssh_tunnel_sshd_bin() {
+    command -v sshd 2>/dev/null || command -v /usr/sbin/sshd 2>/dev/null || echo /usr/sbin/sshd
+}
+
+_ssh_tunnel_test_config() {
+    local dropin="$1" sshd
+    sshd=$(_ssh_tunnel_sshd_bin)
+    [[ -x "$sshd" ]] || { _err "未找到 sshd"; return 1; }
+    # Prefer -t against main config after drop-in is in place; for candidate use Include via temp wrapper when needed.
+    if [[ "$dropin" == /etc/ssh/sshd_config.d/* ]]; then
+        "$sshd" -t 2>/dev/null || { _err "sshd -t 失败"; return 1; }
+        "$sshd" -T >/dev/null 2>&1 || { _err "sshd -T 失败"; return 1; }
+        return 0
+    fi
+    # Candidate under $CFG: validate syntax via temporary Include
+    local tmp_main
+    tmp_main=$(mktemp) || return 1
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        cat /etc/ssh/sshd_config > "$tmp_main"
+    else
+        echo "Include /etc/ssh/sshd_config.d/*.conf" > "$tmp_main"
+    fi
+    echo "Include $dropin" >> "$tmp_main"
+    if ! "$sshd" -t -f "$tmp_main" 2>/dev/null; then
+        rm -f "$tmp_main"
+        _err "sshd -t 候选配置失败"
+        return 1
+    fi
+    rm -f "$tmp_main"
+    return 0
+}
+
+_ssh_tunnel_reload() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || service sshd reload 2>/dev/null || service ssh reload 2>/dev/null || return 1
+        return 0
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service sshd reload 2>/dev/null || rc-service ssh reload 2>/dev/null || return 1
+        return 0
+    fi
+    pkill -HUP sshd 2>/dev/null || return 1
+}
+
+_ssh_tunnel_admin_verify() {
+    local user="$1" sshd
+    sshd=$(_ssh_tunnel_sshd_bin)
+    # Effective config for user should force publickey and disable TTY
+    local dump
+    dump=$("$sshd" -T -C "user=${user}" 2>/dev/null) || return 1
+    echo "$dump" | grep -qi '^passwordauthentication no' || return 1
+    echo "$dump" | grep -qi '^permittty no' || return 1
+    return 0
+}
+
+apply_ssh_tunnel_config() {
+    local live cand bak="" built
+    mkdir -p "$CFG/ssh-tunnel"
+    live=$(_ssh_tunnel_dropin_live)
+    cand=$(mktemp "$CFG/ssh-tunnel/.dropin.XXXXXX") || return 1
+    built=$(_ssh_tunnel_build_dropin) || { rm -f "$cand"; _err "无有效 ssh-tunnel 配置"; return 1; }
+    printf '%s\n' "$built" > "$cand" || { rm -f "$cand"; return 1; }
+    chmod 644 "$cand" 2>/dev/null || true
+
+    if ! _ssh_tunnel_test_config "$cand"; then
+        rm -f "$cand"
+        return 1
+    fi
+
+    if [[ -f "$live" ]]; then
+        bak=$(mktemp "$CFG/ssh-tunnel/.dropin.bak.XXXXXX") || { rm -f "$cand"; return 1; }
+        cp -p "$live" "$bak" || { rm -f "$cand" "$bak"; return 1; }
+    fi
+
+    # Install drop-in
+    if [[ "$live" == /etc/ssh/sshd_config.d/* ]]; then
+        mkdir -p /etc/ssh/sshd_config.d
+        cp -f "$cand" "$live" || { rm -f "$cand"; return 1; }
+        chmod 644 "$live"
+    else
+        mv -f "$cand" "$live" || { rm -f "$cand"; return 1; }
+        cand=""
+        # Ensure main config includes drop-in dir or file — best-effort
+        if [[ -f /etc/ssh/sshd_config ]] && ! grep -q "vless-ssh-tunnel\\|sshd_config.d" /etc/ssh/sshd_config 2>/dev/null; then
+            _warn "请确认 sshd_config 已 Include 本脚本生成的 drop-in: $live"
+        fi
+    fi
+    rm -f "$cand"
+
+    if ! _ssh_tunnel_test_config "$live"; then
+        if [[ -n "$bak" && -f "$bak" ]]; then
+            cp -f "$bak" "$live"
+            _ssh_tunnel_reload || true
+        else
+            rm -f "$live"
+        fi
+        rm -f "$bak"
+        _err "sshd 校验失败，已回滚 drop-in"
+        return 1
+    fi
+
+    if ! _ssh_tunnel_reload; then
+        if [[ -n "$bak" && -f "$bak" ]]; then
+            cp -f "$bak" "$live"
+            _ssh_tunnel_reload || true
+        fi
+        rm -f "$bak"
+        _err "sshd reload 失败，已回滚"
+        return 1
+    fi
+
+    # Admin verify first user if present
+    local first_user
+    first_user=$(db_get "xray" "ssh-tunnel" | jq -r 'if type=="array" then .[0].username // empty else .username // empty end')
+    if [[ -n "$first_user" ]]; then
+        if ! _ssh_tunnel_admin_verify "$first_user"; then
+            _warn "sshd -T 用户校验未完全通过（继续保留配置，请人工复查）"
+        fi
+    fi
+    rm -f "$bak"
+    _ok "SSH Tunnel (OpenSSH) 配置已应用"
+    return 0
+}
+
+gen_ssh_tunnel_server_config() {
+    local username="$1" port="$2" mode="$3" pubkey="$4" bind_addr="${5:-}" target="${6:-}"
+    local akpath
+    mkdir -p "$CFG"
+    _ssh_tunnel_valid_username "$username" || { _err "用户名无效"; return 1; }
+    _is_valid_port "$port" || { _err "SSH Tunnel 端口无效 (1-65535)"; return 1; }
+    _ssh_tunnel_valid_mode "$mode" || { _err "mode 只允许 L / D / R"; return 1; }
+    [[ -n "$pubkey" ]] || { _err "缺少公钥"; return 1; }
+    if [[ "$mode" == "L" || "$mode" == "R" ]]; then
+        if [[ -n "$target" && ! "$target" =~ ^[^[:space:]]+:[0-9]+$ ]]; then
+            _err "target 须为 host:port"
+            return 1
+        fi
+    fi
+    _ssh_tunnel_ensure_group_user "$username" || return 1
+    akpath=$(_ssh_tunnel_write_authorized_keys "$username" "$pubkey") || return 1
+    # db.json 只存路径，永不存公钥/私钥原文
+    local cfg_json
+    cfg_json=$(jq -n \
+        --arg u "$username" --argjson p "$port" --arg m "$mode" --arg ak "$akpath" \
+        --arg b "$bind_addr" --arg t "$target" \
+        '{username:$u, port:$p, mode:$m, authorized_keys_path:$ak}
+         + (if ($b|length)>0 then {bind_addr:$b} else {} end)
+         + (if ($t|length)>0 then {target:$t} else {} end)') || return 1
+    register_protocol "ssh-tunnel" "$cfg_json" || return 1
+    echo "server" > "$CFG/role"
+}
+
 # Snell + ShadowTLS 服务端配置 (v4/v5)
 gen_snell_shadowtls_server_config() {
     local psk="$1" port="$2" sni="${3:-www.microsoft.com}" stls_password="$4" version="${5:-4}" custom_backend_port="${6:-}"
@@ -14495,6 +14775,7 @@ get_all_services() {
     for proto in $xray_keys; do
         case "$proto" in
             mieru) services+="vless-mieru:mita " ;;
+            ssh-tunnel) ;; # 系统 sshd，不由 vless-watchdog 拉起
             naive) services+="vless-naive:caddy " ;;
             snell) services+="vless-snell:snell-server " ;;
             snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
@@ -14698,6 +14979,12 @@ create_service() {
     local port password sni stls_password ss_backend_port snell_backend_port
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
+
+    # SSH Tunnel：不写独立 unit，只应用系统 sshd drop-in。
+    if [[ "$kind" == "ssh-tunnel" || "$protocol" == "ssh-tunnel" ]]; then
+        apply_ssh_tunnel_config || return 1
+        return 0
+    fi
 
     # 检查配置是否存在（支持 xray 和 singbox 核心）
     _need_cfg() { 
@@ -21301,6 +21588,10 @@ show_all_share_links() {
                         IFS=$'\t' read -r mu mp < <(_mieru_share_user_pass "$username" "$password") || true
                         [[ -n "$mu" ]] && link=$(gen_mierus_link "$ipv4" "$display_port" "$mu" "$mp" "$country_code")
                         ;;
+                    ssh-tunnel)
+                        echo -e "  ${D}SSH Tunnel 无分享 URI（禁止 ssh://）；使用 ssh -N -D/-L/-R + 公钥${NC}"
+                        has_links=true
+                        ;;
                     vless-finalmask)
                         local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
                         local fm_ascii=$(echo "$cfg" | jq -r '.ascii // "prefer_entropy"')
@@ -22960,13 +23251,14 @@ select_protocol() {
     _item "15" "NaïveProxy"
     _item "16" "VLESS + Encryption + FinalMask ${D}(Sudoku 外观)${NC}"
     _item "17" "mieru ${D}(mita 独立进程)${NC}"
+    _item "18" "SSH Tunnel ${D}(系统 OpenSSH，仅密钥，无 shell)${NC}"
     _item "0" "返回"
     echo ""
     echo -e "  ${D}提示: 5/6 使用 8443 端口时，3/4 可作为回落共用${NC}"
     echo ""
     
     while true; do
-        read -rp "  选择协议 [0-17]: " choice
+        read -rp "  选择协议 [0-18]: " choice
         case $choice in
             0) SELECTED_PROTOCOL=""; return 1 ;;
             1) select_vless_mode || return 1; break ;;
@@ -22986,6 +23278,7 @@ select_protocol() {
             15) SELECTED_PROTOCOL="naive"; break ;;
             16) SELECTED_PROTOCOL="vless-finalmask"; break ;;
             17) SELECTED_PROTOCOL="mieru"; break ;;
+            18) SELECTED_PROTOCOL="ssh-tunnel"; break ;;
             *) _err "无效选择" ;;
         esac
     done
@@ -23037,9 +23330,9 @@ do_install_server() {
     # 检查该协议是否已安装
     if is_protocol_installed "$protocol"; then
         # 处理已安装协议的多端口选择（mieru 为独立进程但支持单服务多端口绑定）
-        if [[ "$core" != "standalone" || "$protocol" == "mieru" ]]; then
+        if [[ "$core" != "standalone" || "$protocol" == "mieru" || "$protocol" == "ssh-tunnel" ]]; then
             local check_core="$core"
-            [[ "$protocol" == "mieru" ]] && check_core="xray"
+            [[ "$protocol" == "mieru" || "$protocol" == "ssh-tunnel" ]] && check_core="xray"
             handle_existing_protocol "$protocol" "$check_core" || return 1
         else
             # 独立协议保持原有的重新安装确认
@@ -23222,6 +23515,11 @@ do_install_server() {
             ;;
         mieru)
             install_mieru || { _err "mieru (mita) 安装失败"; _pause; return 1; }
+            ;;
+        ssh-tunnel)
+            command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]] || {
+                _err "需要系统 OpenSSH (sshd)"; _pause; return 1
+            }
             ;;
     esac
 
@@ -24578,6 +24876,50 @@ do_install_server() {
             _info "生成配置..."
             gen_mieru_server_config "$username" "$password" "$binding" "$transport" "$tp_mode" "$tp_seed" || { _pause; return 1; }
             ;;
+        ssh-tunnel)
+            local st_user st_mode="D" st_pubkey="" st_bind="" st_target="" st_port
+            echo ""
+            _line
+            echo -e "  ${W}SSH Tunnel (OpenSSH)${NC}"
+            _line
+            echo -e "  ${D}仅公钥登录；ForceCommand=/bin/false；支持客户端 -N -L/-D/-R (TCP)，无原生 UDP，无 ssh://${NC}"
+            read -rp "  系统用户名 (Match User): " st_user
+            _ssh_tunnel_valid_username "$st_user" || { _err "用户名无效"; return 1; }
+            st_port=$(ask_port "ssh-tunnel") || { _warn "已取消"; return 1; }
+            _is_valid_port "$st_port" || { _err "端口无效"; return 1; }
+            echo ""
+            _item "1" "D 动态 SOCKS (-D)"
+            _item "2" "L 本地转发 (-L)"
+            _item "3" "R 远程转发 (-R)"
+            while true; do
+                read -rp "  模式 [1-3]: " mc
+                case "${mc:-1}" in
+                    1) st_mode="D"; break ;;
+                    2) st_mode="L"; break ;;
+                    3) st_mode="R"; break ;;
+                    *) _err "无效选择" ;;
+                esac
+            done
+            if [[ "$st_mode" == "L" || "$st_mode" == "R" ]]; then
+                read -rp "  target host:port (可选, PermitOpen): " st_target
+                read -rp "  bind_addr (可选): " st_bind
+            fi
+            echo ""
+            echo -e "  ${D}粘贴一行 SSH 公钥 (ssh-ed25519/ssh-rsa/...)；私钥绝不入库${NC}"
+            read -rp "  公钥: " st_pubkey
+            echo ""
+            _line
+            echo -e "  ${C}SSH Tunnel 配置${NC}"
+            _line
+            echo -e "  用户: ${G}$st_user${NC}  端口: ${G}$st_port${NC}  模式: ${G}$st_mode${NC}"
+            echo -e "  密钥文件: ${G}$(_ssh_tunnel_authorized_keys_path "$st_user")${NC} ${D}(0600)${NC}"
+            [[ -n "$st_target" ]] && echo -e "  target: ${G}$st_target${NC}"
+            _line
+            read -rp "  确认安装? [Y/n]: " confirm
+            [[ "$confirm" =~ ^[nN]$ ]] && return
+            _info "写入密钥并注册..."
+            gen_ssh_tunnel_server_config "$st_user" "$st_port" "$st_mode" "$st_pubkey" "$st_bind" "$st_target" || { _pause; return 1; }
+            ;;
     esac
     
     _info "创建服务..."
@@ -24593,7 +24935,7 @@ do_install_server() {
 
     # 独立协议必须显式启用并启动当前服务。
     # 不能只依赖数据库枚举，否则数据库结构异常时会出现 unit 已创建但从未启动的情况。
-    if [[ " $STANDALONE_PROTOCOLS " == *" $current_protocol "* ]]; then
+    if [[ " $STANDALONE_PROTOCOLS " == *" $current_protocol "* && "$current_protocol" != "ssh-tunnel" ]]; then
         local current_service="${PROTO_SVC[$current_protocol]:-vless-${current_protocol}}"
         svc enable "$current_service" || { _err "$current_service 设置开机启动失败"; _limited_change_rollback; _pause; return 1; }
         if svc status "$current_service" >/dev/null 2>&1; then
@@ -24610,6 +24952,8 @@ do_install_server() {
             return 1
         fi
         _ok "$current_service 已启用并启动"
+    elif [[ "$current_protocol" == "ssh-tunnel" ]]; then
+        _ok "SSH Tunnel 已通过系统 sshd 应用（无独立 vless unit）"
     fi
     
     if start_services; then
