@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.20 [服务端]
+#  多协议代理一键部署脚本 v3.5.21 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.20"
+readonly VERSION="3.5.21"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -17709,6 +17709,78 @@ gen_xray_ip_routing_rules() {
 # 注意：这个函数需要在已有协议inbound的基础上，为每个入站IP创建独立的inbound
 # 由于实现较复杂，暂时采用简化方案：用户手动指定每个协议的监听IP
 
+
+# 分流 custom token：按逗号拆分并分类（Xray/Sing-box 共用；不改 DB）
+# 禁止整段 geosite:* 判断，禁止 tr/word-split。
+_routing_split_tokens() {
+    local src="$1"
+    _ROUTING_TOKENS=()
+    # 粘贴多行列表时 read 默认只吃第一行；换行视为逗号
+    src="${src//$''/}"
+    src="${src//$'
+'/,}"
+    local IFS=','
+    local -a _raw=()
+    read -r -a _raw <<< "$src"
+    local t
+    for t in "${_raw[@]}"; do
+        t="${t#"${t%%[![:space:]]*}"}"
+        t="${t%"${t##*[![:space:]]}"}"
+        [[ -n "$t" ]] && _ROUTING_TOKENS+=("$t")
+    done
+}
+
+# 单 token → _ROUTING_KIND=domain|ip  _ROUTING_VALUE=引擎字段值
+# Xray 保留 geosite:/domain:/full:/keyword:/regexp:/ext:/dotless:；裸域名加 domain:
+# IP：geoip: / ext:…geoip… / IPv4 / IPv6 / CIDR
+_routing_classify_token() {
+    local tok="$1"
+    _ROUTING_KIND=""
+    _ROUTING_VALUE=""
+    case "$tok" in
+        geosite:*|domain:*|full:*|keyword:*|regexp:*|dotless:*)
+            _ROUTING_KIND=domain
+            _ROUTING_VALUE="$tok"
+            return
+            ;;
+        geoip:*)
+            _ROUTING_KIND=ip
+            _ROUTING_VALUE="$tok"
+            return
+            ;;
+        ext:*)
+            # ext:geoip.dat:cn → ip；ext:geosite.dat:tag → domain
+            if [[ "$tok" == ext:geoip* || "$tok" == *:geoip* || "$tok" == *geoip.dat* ]]; then
+                _ROUTING_KIND=ip
+            else
+                _ROUTING_KIND=domain
+            fi
+            _ROUTING_VALUE="$tok"
+            return
+            ;;
+    esac
+    if [[ "$tok" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+        _ROUTING_KIND=ip
+        _ROUTING_VALUE="$tok"
+        return
+    fi
+    if [[ "$tok" == *:* && "$tok" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
+        _ROUTING_KIND=ip
+        _ROUTING_VALUE="$tok"
+        return
+    fi
+    _ROUTING_KIND=domain
+    _ROUTING_VALUE="domain:$tok"
+}
+
+_routing_json_array() {
+    if [[ $# -eq 0 ]]; then
+        echo '[]'
+        return
+    fi
+    printf '%s\n' "$@" | jq -R . | jq -s .
+}
+
 # 生成 Xray 分流路由配置 (支持多出口)
 gen_xray_routing_rules() {
     local rules=$(db_get_routing_rules)
@@ -17779,78 +17851,54 @@ gen_xray_routing_rules() {
                 *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
             esac
         elif [[ -n "$domains" ]]; then
-            # 检测是否是 geosite 规则
-            if [[ "$domains" == geosite:* ]]; then
-                # 添加 domain 规则
-                if [[ -n "$ip_family_cidr" ]]; then
-                    result=$(echo "$result" | jq --arg geosite "$domains" --arg tag "$tag" --arg key "$tag_key" --arg ip "$ip_family_cidr" \
-                        '. + [{"type": "field", "domain": [$geosite], "ip": [$ip], ($key): $tag}]')
+            local -a _xd=() _xi=()
+            local _tok _preset_ip
+            _routing_split_tokens "$domains"
+            for _tok in "${_ROUTING_TOKENS[@]}"; do
+                _routing_classify_token "$_tok"
+                if [[ "$_ROUTING_KIND" == "ip" ]]; then
+                    if [[ "$ip_version" == "ipv4_only" && "$_ROUTING_VALUE" == *:* && "$_ROUTING_VALUE" != geoip:* && "$_ROUTING_VALUE" != ext:* ]]; then
+                        continue
+                    fi
+                    if [[ "$ip_version" == "ipv6_only" && "$_ROUTING_VALUE" == *.* && "$_ROUTING_VALUE" != geoip:* && "$_ROUTING_VALUE" != ext:* ]]; then
+                        continue
+                    fi
+                    _xi+=("$_ROUTING_VALUE")
                 else
-                    result=$(echo "$result" | jq --arg geosite "$domains" --arg tag "$tag" --arg key "$tag_key" \
-                        '. + [{"type": "field", "domain": [$geosite], ($key): $tag}]')
+                    _xd+=("$_ROUTING_VALUE")
                 fi
-                
-                # 检查是否有对应的 geoip 规则需要添加（拆成独立规则，OR 关系）
-                local geoip_rule="${ROUTING_PRESETS_IP[$rule_type]:-}"
-                if [[ -n "$geoip_rule" && -z "$ip_family_cidr" ]]; then
-                    result=$(echo "$result" | jq --arg geoip "$geoip_rule" --arg tag "$tag" --arg key "$tag_key" \
-                        '. + [{"type": "field", "ip": [$geoip], ($key): $tag}]')
-                fi
-            elif [[ "$domains" =~ ^geoip:[^,]+(,geoip:[^,]+)*$ ]]; then
-                # geoip 规则支持多个条目
-                if [[ -z "$ip_family_cidr" ]]; then
-                    local geoip_array
-                    geoip_array=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$geoip_array" && "$geoip_array" != "[]" && "$geoip_array" != "null" ]] && echo "$geoip_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson ips "$geoip_array" --arg tag "$tag" --arg key "$tag_key" \
-                            '. + [{"type": "field", "ip": $ips, ($key): $tag}]')
-                    fi
-                fi
-            else
-                # 分离域名和 IP 地址
-                local domain_list="" ip_list=""
-                local item
-                for item in $(echo "$domains" | tr ',' ' '); do
-                    [[ -z "$item" ]] && continue
-                    # 判断是否是 IP 地址 (IPv4/IPv6/CIDR)
-                    if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
-                        if [[ "$ip_version" == "ipv4_only" && "$item" =~ : ]]; then
-                            continue
-                        fi
-                        if [[ "$ip_version" == "ipv6_only" && "$item" =~ \. ]]; then
-                            continue
-                        fi
-                        [[ -n "$ip_list" ]] && ip_list+=","
-                        ip_list+="$item"
+            done
+            if [[ ${#_xd[@]} -gt 0 ]]; then
+                local domain_array
+                domain_array=$(_routing_json_array "${_xd[@]}")
+                if echo "$domain_array" | jq empty 2>/dev/null; then
+                    if [[ -n "$ip_family_cidr" ]]; then
+                        result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg key "$tag_key" --arg ip "$ip_family_cidr" \
+                            '. + [{"type": "field", "domain": $domains, "ip": [$ip], ($key): $tag}]')
                     else
-                        [[ -n "$domain_list" ]] && domain_list+=","
-                        domain_list+="$item"
-                    fi
-                done
-                
-                # 生成域名规则
-                if [[ -n "$domain_list" ]]; then
-                    local domain_array
-                    domain_array=$(echo "$domain_list" | tr ',' '\n' | grep -v '^$' | sed 's/^/domain:/' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$domain_array" && "$domain_array" != "[]" && "$domain_array" != "null" ]] && echo "$domain_array" | jq empty 2>/dev/null; then
-                        if [[ -n "$ip_family_cidr" ]]; then
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg key "$tag_key" --arg ip "$ip_family_cidr" \
-                                '. + [{"type": "field", "domain": $domains, "ip": [$ip], ($key): $tag}]')
-                        else
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg key "$tag_key" \
-                                '. + [{"type": "field", "domain": $domains, ($key): $tag}]')
-                        fi
+                        result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg key "$tag_key" \
+                            '. + [{"type": "field", "domain": $domains, ($key): $tag}]')
                     fi
                 fi
-                
-                # 生成 IP 规则
-                if [[ -n "$ip_list" ]]; then
-                    local ip_array
-                    ip_array=$(echo "$ip_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$ip_array" && "$ip_array" != "[]" && "$ip_array" != "null" ]] && echo "$ip_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" --arg key "$tag_key" \
-                            '. + [{"type": "field", "ip": $ips, ($key): $tag}]')
-                    fi
+            fi
+            if [[ ${#_xi[@]} -gt 0 && -z "$ip_family_cidr" ]]; then
+                local ip_array
+                ip_array=$(_routing_json_array "${_xi[@]}")
+                if echo "$ip_array" | jq empty 2>/dev/null; then
+                    result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" --arg key "$tag_key" \
+                        '. + [{"type": "field", "ip": $ips, ($key): $tag}]')
+                fi
+            fi
+            # 预设 geosite 仍附带对应 geoip（独立规则，OR）
+            _preset_ip="${ROUTING_PRESETS_IP[$rule_type]:-}"
+            if [[ -n "$_preset_ip" && -z "$ip_family_cidr" ]]; then
+                local _have_preset=0 _pv
+                for _pv in "${_xi[@]}"; do
+                    [[ "$_pv" == "$_preset_ip" ]] && _have_preset=1 && break
+                done
+                if [[ "$_have_preset" != "1" ]]; then
+                    result=$(echo "$result" | jq --arg geoip "$_preset_ip" --arg tag "$tag" --arg key "$tag_key" \
+                        '. + [{"type": "field", "ip": [$geoip], ($key): $tag}]')
                 fi
             fi
         fi
@@ -17925,74 +17973,86 @@ gen_singbox_routing_rules() {
                 *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
             esac
         elif [[ -n "$domains" ]]; then
-            # 检测是否是 geosite 规则
-            if [[ "$domains" == geosite:* ]]; then
-                # Sing-box 使用 rule_set 格式，需要引用 geosite 规则集
-                local geosite_name="${domains#geosite:}"
-                if [[ -n "$ip_family_cidr" ]]; then
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "ip_cidr": [$ip], "outbound": $tag}]')
-                else
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "outbound": $tag}]')
-                fi
-            elif [[ "$domains" =~ ^geoip:[^,]+(,geoip:[^,]+)*$ ]]; then
-                # geoip 规则转换为对应 rule_set
-                local geoip_rule_set
-                geoip_rule_set=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | sed 's/^geoip:/geoip-/' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                if [[ -n "$geoip_rule_set" && "$geoip_rule_set" != "[]" && "$geoip_rule_set" != "null" ]] && echo "$geoip_rule_set" | jq empty 2>/dev/null; then
-                    if [[ -n "$ip_family_cidr" ]]; then
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                            '. + [{"rule_set": $sets, "ip_cidr": [$ip], "outbound": $tag}]')
-                    else
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" \
-                            '. + [{"rule_set": $sets, "outbound": $tag}]')
-                    fi
-                fi
-            else
-                # 分离域名和 IP 地址
-                local domain_list="" ip_list=""
-                local item
-                for item in $(echo "$domains" | tr ',' ' '); do
-                    [[ -z "$item" ]] && continue
-                    # 判断是否是 IP 地址 (IPv4/IPv6/CIDR)
-                    if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
-                        if [[ "$ip_version" == "ipv4_only" && "$item" =~ : ]]; then
-                            continue
-                        fi
-                        if [[ "$ip_version" == "ipv6_only" && "$item" =~ \. ]]; then
-                            continue
-                        fi
-                        [[ -n "$ip_list" ]] && ip_list+=","
-                        ip_list+="$item"
-                    else
-                        [[ -n "$domain_list" ]] && domain_list+=","
-                        domain_list+="$item"
-                    fi
-                done
-                
-                # 生成域名规则
-                if [[ -n "$domain_list" ]]; then
-                    local domain_array
-                    domain_array=$(echo "$domain_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$domain_array" && "$domain_array" != "[]" && "$domain_array" != "null" ]] && echo "$domain_array" | jq empty 2>/dev/null; then
-                        if [[ -n "$ip_family_cidr" ]]; then
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                                '. + [{"domain_suffix": $domains, "ip_cidr": [$ip], "outbound": $tag}]')
+            local -a _srs=() _sdom=() _ssuf=() _skey=() _sre=() _sip=()
+            local _tok _rest
+            _routing_split_tokens "$domains"
+            for _tok in "${_ROUTING_TOKENS[@]}"; do
+                case "$_tok" in
+                    geosite:*)
+                        _srs+=("geosite-${_tok#geosite:}")
+                        continue
+                        ;;
+                    geoip:*)
+                        _srs+=("geoip-${_tok#geoip:}")
+                        continue
+                        ;;
+                    domain:*|full:*)
+                        _rest="${_tok#*:}"
+                        _sdom+=("$_rest")
+                        continue
+                        ;;
+                    keyword:*)
+                        _skey+=("${_tok#keyword:}")
+                        continue
+                        ;;
+                    regexp:*)
+                        _sre+=("${_tok#regexp:}")
+                        continue
+                        ;;
+                    dotless:*)
+                        _ssuf+=("${_tok#dotless:}")
+                        continue
+                        ;;
+                    ext:*)
+                        if [[ "$_tok" == ext:geoip* || "$_tok" == *:geoip* || "$_tok" == *geoip.dat* ]]; then
+                            _sip+=("$_tok")
                         else
-                            result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" \
-                                '. + [{"domain_suffix": $domains, "outbound": $tag}]')
+                            _ssuf+=("$_tok")
                         fi
+                        continue
+                        ;;
+                esac
+                if [[ "$_tok" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+                    if [[ "$ip_version" == "ipv6_only" ]]; then
+                        continue
                     fi
+                    _sip+=("$_tok")
+                    continue
                 fi
-                
-                # 生成 IP 规则
-                if [[ -n "$ip_list" ]]; then
-                    local ip_array
-                    ip_array=$(echo "$ip_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                    if [[ -n "$ip_array" && "$ip_array" != "[]" && "$ip_array" != "null" ]] && echo "$ip_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" '. + [{"ip_cidr": $ips, "outbound": $tag}]')
+                if [[ "$_tok" == *:* && "$_tok" =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]]; then
+                    if [[ "$ip_version" == "ipv4_only" ]]; then
+                        continue
                     fi
+                    _sip+=("$_tok")
+                    continue
+                fi
+                _ssuf+=("$_tok")
+            done
+            _sb_emit() {
+                local field="$1"
+                shift
+                [[ $# -eq 0 ]] && return
+                local arr
+                arr=$(_routing_json_array "$@")
+                echo "$arr" | jq empty 2>/dev/null || return
+                if [[ -n "$ip_family_cidr" ]]; then
+                    result=$(echo "$result" | jq --argjson v "$arr" --arg f "$field" --arg tag "$tag" --arg ip "$ip_family_cidr" \
+                        '. + [{($f): $v, "ip_cidr": [$ip], "outbound": $tag}]')
+                else
+                    result=$(echo "$result" | jq --argjson v "$arr" --arg f "$field" --arg tag "$tag" \
+                        '. + [{($f): $v, "outbound": $tag}]')
+                fi
+            }
+            _sb_emit rule_set "${_srs[@]}"
+            _sb_emit domain "${_sdom[@]}"
+            _sb_emit domain_suffix "${_ssuf[@]}"
+            _sb_emit domain_keyword "${_skey[@]}"
+            _sb_emit domain_regex "${_sre[@]}"
+            if [[ ${#_sip[@]} -gt 0 ]]; then
+                local ip_array
+                ip_array=$(_routing_json_array "${_sip[@]}")
+                if echo "$ip_array" | jq empty 2>/dev/null; then
+                    result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" '. + [{"ip_cidr": $ips, "outbound": $tag}]')
                 fi
             fi
         fi
