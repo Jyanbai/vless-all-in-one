@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.20 [服务端]
+#  多协议代理一键部署脚本 v3.5.21 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.20"
+readonly VERSION="3.5.21"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -18521,7 +18521,9 @@ configure_routing_rules() {
 }
 
 # 添加分流规则
+# $1=defer_apply → 只写 DB，由调用方统一 _regenerate_proxy_configs（链式添加同事务）
 _add_routing_rule() {
+    local defer_apply="${1:-}"
     _header
     echo -e "  ${W}添加分流规则${NC}"
     _line
@@ -18592,6 +18594,10 @@ _add_routing_rule() {
     if [[ "$rule_type" == "ads" ]]; then
         db_add_routing_rule "$rule_type" "block"
         _ok "已添加规则: 广告屏蔽 → 拦截"
+        if [[ "$defer_apply" == "defer_apply" ]]; then
+            _pause
+            return
+        fi
         _info "更新代理配置..."
         _regenerate_proxy_configs
         _ok "配置已更新"
@@ -18669,7 +18675,11 @@ _add_routing_rule() {
     
     _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     
-    # 更新配置
+    # 更新配置（链式添加路径 defer_apply：由外层一次 regen）
+    if [[ "$defer_apply" == "defer_apply" ]]; then
+        _pause
+        return
+    fi
     _info "更新代理配置..."
     _regenerate_proxy_configs
     _ok "配置已更新"
@@ -18744,21 +18754,34 @@ _del_routing_rule() {
 
 # 重新生成代理配置的辅助函数
 _regenerate_proxy_configs() {
+    # Optional instrumentation: VLESS_COUNT_REGEN=1 logs one line per call (CASE matrix / VPS before-after)
+    if [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]]; then
+        VLESS_REGEN_N=$(( ${VLESS_REGEN_N:-0} + 1 ))
+        printf 'REGEN#%s xray=%s singbox=%s mieru=%s\n' \
+            "${VLESS_REGEN_N}" \
+            "$(get_xray_protocols 2>/dev/null | tr '\n' ',' )" \
+            "$(get_singbox_protocols 2>/dev/null | tr '\n' ',' )" \
+            "$(db_exists xray mieru && echo yes || echo no)" \
+            >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
+    fi
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]] || _mieru_chain_needs_xray_bridge; then
         generate_xray_config
         svc restart vless-reality 2>/dev/null
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-reality" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
         generate_singbox_config
         svc restart vless-singbox 2>/dev/null
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-singbox" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
     fi
 
     if db_exists "xray" "mieru"; then
         generate_mieru_config
         svc restart vless-mieru 2>/dev/null
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-mieru" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
     fi
 }
 
@@ -20344,6 +20367,51 @@ gen_singbox_chain_outbound() {
 }
 
 # 添加节点交互 (带解析预览和自定义名称)
+
+# True if node name is live-referenced (routing / balancer / active / user routing / mieru infer).
+# Contract for Data Admin: fail-closed false when DB missing; name match exact; no side effects.
+_chain_node_runtime_referenced() {
+    local name="$1"
+    [[ -n "$name" && -f "$DB_FILE" ]] || return 1
+    # global routing_rules → chain:name
+    if jq -e --arg n "$name" '
+        [.routing_rules[]? | .outbound // empty | select(. == ("chain:" + $n))] | length > 0
+    ' "$DB_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    # chain_proxy.active
+    if jq -e --arg n "$name" '(.chain_proxy.active // "") == $n' "$DB_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    # balancer group membership
+    if jq -e --arg n "$name" '
+        [.balancer_groups[]? | (.nodes // [])[]?] | index($n) != null
+    ' "$DB_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    # per-user routing on xray/singbox instances
+    if jq -e --arg n "$name" '
+        [
+            (.xray // {}), (.singbox // {})
+            | to_entries[]?
+            | .value
+            | if type == "array" then .[] elif type == "object" then . else empty end
+            | (.users // [])[]?
+            | .routing // empty
+            | select(. == ("chain:" + $n))
+        ] | length > 0
+    ' "$DB_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    # mieru legacy/multi: inferred single global chain equals name
+    if db_exists "xray" "mieru" 2>/dev/null; then
+        local inferred=""
+        inferred=$(_infer_global_chain_node 2>/dev/null || true)
+        [[ -n "$inferred" && "$inferred" == "$name" ]] && return 0
+    fi
+    return 1
+}
+
 _add_chain_node_interactive() {
     _header
     echo -e "  ${W}添加代理节点${NC}"
@@ -20391,6 +20459,7 @@ _add_chain_node_interactive() {
     local final_name="${custom_name:-$orig_name}"
     
     # 检查是否已存在同名节点
+    local _overwrite_was_ref=0
     if db_chain_node_exists "$final_name"; then
         echo ""
         _warn "节点 '$final_name' 已存在"
@@ -20400,6 +20469,7 @@ _add_chain_node_interactive() {
             _pause
             return
         fi
+        _chain_node_runtime_referenced "$final_name" && _overwrite_was_ref=1
         db_del_chain_node "$final_name"
     fi
     
@@ -20408,21 +20478,28 @@ _add_chain_node_interactive() {
         node=$(echo "$node" | jq --arg name "$final_name" '.name = $name')
     fi
     
-    # 保存节点
+    # 保存节点（未引用则仅写 DB，不重启；与分流同事务最多一次 regen）
+    local _chain_txn_need_regen=0
     if db_add_chain_node "$node"; then
         echo ""
         _ok "节点已添加: $final_name"
-        # 菜单1是全局链式入口：mieru 已安装则立即跟随
-        if db_exists "xray" "mieru"; then
-            _refresh_mieru_chain_egress
-        fi
-        
+
         # 询问是否立即配置分流
         echo ""
         read -rp "  是否立即将此节点用于分流? [y/N]: " use_now
         if [[ "$use_now" =~ ^[Yy]$ ]]; then
-            _add_routing_rule
-            return
+            _add_routing_rule defer_apply
+            _chain_txn_need_regen=1
+        elif [[ "$_overwrite_was_ref" == "1" ]] || _chain_node_runtime_referenced "$final_name"; then
+            # 覆盖已引用节点（routing/balancer/active/mieru）→ 一次 regen
+            _chain_txn_need_regen=1
+        fi
+        # 未引用且不配分流 → DB-only，0 regen
+
+        if [[ "$_chain_txn_need_regen" == "1" ]]; then
+            _info "更新代理配置..."
+            _regenerate_proxy_configs
+            _ok "配置已更新"
         fi
     else
         _err "添加节点失败"
@@ -21322,11 +21399,21 @@ manage_chain_proxy() {
                 elif [[ -n "$idx" && "$idx" =~ ^[0-9]+$ ]]; then
                     local name=$(echo "$nodes" | jq -r ".[$((idx-1))].name // empty")
                     if [[ -n "$name" ]]; then
+                        local _was_ref=0
+                        _chain_node_runtime_referenced "$name" && _was_ref=1
                         db_del_chain_node "$name"
                         # 清理引用该节点的分流规则
                         _db_apply --arg out "chain:$name" '.routing_rules = [.routing_rules[]? | select(.outbound != $out)]'
+                        # 同步从 balancer 摘掉
+                        _db_apply --arg n "$name" '
+                            if .balancer_groups then
+                              .balancer_groups = [.balancer_groups[] | if .nodes then .nodes = [.nodes[] | select(. != $n)] else . end]
+                            else . end
+                        ' 2>/dev/null || true
                         _ok "已删除: $name"
-                        _regenerate_proxy_configs
+                        if [[ "$_was_ref" == "1" ]]; then
+                            _regenerate_proxy_configs
+                        fi
                     fi
                 fi
                 _pause
