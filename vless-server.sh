@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.21 [服务端]
+#  多协议代理一键部署脚本 v3.5.22 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.21"
+readonly VERSION="3.5.22"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -5255,19 +5255,35 @@ _inject_mieru_chain_bridge() {
                 if [[ "$rtype" == "all" ]]; then
                     scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --arg t "$tag" \
                         '. + [{type:"field", inboundTag:[$in], network:"tcp,udp", outboundTag:$t}]')
-                elif [[ "$domains" == geosite:* ]]; then
-                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --arg d "$domains" --arg t "$tag" \
-                        '. + [{type:"field", inboundTag:[$in], domain:[$d], outboundTag:$t}]')
-                elif [[ "$domains" == geoip:* || "$domains" =~ ^geoip: ]]; then
-                    local ips
-                    ips=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
-                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ips "$ips" --arg t "$tag" \
-                        '. + [{type:"field", inboundTag:[$in], ip:$ips, outboundTag:$t}]')
                 elif [[ -n "$domains" ]]; then
-                    local ds
-                    ds=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
-                    scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ds "$ds" --arg t "$tag" \
-                        '. + [{type:"field", inboundTag:[$in], domain:$ds, outboundTag:$t}]')
+                    # 复用 3.5.21 split/classify：禁止整段 geosite:* / tr word-split
+                    local -a _md=() _mi=()
+                    local _mtok
+                    _routing_split_tokens "$domains"
+                    for _mtok in "${_ROUTING_TOKENS[@]}"; do
+                        _routing_classify_token "$_mtok"
+                        if [[ "$_ROUTING_KIND" == "ip" ]]; then
+                            _mi+=("$_ROUTING_VALUE")
+                        else
+                            _md+=("$_ROUTING_VALUE")
+                        fi
+                    done
+                    if [[ ${#_md[@]} -gt 0 ]]; then
+                        local _md_json
+                        _md_json=$(_routing_json_array "${_md[@]}")
+                        if echo "$_md_json" | jq empty 2>/dev/null; then
+                            scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ds "$_md_json" --arg t "$tag" \
+                                '. + [{type:"field", inboundTag:[$in], domain:$ds, outboundTag:$t}]')
+                        fi
+                    fi
+                    if [[ ${#_mi[@]} -gt 0 ]]; then
+                        local _mi_json
+                        _mi_json=$(_routing_json_array "${_mi[@]}")
+                        if echo "$_mi_json" | jq empty 2>/dev/null; then
+                            scoped=$(echo "$scoped" | jq -c --arg in "$inbound_tag" --argjson ips "$_mi_json" --arg t "$tag" \
+                                '. + [{type:"field", inboundTag:[$in], ip:$ips, outboundTag:$t}]')
+                        fi
+                    fi
                 fi
             done < <(echo "$fb_rules" | jq -c '.[]')
             # default catch-all on fallback inbound → freedom
