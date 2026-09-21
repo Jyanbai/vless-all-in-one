@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.23 [服务端]
+#  多协议代理一键部署脚本 v3.5.24 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.23"
+readonly VERSION="3.5.24"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -1863,23 +1863,10 @@ db_migrate_to_multiuser() {
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_xray() {
     local silent="${1:-}"
-    
-    # 重新生成 Xray 配置
-    if generate_xray_config 2>/dev/null; then
-        # 检查 Xray 服务是否在运行
-        if svc status vless-reality 2>/dev/null; then
-            # 重启服务确保配置生效 (reload 可能不可靠)
-            if svc restart vless-reality 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _err "配置已更新，但服务重启失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "配置已更新"
-            return 0
-        fi
+    if _smart_apply_core "xray" "$CFG/config.json" "vless-reality" "generate_xray_config" "if_running" "$silent"; then
+        [[ -z "$silent" && "${SMART_APPLY_CHANGED:-0}" == "1" ]] && _ok "配置已更新并重载"
+        [[ -z "$silent" && "${SMART_APPLY_CHANGED:-0}" != "1" ]] && _ok "配置未变化"
+        return 0
     else
         [[ -z "$silent" ]] && _err "配置重建失败"
         return 1
@@ -1891,23 +1878,10 @@ rebuild_and_reload_xray() {
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_singbox() {
     local silent="${1:-}"
-    
-    # 重新生成 Sing-box 配置
-    if generate_singbox_config; then
-        # 检查 Sing-box 服务是否在运行
-        if svc status vless-singbox 2>/dev/null; then
-            # 重载服务
-            if svc restart vless-singbox 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
-            return 0
-        fi
+    if _smart_apply_core "singbox" "$CFG/singbox.json" "vless-singbox" "generate_singbox_config" "if_running" "$silent"; then
+        [[ -z "$silent" && "${SMART_APPLY_CHANGED:-0}" == "1" ]] && _ok "Sing-box 配置已更新并重载"
+        [[ -z "$silent" && "${SMART_APPLY_CHANGED:-0}" != "1" ]] && _ok "Sing-box 配置未变化"
+        return 0
     else
         [[ -z "$silent" ]] && _err "Sing-box 配置重建失败"
         return 1
@@ -19252,36 +19226,287 @@ _del_routing_rule() {
     _pause
 }
 
-# 重新生成代理配置的辅助函数
+#═══════════════════════════════════════════════════════════════════════════════
+#  Smart apply: candidate → validate → diff → restart only if changed (v3.5.24)
+#  Kill-switch: VLESS_SMART_APPLY=0 restores always-restart-after-generate.
+#  Instrumentation: VLESS_COUNT_REGEN=1 → REGEN# / restart: / skip_restart: / validate_fail:
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 快照现有 live 配置到临时文件；无文件则输出空串
+_smart_snapshot_config() {
+    local live="$1" snap
+    if [[ -f "$live" ]]; then
+        snap=$(mktemp "${TMPDIR:-/tmp}/vless-smart-snap.XXXXXX") || return 1
+        cp -a "$live" "$snap" || { rm -f "$snap"; return 1; }
+        printf '%s\n' "$snap"
+    else
+        printf '\n'
+    fi
+}
+
+# 校验候选配置: xray run -test / sing-box check / mieru jq(+mita if available)
+_smart_validate_config() {
+    local core="$1" path="$2"
+    [[ -f "$path" ]] || return 1
+    case "$core" in
+        xray)
+            jq empty "$path" 2>/dev/null || return 1
+            if check_cmd xray; then
+                xray run -test -c "$path" >/dev/null 2>&1 || xray -test -c "$path" >/dev/null 2>&1 || return 1
+            fi
+            ;;
+        singbox)
+            jq empty "$path" 2>/dev/null || return 1
+            if check_cmd sing-box; then
+                sing-box check -c "$path" >/dev/null 2>&1 || return 1
+            elif [[ -x /usr/local/bin/sing-box ]]; then
+                /usr/local/bin/sing-box check -c "$path" >/dev/null 2>&1 || return 1
+            fi
+            ;;
+        mieru)
+            jq empty "$path" 2>/dev/null || return 1
+            # generate_mieru_config already validates before mv; re-check jq shape lightly
+            if declare -F _mieru_validate_candidate >/dev/null 2>&1 && check_cmd mita; then
+                _mieru_validate_candidate "$path" || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# 单核心: 生成到 live → 挪到候选并还原 live → 校验 → 与 live 比较 → 仅变更时提交并重启
+# 用法: _smart_apply_core <core> <live> <service> <gen_fn> [always|if_running] [silent]
+# 成功时 SMART_APPLY_CHANGED=0|1
+_smart_apply_core() {
+    local core="$1" live="$2" service="$3" gen_fn="$4"
+    local restart_mode="${5:-always}"
+    local silent="${6:-}"
+    local snap="" candidate="" regen_log="${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
+    SMART_APPLY_CHANGED=0
+
+    # Kill-switch: 旧行为（生成后总是重启）
+    if [[ "${VLESS_SMART_APPLY:-1}" == "0" ]]; then
+        if [[ -n "$silent" ]]; then
+            "$gen_fn" 2>/dev/null || return 1
+        else
+            "$gen_fn" || return 1
+        fi
+        case "$restart_mode" in
+            if_running)
+                if svc status "$service" 2>/dev/null; then
+                    svc restart "$service" 2>/dev/null || return 1
+                fi
+                ;;
+            *) svc restart "$service" 2>/dev/null || true ;;
+        esac
+        SMART_APPLY_CHANGED=1
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:$service" >> "$regen_log"
+        return 0
+    fi
+
+    snap=$(_smart_snapshot_config "$live") || snap=""
+
+    if [[ -n "$silent" ]]; then
+        if ! "$gen_fn" 2>/dev/null; then
+            [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
+            rm -f "$snap"
+            return 1
+        fi
+    else
+        if ! "$gen_fn"; then
+            [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
+            rm -f "$snap"
+            return 1
+        fi
+    fi
+
+    # live 现为新内容 → 挪到候选，立即还原旧 live（fail-closed）
+    candidate=$(mktemp "${TMPDIR:-/tmp}/vless-smart-cand.XXXXXX") || {
+        [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
+        rm -f "$snap"
+        return 1
+    }
+    if [[ -f "$live" ]]; then
+        cp -a "$live" "$candidate" || {
+            [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
+            rm -f "$snap" "$candidate"
+            return 1
+        }
+    else
+        [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
+        rm -f "$snap" "$candidate"
+        return 1
+    fi
+    # fail-closed: snap 还原必须成功，否则不可进入 cmp/skip_restart（否则 live=新配置会被误判 unchanged）
+    if [[ -n "$snap" && -f "$snap" ]]; then
+        if ! cp -a "$snap" "$live" 2>/dev/null; then
+            rm -f "$candidate" "$snap"
+            [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restore_fail:$service" >> "$regen_log"
+            [[ -z "$silent" ]] && _err "$core 配置快照还原失败，已中止（未比较/未跳过重启）"
+            return 1
+        fi
+    else
+        rm -f "$live"
+    fi
+
+    if ! _smart_validate_config "$core" "$candidate"; then
+        rm -f "$candidate" "$snap"
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  validate_fail:$service" >> "$regen_log"
+        [[ -z "$silent" ]] && _err "$core 配置校验失败，已保留原配置"
+        return 1
+    fi
+
+    # 与当前 live（已还原的旧配置）比较
+    if [[ -f "$live" ]] && cmp -s "$candidate" "$live"; then
+        rm -f "$candidate" "$snap"
+        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  skip_restart:$service" >> "$regen_log"
+        return 0
+    fi
+
+    # 提交候选
+    mkdir -p "$(dirname "$live")" 2>/dev/null || true
+    if ! cp -a "$candidate" "$live"; then
+        rm -f "$candidate" "$snap"
+        [[ -z "$silent" ]] && _err "$core 配置提交失败"
+        return 1
+    fi
+    rm -f "$candidate" "$snap"
+    SMART_APPLY_CHANGED=1
+
+    case "$restart_mode" in
+        if_running)
+            if svc status "$service" 2>/dev/null; then
+                if ! svc restart "$service" 2>/dev/null; then
+                    [[ -z "$silent" ]] && _err "$service 重启失败"
+                    return 1
+                fi
+            fi
+            ;;
+        *)
+            svc restart "$service" 2>/dev/null || true
+            ;;
+    esac
+    [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:$service" >> "$regen_log"
+    return 0
+}
+
+
+# 离线自检（无真实 systemd）: unchanged→skip / changed→restart / invalid→restore
+# 测试钩子: VLESS_SMART_APPLY_SELFTEST 由 --smart-apply-selftest 触发
+_smart_apply_selftest() {
+    local tmpdir regen_log live
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/vless-smart-selftest.XXXXXX") || return 1
+    mkdir -p "$tmpdir/cfg"
+    regen_log="$tmpdir/regen.log"
+    VLESS_COUNT_REGEN=1
+    VLESS_REGEN_LOG="$regen_log"
+    VLESS_SMART_APPLY=1
+    : > "$regen_log"
+    # CFG is readonly; use explicit live path under tmpdir
+    live="$tmpdir/cfg/config.json"
+
+    check_cmd() { command -v "$1" >/dev/null 2>&1; }
+    _err() { echo "ERR: $*" >&2; }
+    _ok() { :; }
+    svc() {
+        local action="$1"
+        case "$action" in
+            status) return 0 ;;
+            restart) return 0 ;;
+            *) return 0 ;;
+        esac
+    }
+
+    _gen_same() { printf '%s\n' '{"ok":true,"n":1}' > "$live"; return 0; }
+    _gen_change() { printf '%s\n' '{"ok":true,"n":2}' > "$live"; return 0; }
+    _gen_bad() { printf '%s\n' 'NOT-JSON{' > "$live"; return 0; }
+
+    # seed
+    printf '%s\n' '{"ok":true,"n":1}' > "$live"
+
+    echo "SELFTEST A: unchanged → skip_restart"
+    : > "$regen_log"
+    _smart_apply_core "xray" "$live" "vless-reality" "_gen_same" "always" || return 1
+    grep -qE '^[[:space:]]*skip_restart:vless-reality$' "$regen_log" || { echo "FAIL: expected skip_restart"; cat "$regen_log"; return 1; }
+    grep -qE '^[[:space:]]*restart:vless-reality$' "$regen_log" && { echo "FAIL: unexpected restart"; return 1; }
+    cmp -s "$live" <(printf '%s\n' '{"ok":true,"n":1}') || { echo "FAIL: live mutated on noop"; return 1; }
+
+    echo "SELFTEST B: changed → restart"
+    : > "$regen_log"
+    _smart_apply_core "xray" "$live" "vless-reality" "_gen_change" "always" || return 1
+    grep -qE '^[[:space:]]*restart:vless-reality$' "$regen_log" || { echo "FAIL: expected restart"; cat "$regen_log"; return 1; }
+    grep -qE '^[[:space:]]*skip_restart:vless-reality$' "$regen_log" && { echo "FAIL: unexpected skip"; return 1; }
+    grep -q '"n":2' "$live" || { echo "FAIL: live not updated"; return 1; }
+
+    echo "SELFTEST C: invalid → restore / no restart"
+    printf '%s\n' '{"ok":true,"n":9}' > "$live"
+    : > "$regen_log"
+    if _smart_apply_core "xray" "$live" "vless-reality" "_gen_bad" "always"; then
+        echo "FAIL: expected validate failure"; return 1
+    fi
+    grep -qE '^[[:space:]]*validate_fail:vless-reality$' "$regen_log" || { echo "FAIL: expected validate_fail"; cat "$regen_log"; return 1; }
+    grep -qE '^[[:space:]]*restart:vless-reality$' "$regen_log" && { echo "FAIL: restart after invalid"; return 1; }
+    grep -q '"n":9' "$live" || { echo "FAIL: old live not restored"; cat "$live"; return 1; }
+
+    echo "SELFTEST D: hint parsing default all"
+    # smoke: function accepts hints (no protocols → no-op cores)
+    get_xray_protocols() { echo ""; }
+    get_singbox_protocols() { echo ""; }
+    db_exists() { return 1; }
+    _mieru_chain_needs_xray_bridge() { return 1; }
+    VLESS_REGEN_N=0
+    : > "$regen_log"
+    _regenerate_proxy_configs bogus_hint
+    grep -q 'hint=all' "$regen_log" || { echo "FAIL: unknown hint should default all"; cat "$regen_log"; return 1; }
+
+    rm -rf "$tmpdir"
+    echo "SELFTEST OK"
+    return 0
+}
+
+# 重新生成代理配置（智能跳过未变更核心）
+# 用法: _regenerate_proxy_configs [xray|singbox|mieru|all]
+# 未知 hint / 全局分流默认 all；即便 all 也按 diff 跳过未变更核心
 _regenerate_proxy_configs() {
+    local hint="${1:-all}"
+    case "$hint" in
+        xray|singbox|mieru|all) ;;
+        *) hint="all" ;;
+    esac
+
     # Optional instrumentation: VLESS_COUNT_REGEN=1 logs one line per call (CASE matrix / VPS before-after)
     if [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]]; then
         VLESS_REGEN_N=$(( ${VLESS_REGEN_N:-0} + 1 ))
-        printf 'REGEN#%s xray=%s singbox=%s mieru=%s\n' \
+        printf 'REGEN#%s hint=%s xray=%s singbox=%s mieru=%s\n' \
             "${VLESS_REGEN_N}" \
+            "$hint" \
             "$(get_xray_protocols 2>/dev/null | tr '\n' ',' )" \
             "$(get_singbox_protocols 2>/dev/null | tr '\n' ',' )" \
             "$(db_exists xray mieru && echo yes || echo no)" \
             >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
     fi
-    local xray_protocols=$(get_xray_protocols)
-    if [[ -n "$xray_protocols" ]] || _mieru_chain_needs_xray_bridge; then
-        generate_xray_config
-        svc restart vless-reality 2>/dev/null
-        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-reality" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
-    fi
-    
-    local singbox_protocols=$(get_singbox_protocols)
-    if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
-        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-singbox" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
+
+    if [[ "$hint" == "all" || "$hint" == "xray" ]]; then
+        local xray_protocols
+        xray_protocols=$(get_xray_protocols)
+        if [[ -n "$xray_protocols" ]] || _mieru_chain_needs_xray_bridge; then
+            _smart_apply_core "xray" "$CFG/config.json" "vless-reality" "generate_xray_config" "always"
+        fi
     fi
 
-    if db_exists "xray" "mieru"; then
-        generate_mieru_config
-        svc restart vless-mieru 2>/dev/null
-        [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restart:vless-mieru" >> "${VLESS_REGEN_LOG:-/tmp/vless-regen.count}"
+    if [[ "$hint" == "all" || "$hint" == "singbox" ]]; then
+        local singbox_protocols
+        singbox_protocols=$(get_singbox_protocols)
+        if [[ -n "$singbox_protocols" ]]; then
+            _smart_apply_core "singbox" "$CFG/singbox.json" "vless-singbox" "generate_singbox_config" "always"
+        fi
+    fi
+
+    if [[ "$hint" == "all" || "$hint" == "mieru" ]]; then
+        if db_exists "xray" "mieru"; then
+            _smart_apply_core "mieru" "$CFG/mieru.json" "vless-mieru" "generate_mieru_config" "always"
+        fi
     fi
 }
 
@@ -19477,22 +19702,10 @@ configure_direct_outbound() {
     
     echo "$new_setting" > "$CFG/direct_ip_version"
     _ok "直连出口已设置为: $new_setting"
-    
-    # 重新生成配置
-    local xray_protocols=$(get_xray_protocols)
-    if [[ -n "$xray_protocols" ]]; then
-        _info "重新生成 Xray 配置..."
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
-    fi
-    
-    local singbox_protocols=$(get_singbox_protocols)
-    if [[ -n "$singbox_protocols" ]]; then
-        _info "重新生成 Sing-box 配置..."
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-    fi
+
+    # 仅写 direct_ip_version；由 smart-apply 校验→diff→按需重启（覆盖 Xray + Sing-box）
+    _info "重新生成代理配置..."
+    _regenerate_proxy_configs
 }
 
 # WARP → 落地 双层链式代理一键配置
@@ -19870,8 +20083,8 @@ manage_instance_outbound() {
             db_set_instance_outbound "xray" "$proto" "$port" "$new_ob" || { _err "设置失败"; _pause; continue; }
             _ok "已设置: $(_get_outbound_display_name "$new_ob")"
         fi
-        # 仅重生一次
-        _regenerate_proxy_configs
+        # 仅重生一次（实例出口仅影响 Xray）
+        _regenerate_proxy_configs xray
         _pause
     done
 }
@@ -33396,6 +33609,11 @@ case "${1:-}" in
         install_expire_check_cron
         exit 0
         ;;
+    --smart-apply-selftest)
+        # Offline smart-apply gates (no systemd; used by tests/test_smart_apply.sh)
+        _smart_apply_selftest
+        exit $?
+        ;;
     --help|-h)
         echo "用法: $0 [选项]"
         echo ""
@@ -33405,6 +33623,7 @@ case "${1:-}" in
         echo "  --tg-bot-poll        处理 Telegram 用户机器人消息 (用于定时任务)"
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"
         echo "  --setup-expire-cron  安装过期检查定时任务"
+        echo "  --smart-apply-selftest  离线 smart-apply 自检 (测试用)"
         echo "  --help, -h           显示帮助信息"
         echo ""
         echo "无参数时启动交互式菜单"

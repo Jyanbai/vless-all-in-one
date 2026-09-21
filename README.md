@@ -24,6 +24,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
 - **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
+- **Smart apply (v3.5.24):** regenerating proxy configs validates first, then restarts Xray / Sing-box / mieru only when the live config actually changed (`VLESS_SMART_APPLY=0` restores always-restart)
 
 ## Quick Install
 
@@ -31,7 +32,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.23**
+Current script version: **v3.5.24**
 
 ## Sing-box custom build for traffic stats
 

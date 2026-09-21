@@ -24,6 +24,7 @@ Linux 服务器一体化代理部署脚本。
 - **v3.5.21：** 添加链式节点时延迟/批量 regenerate（未使用仅写库；添加+路由 ≤1 次 regen）；自定义路由 token 解析器，支持混合 geosite/域名/IP（Xray + Sing-box）
 - **v3.5.22：** Mieru 回退路径复用同一套路由 token helpers（修复混合自定义规则导致 Xray 异常）
 - **v3.5.23：** 实例级 Xray 出口（`instance_outbound`）；菜单「实例出口管理」；默认继承全局；优先级 用户 > 实例 > 全局；仅 Xray 共享核心
+- **智能应用（v3.5.24）：** 重新生成代理配置时先校验，仅在 live 配置确有变化时才重启 Xray / Sing-box / mieru（`VLESS_SMART_APPLY=0` 恢复为每次生成后都重启）
 
 ## 快速安装
 
@@ -31,7 +32,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.23**
+当前脚本版本：**v3.5.24**
 
 ## 用于流量统计的自定义 Sing-box 构建
 
