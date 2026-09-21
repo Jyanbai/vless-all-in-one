@@ -21,6 +21,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru:** TCP/UDP transport, native `port` or `portRange` bindings, Traffic Pattern (Advanced) default Off (Off / Conservative / Custom); official `mierus://` share links
 - **SSH Tunnel:** uses the server’s existing OpenSSH only — key-only auth, TCP `-L` / `-D` / `-R`, no shell/exec/TTY/SFTP, no native UDP, no `ssh://` URI
+- **Smart apply (v3.5.24):** regenerating proxy configs validates first, then restarts Xray / Sing-box / mieru only when the live config actually changed (`VLESS_SMART_APPLY=0` restores always-restart)
 
 ## Quick Install
 

@@ -11,8 +11,8 @@
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
 ## v3.5.24 product notes (docs surface)
-- **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; `configure_direct_outbound` uses it (no stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0`. Count log: `VLESS_COUNT_REGEN=1` → `restart:` / `skip_restart:` / `validate_fail:`.
-- Local matrix: `tests/test_smart_apply.sh` / `./vless-server.sh --smart-apply-selftest`.
+- **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; snap restore fail-closed (`restore_fail:`, never false `skip_restart`). `configure_direct_outbound` writes `$CFG/direct_ip_version` then calls it (no private stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0` (always restart after gen). Count: `VLESS_COUNT_REGEN=1` → `VLESS_REGEN_LOG` (default `/tmp/vless-regen.count`) lines `restart:` / `skip_restart:` / `validate_fail:` / `restore_fail:`.
+- Local matrix: `tests/test_smart_apply.sh` (A–K) / `./vless-server.sh --smart-apply-selftest`.
 
 ## v3.5.23 product notes (docs surface)
 - **instance_outbound (Xray shared-core only):** per-port field; absent/empty = inherit global (never store literal `inherit`); vocab `direct|warp|chain:…|balancer:…`.

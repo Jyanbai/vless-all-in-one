@@ -21,6 +21,7 @@ Linux 服务器一体化代理部署脚本。
 - 提供用户管理、路由、订阅与故障排查文档
 - **mieru：** TCP/UDP 传输、原生 `port` 或 `portRange` 绑定、流量模式（高级）默认关闭（关闭 / 保守 / 自定义）；官方 `mierus://` 分享链接
 - **SSH Tunnel：** 仅使用服务器已有 OpenSSH — 仅公钥认证、TCP `-L` / `-D` / `-R`、无 shell/exec/TTY/SFTP、无原生 UDP、无 `ssh://` URI
+- **智能应用（v3.5.24）：** 重新生成代理配置时先校验，仅在 live 配置确有变化时才重启 Xray / Sing-box / mieru（`VLESS_SMART_APPLY=0` 恢复为每次生成后都重启）
 
 ## 快速安装
 
