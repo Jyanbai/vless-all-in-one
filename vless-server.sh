@@ -4769,10 +4769,40 @@ generate_xray_config() {
                             fi
                             ;;
                         balancer:*)
+                            # Mirror user_routing_needs balancer emit (no-global path has no prebuilt balancers)
                             local group_name="${need#balancer:}"
                             if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
                                 _err "实例出口负载组不存在: $group_name（fail-closed）"
                                 return 1
+                            fi
+                            if ! echo "$user_balancers" | jq -e --arg tag "balancer-${group_name}" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                                local balancer_groups=$(db_get_balancer_groups)
+                                local group_json=$(echo "$balancer_groups" | jq -c --arg name "$group_name" '.[] | select(.name == $name)')
+                                if [[ -z "$group_json" ]]; then
+                                    _err "实例出口负载组不存在: $group_name（fail-closed）"
+                                    return 1
+                                fi
+                                local strategy=$(echo "$group_json" | jq -r '.strategy')
+                                local selectors="[]"
+                                while IFS= read -r node_name; do
+                                    [[ -z "$node_name" ]] && continue
+                                    local node_tag="chain-${node_name}-prefer-ipv4"
+                                    selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
+                                    if ! echo "$user_outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                                        local chain_out=$(gen_xray_chain_outbound "$node_name" "$node_tag" "prefer_ipv4")
+                                        if [[ -z "$chain_out" ]]; then
+                                            _err "实例出口负载组节点不可用: $node_name（fail-closed）"
+                                            return 1
+                                        fi
+                                        user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                                    fi
+                                done < <(echo "$group_json" | jq -r '.nodes[]?')
+                                local balancer=$(jq -n \
+                                    --arg tag "balancer-${group_name}" \
+                                    --arg strategy "$strategy" \
+                                    --argjson selector "$selectors" \
+                                    '{tag: $tag, selector: $selector, strategy: {type: $strategy}}')
+                                user_balancers=$(echo "$user_balancers" | jq --argjson b "$balancer" '. + [$b]')
                             fi
                             ;;
                     esac
@@ -18111,10 +18141,8 @@ _routing_split_tokens() {
     local src="$1"
     _ROUTING_TOKENS=()
     # 粘贴多行列表时 read 默认只吃第一行；换行视为逗号
-    src="${src//$'
-'/}"
-    src="${src//$'
-'/,}"
+    src="${src//$'\r'/}"
+    src="${src//$'\n'/,}"
     local IFS=','
     local -a _raw=()
     read -r -a _raw <<< "$src"
