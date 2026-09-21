@@ -19338,8 +19338,14 @@ _smart_apply_core() {
         rm -f "$snap" "$candidate"
         return 1
     fi
+    # fail-closed: snap 还原必须成功，否则不可进入 cmp/skip_restart（否则 live=新配置会被误判 unchanged）
     if [[ -n "$snap" && -f "$snap" ]]; then
-        cp -a "$snap" "$live" 2>/dev/null || true
+        if ! cp -a "$snap" "$live" 2>/dev/null; then
+            rm -f "$candidate" "$snap"
+            [[ "${VLESS_COUNT_REGEN:-0}" == "1" ]] && echo "  restore_fail:$service" >> "$regen_log"
+            [[ -z "$silent" ]] && _err "$core 配置快照还原失败，已中止（未比较/未跳过重启）"
+            return 1
+        fi
     else
         rm -f "$live"
     fi

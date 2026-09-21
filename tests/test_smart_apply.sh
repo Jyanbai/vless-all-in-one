@@ -58,6 +58,17 @@ if bash "$SCRIPT" --smart-apply-selftest; then pass "selftest"; else fail "selft
 echo "=== J: diff proves skip-restart path exists ==="
 if grep -A80 '^_smart_apply_core()' "$SCRIPT" | grep -q 'cmp -s'; then pass "cmp diff gate"; else fail "no cmp"; fi
 
+echo "=== K: snap restore fail-closed (no false skip_restart) ==="
+if grep -A12 'fail-closed: snap' "$SCRIPT" | grep -q 'restore_fail'; then pass "restore_fail on snap cp fail"
+else fail "missing restore_fail abort after snap restore failure"; fi
+if grep -A12 'fail-closed: snap' "$SCRIPT" | grep -q 'return 1'; then pass "snap restore failure returns 1"
+else fail "snap restore failure does not return 1"; fi
+if awk '/fail-closed: snap/{f=1} f{print} /_smart_validate_config/{if(f){exit}}' "$SCRIPT" | grep -q '|| true'; then
+  fail "critical snap restore still has || true"
+else
+  pass "critical snap restore has no || true"
+fi
+
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]
