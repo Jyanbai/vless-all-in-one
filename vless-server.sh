@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.24"
+readonly VERSION="3.5.25"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -468,6 +468,42 @@ db_list_instances_using_outbound() {
             "xray|\($proto)|\(.port // .port_range // "")|\(.instance_outbound)"
         end
     ' "$DB_FILE" 2>/dev/null
+}
+
+# Mieru 服务级出口 (.service_outbound.mieru): 缺省/空=继承全局; 不落库 inherit
+# 用法: db_get_service_outbound_mieru
+db_get_service_outbound_mieru() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r '.service_outbound.mieru // empty' "$DB_FILE" 2>/dev/null
+}
+
+# 用法: db_set_service_outbound_mieru "direct|warp|chain:x|balancer:g"
+# 空/inherit/null → 清除
+db_set_service_outbound_mieru() {
+    local value="${1:-}"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    if [[ -z "$value" || "$value" == "inherit" || "$value" == "null" ]]; then
+        db_clear_service_outbound_mieru
+        return $?
+    fi
+    case "$value" in
+        direct|warp|chain:*|balancer:*) ;;
+        *) _err "无效 Mieru 服务出口: $value"; return 1 ;;
+    esac
+    _db_apply --arg v "$value" '
+        .service_outbound = ((.service_outbound // {}) + {mieru: $v})
+    '
+}
+
+# 用法: db_clear_service_outbound_mieru
+db_clear_service_outbound_mieru() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    _db_apply '
+        if .service_outbound then
+            .service_outbound |= del(.mieru)
+            | if (.service_outbound | length) == 0 then del(.service_outbound) else . end
+        else . end
+    '
 }
 
 # 删除协议
@@ -5187,7 +5223,9 @@ _maybe_refresh_mieru_chain_after_import() {
 # 是否需要任一 Xray SOCKS 桥（非 socks 节点或 routing-fallback）
 _mieru_chain_needs_xray_bridge() {
     db_exists "xray" "mieru" || return 1
-    if _mieru_needs_multi_egress; then
+    local svc_ob=""
+    svc_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
+    if [[ -n "$svc_ob" ]] || _mieru_needs_multi_egress; then
         local plan
         plan=$(_mieru_compile_egress_plan 2>/dev/null) || return 1
         echo "$plan" | jq -e '(.bridges | length) > 0' >/dev/null 2>&1
@@ -5255,6 +5293,116 @@ _mieru_resolve_proxy_endpoint() {
 # 编译计划 JSON:
 # { mode:"legacy"|"multi", proxies:[], rules:[], bridges:[{name,port,tag,inbound}],
 #   allowLoopbackIP:bool, fallback_rules:[], legacy_name:"" }
+_mieru_compile_service_override_plan() {
+    # 显式 Mieru 服务出口 → 单一 egress plan；缺目标 fail-closed（不静默 DIRECT）
+    local routing="$1"
+    local port="${MIERU_CHAIN_SOCKS_PORT:-40100}"
+    local node_name group_name warp_st _ep_raw host user pass proxy_name kind val needs_br
+    local proxies='[]' erules='[]' bridges='[]' allow_loop=false
+
+    case "$routing" in
+        direct)
+            jq -n '{
+                mode:"multi", legacy_name:"", proxies:[],
+                rules:[{ipRanges:["*"], domainNames:["*"], action:"DIRECT"}],
+                bridges:[], allowLoopbackIP:false, fallback_rules:[]
+            }'
+            return 0
+            ;;
+        warp)
+            warp_st=$(warp_status 2>/dev/null || true)
+            case "$warp_st" in
+                configured|connected|registered) ;;
+                *) _err "Mieru 服务出口需要 WARP 但未就绪（fail-closed）"; return 1 ;;
+            esac
+            allow_loop=true
+            proxies=$(jq -n --argjson port "$port" '[{
+                name:"proxy-svc-warp", protocol:"SOCKS5_PROXY_PROTOCOL",
+                host:"127.0.0.1", port:$port
+            }]')
+            erules=$(jq -n '[
+                {ipRanges:["127.0.0.1/32"], action:"DIRECT"},
+                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-svc-warp"]}
+            ]')
+            bridges=$(jq -n --argjson port "$port" '[{
+                name:"warp", port:$port, inbound:"mieru-bridge-svc-warp",
+                tag:"warp-prefer-ipv4", kind:"warp"
+            }]')
+            ;;
+        chain:*)
+            node_name="${routing#chain:}"
+            if ! db_chain_node_exists "$node_name" 2>/dev/null; then
+                _err "Mieru 服务出口链式节点不存在: $routing（fail-closed）"
+                return 1
+            fi
+            if ! _ep_raw=$(_mieru_resolve_proxy_endpoint "$node_name" 0); then
+                _err "Mieru 服务出口链式节点不可用: $routing（fail-closed）"
+                return 1
+            fi
+            local _ep=()
+            mapfile -t _ep <<< "$_ep_raw"
+            host="${_ep[0]}"; port="${_ep[1]}"; user="${_ep[2]}"; pass="${_ep[3]}"
+            proxy_name="${_ep[4]}"; kind="${_ep[5]}"; val="${_ep[6]}"; needs_br="${_ep[7]}"
+            [[ -n "$host" && "$port" =~ ^[0-9]+$ && -n "$proxy_name" ]] || {
+                _err "Mieru 服务出口链式端点无效: $routing（fail-closed）"
+                return 1
+            }
+            proxies=$(jq -n --arg name "$proxy_name" --arg host "$host" --argjson port "$port" \
+                --arg user "$user" --arg pass "$pass" '[ {
+                    name:$name, protocol:"SOCKS5_PROXY_PROTOCOL", host:$host, port:$port
+                } + (if ($user|length)>0 and ($pass|length)>0 then {socks5Authentication:{user:$user,password:$pass}} else {} end) ]')
+            if [[ "$kind" == "ip" ]]; then
+                erules=$(jq -n --arg v "$val" --arg p "$proxy_name" '[
+                    {ipRanges:[$v], action:"DIRECT"},
+                    {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:[$p]}
+                ]')
+            else
+                erules=$(jq -n --arg v "$val" --arg p "$proxy_name" '[
+                    {domainNames:[$v], action:"DIRECT"},
+                    {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:[$p]}
+                ]')
+            fi
+            if [[ "$needs_br" == "1" ]]; then
+                allow_loop=true
+                bridges=$(jq -n --arg name "$node_name" --argjson port "$port" --arg slug "$(_mieru_proxy_slug "$node_name")" '[
+                    {name:$name, port:$port, inbound:("mieru-bridge-"+$slug),
+                     tag:("chain-"+$name+"-prefer-ipv4"), kind:"chain"}
+                ]')
+            elif [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
+                allow_loop=true
+            fi
+            ;;
+        balancer:*)
+            group_name="${routing#balancer:}"
+            if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
+                _err "Mieru 服务出口负载组不存在: $routing（fail-closed）"
+                return 1
+            fi
+            allow_loop=true
+            proxies=$(jq -n --argjson port "$port" '[{
+                name:"proxy-svc-balancer", protocol:"SOCKS5_PROXY_PROTOCOL",
+                host:"127.0.0.1", port:$port
+            }]')
+            erules=$(jq -n '[
+                {ipRanges:["127.0.0.1/32"], action:"DIRECT"},
+                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-svc-balancer"]}
+            ]')
+            bridges=$(jq -n --argjson port "$port" --arg g "$group_name" '[{
+                name:$g, port:$port, inbound:("mieru-bridge-svc-bal-"+$g),
+                tag:("balancer-"+$g), kind:"balancer"
+            }]')
+            ;;
+        *)
+            _err "无效 Mieru 服务出口: $routing"
+            return 1
+            ;;
+    esac
+
+    jq -n --argjson proxies "$proxies" --argjson rules "$erules" --argjson bridges "$bridges" \
+        --argjson loop "$allow_loop" \
+        '{mode:"multi", legacy_name:"", proxies:$proxies, rules:$rules, bridges:$bridges, allowLoopbackIP:$loop, fallback_rules:[]}'
+}
+
 _mieru_compile_egress_plan() {
     local rules proxies='[]' erules='[]' bridges='[]' allow_loop=false
     local fallback_rules='[]' seen_nodes='' node_idx=0
@@ -5262,6 +5410,14 @@ _mieru_compile_egress_plan() {
     local domains rule_type item domain_list ip_list hit_unsafe=0
     local -A node_port_map=()
     local -A node_proxy_map=()
+    local svc_ob=""
+
+    # 显式服务出口 > 全局 routing_rules > 默认
+    svc_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
+    if [[ -n "$svc_ob" ]]; then
+        _mieru_compile_service_override_plan "$svc_ob"
+        return $?
+    fi
 
     rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
     if ! _mieru_needs_multi_egress; then
@@ -5653,21 +5809,58 @@ _inject_mieru_chain_bridge() {
             continue
         fi
 
-        chain_out=$(gen_xray_chain_outbound "$name" "$out_tag" "prefer_ipv4")
-        [[ -n "$chain_out" ]] || { _err "mieru 链式出口 outbound 生成失败: $name"; return 1; }
+        local bkind
+        bkind=$(echo "$bridge" | jq -r '.kind // "chain"')
+        case "$bkind" in
+            warp)
+                chain_out=$(gen_xray_warp_outbound) || chain_out=""
+                if [[ -z "$chain_out" ]]; then
+                    _err "mieru 服务出口 WARP outbound 生成失败（fail-closed）"
+                    return 1
+                fi
+                chain_out=$(echo "$chain_out" | jq '.tag = "warp-prefer-ipv4" | .domainStrategy = "ForceIPv4v6"')
+                out_tag="warp-prefer-ipv4"
+                ;;
+            balancer)
+                # 负载组 outbound/balancer 由主配置生成；此处仅挂 inbound→balancerTag
+                chain_out=""
+                if ! jq -e --arg t "$out_tag" '
+                    ((.routing.balancers // []) | map(.tag) | index($t)) != null
+                    or ((.outbounds // []) | map(.tag) | index($t)) != null
+                ' "$CFG/config.json" >/dev/null 2>&1; then
+                    _err "mieru 服务出口负载组未就绪: $name（fail-closed）"
+                    return 1
+                fi
+                ;;
+            *)
+                chain_out=$(gen_xray_chain_outbound "$name" "$out_tag" "prefer_ipv4")
+                [[ -n "$chain_out" ]] || { _err "mieru 链式出口 outbound 生成失败: $name"; return 1; }
+                ;;
+        esac
         inbound=$(jq -n --argjson port "$port" --arg tag "$inbound_tag" '{
             listen:"127.0.0.1", port:$port, protocol:"socks",
             settings:{auth:"noauth", udp:true}, tag:$tag
         }')
         tmp=$(mktemp) || return 1
-        if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" --arg in_tag "$inbound_tag" '
-            .inbounds = ((.inbounds // []) + [$inbound])
-            | if ([.outbounds[]?|.tag]|index($tag)) then . else .outbounds=(.outbounds//[])+[$outbound] end
-            | .routing.rules = ((.routing.rules // []) + [{type:"field", inboundTag:[$in_tag], outboundTag:$tag}])
-        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$CFG/config.json"
+        if [[ "$bkind" == "balancer" ]]; then
+            if jq --argjson inbound "$inbound" --arg tag "$out_tag" --arg in_tag "$inbound_tag" '
+                .inbounds = ((.inbounds // []) + [$inbound])
+                | .routing.rules = ((.routing.rules // []) + [{type:"field", inboundTag:[$in_tag], balancerTag:$tag}])
+            ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$CFG/config.json"
+            else
+                rm -f "$tmp"; return 1
+            fi
         else
-            rm -f "$tmp"; return 1
+            if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" --arg in_tag "$inbound_tag" '
+                .inbounds = ((.inbounds // []) + [$inbound])
+                | if ([.outbounds[]?|.tag]|index($tag)) then . else .outbounds=(.outbounds//[])+[$outbound] end
+                | .routing.rules = ((.routing.rules // []) + [{type:"field", inboundTag:[$in_tag], outboundTag:$tag}])
+            ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$CFG/config.json"
+            else
+                rm -f "$tmp"; return 1
+            fi
         fi
     done < <(echo "$bridges" | jq -c '.[]')
     return 0
@@ -17725,23 +17918,27 @@ db_get_balancer_group() {
 db_delete_balancer_group() {
     local name="$1"
     [[ ! -f "$DB_FILE" ]] && return
-    local _refs
+    local _refs _mieru_ob=""
     _refs=$(db_list_instances_using_outbound "balancer:$name" 2>/dev/null || true)
-    if [[ -n "$_refs" ]]; then
-        _warn "以下实例出口仍引用负载组 $name："
+    _mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
+    if [[ -n "$_refs" || "$_mieru_ob" == "balancer:$name" ]]; then
+        _warn "以下出口仍引用负载组 $name："
         echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+            [[ -z "$_p" ]] && continue
             echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
         done
+        [[ "$_mieru_ob" == "balancer:$name" ]] && echo -e "    • Mieru 服务 → $(_get_outbound_display_name "$_mieru_ob")"
         local _ans
-        read -rp "  重置这些实例为继承全局并删除负载组? [y/N]: " _ans
+        read -rp "  重置这些引用为继承全局并删除负载组? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
-            _err "已取消删除（保留实例出口引用）"
+            _err "已取消删除（保留出口引用）"
             return 1
         fi
         while IFS='|' read -r _c _p _port _v; do
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
+        [[ "$_mieru_ob" == "balancer:$name" ]] && db_clear_service_outbound_mieru || true
     fi
     _db_apply --arg name "$name" \
         '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
@@ -20054,7 +20251,7 @@ _prompt_instance_outbound() {
     esac
 }
 
-# 实例出口管理菜单（仅 Xray 共享核协议）
+# 实例出口管理菜单（Xray 共享核 per-port + 可选 Mieru 服务级一行）
 manage_instance_outbound() {
     while true; do
         _header
@@ -20062,12 +20259,17 @@ manage_instance_outbound() {
         _line
         echo -e "  ${D}优先序: API > 用户 > 多IP > 实例 > 全局 > 默认${NC}"
         echo -e "  ${D}缺省/空 = 继承全局；不写入字面量 inherit${NC}"
+        echo -e "  ${D}Mieru: 服务级覆盖 > 全局分流 > 默认直连（非逐端口）${NC}"
         _line
 
         local entries=()
         local idx=1
         local proto port ob
+        local has_mieru_row=0
+        local mieru_ob=""
         for proto in $XRAY_PROTOCOLS; do
+            # mieru 不走 per-port 行
+            [[ "$proto" == "mieru" ]] && continue
             db_exists "xray" "$proto" 2>/dev/null || continue
             while IFS= read -r port; do
                 [[ -z "$port" || "$port" == "null" ]] && continue
@@ -20077,12 +20279,20 @@ manage_instance_outbound() {
                 local pname
                 pname=$(get_protocol_name "$proto" 2>/dev/null || echo "$proto")
                 echo -e "  ${G}${idx}${NC}) ${pname} :${port}  →  ${C}${ob_disp}${NC}"
-                entries+=("${proto}|${port}|${ob}")
+                entries+=("port|${proto}|${port}|${ob}")
                 ((idx++))
             done < <(db_list_ports "xray" "$proto" 2>/dev/null)
         done
+        if db_exists "xray" "mieru" 2>/dev/null; then
+            mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
+            echo -e "  ${G}${idx}${NC}) Mieru（全部实例）  →  ${C}$(_get_outbound_display_name "$mieru_ob")${NC}"
+            echo -e "     ${D}Mieru 服务: 全部实例 → $(_get_outbound_display_name "$mieru_ob")${NC}"
+            entries+=("mieru|||${mieru_ob}")
+            has_mieru_row=1
+            ((idx++))
+        fi
         if [[ ${#entries[@]} -eq 0 ]]; then
-            echo -e "  ${D}暂无 Xray 入站实例${NC}"
+            echo -e "  ${D}暂无 Xray 入站实例 / Mieru 服务${NC}"
             _pause
             return
         fi
@@ -20095,7 +20305,35 @@ manage_instance_outbound() {
             _err "无效选择"; _pause; continue
         fi
         local ent="${entries[$((choice-1))]}"
-        proto="${ent%%|*}"; local rest="${ent#*|}"; port="${rest%%|*}"; local cur_ob="${rest#*|}"
+        local kind="${ent%%|*}"
+        local rest="${ent#*|}"
+        if [[ "$kind" == "mieru" ]]; then
+            cur_ob="${rest##*|}"
+            echo ""
+            echo -e "  当前出口: ${C}$(_get_outbound_display_name "$cur_ob")${NC}"
+            if ! _prompt_instance_outbound "mieru" "service" "$cur_ob"; then
+                _pause; continue
+            fi
+            local new_ob="$SELECTED_INSTANCE_OUTBOUND"
+            if [[ "$new_ob" == "$cur_ob" ]]; then
+                _ok "未变更"
+                _pause
+                continue
+            fi
+            if [[ -z "$new_ob" ]]; then
+                db_clear_service_outbound_mieru || { _err "清除失败"; _pause; continue; }
+                _ok "已恢复继承全局"
+            else
+                db_set_service_outbound_mieru "$new_ob" || { _err "设置失败"; _pause; continue; }
+                _ok "已设置: $(_get_outbound_display_name "$new_ob")"
+            fi
+            # 桥可能迁移：一次 all
+            _regenerate_proxy_configs all
+            _pause
+            continue
+        fi
+
+        proto="${rest%%|*}"; rest="${rest#*|}"; port="${rest%%|*}"; local cur_ob="${rest#*|}"
 
         echo ""
         echo -e "  当前出口: ${C}$(_get_outbound_display_name "$cur_ob")${NC}"
@@ -20462,24 +20700,28 @@ db_add_chain_node() {
 }
 db_del_chain_node() {
     local name="$1"
-    # 实例出口引用守卫：阻止静默变 DIRECT；询问是否重置为继承
-    local _refs
+    # 实例/Mieru 服务出口引用守卫：阻止静默变 DIRECT；询问是否重置为继承
+    local _refs _mieru_ob=""
     _refs=$(db_list_instances_using_outbound "chain:$name" 2>/dev/null || true)
-    if [[ -n "$_refs" ]]; then
-        _warn "以下实例出口仍引用链式节点 $name："
+    _mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
+    if [[ -n "$_refs" || "$_mieru_ob" == "chain:$name" ]]; then
+        _warn "以下出口仍引用链式节点 $name："
         echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+            [[ -z "$_p" ]] && continue
             echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
         done
+        [[ "$_mieru_ob" == "chain:$name" ]] && echo -e "    • Mieru 服务 → $(_get_outbound_display_name "$_mieru_ob")"
         local _ans
-        read -rp "  重置这些实例为继承全局并删除节点? [y/N]: " _ans
+        read -rp "  重置这些引用为继承全局并删除节点? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
-            _err "已取消删除（保留实例出口引用）"
+            _err "已取消删除（保留出口引用）"
             return 1
         fi
         while IFS='|' read -r _c _p _port _v; do
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
+        [[ "$_mieru_ob" == "chain:$name" ]] && db_clear_service_outbound_mieru || true
     fi
     _db_apply --arg name "$name" '
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
@@ -20518,6 +20760,22 @@ db_rename_chain_node() {
           else . end
         | if .balancer_groups then
             .balancer_groups = [.balancer_groups[] | if .nodes then .nodes = [.nodes[] | if . == $old then $new else . end] else . end]
+          else . end
+        | if ((.service_outbound.mieru // "") == ("chain:" + $old)) then
+            .service_outbound.mieru = ("chain:" + $new)
+          else . end
+        | if .xray then
+            .xray = (
+              .xray | with_entries(
+                .value |= (
+                  if type == "array" then
+                    map(if (.instance_outbound // "") == ("chain:" + $old) then .instance_outbound = ("chain:" + $new) else . end)
+                  elif type == "object" and ((.instance_outbound // "") == ("chain:" + $old)) then
+                    .instance_outbound = ("chain:" + $new)
+                  else . end
+                )
+              )
+            )
           else . end
     '; then
         return 0
