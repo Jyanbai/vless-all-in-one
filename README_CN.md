@@ -26,7 +26,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.24**
+当前脚本版本：**v3.5.25**
 
 ## 用于流量统计的自定义 Sing-box 构建
 

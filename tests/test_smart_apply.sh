@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local semantic tests for smart-apply (v3.5.24)
+# Local semantic tests for smart-apply (v3.5.25)
 # Hook: ./vless-server.sh --smart-apply-selftest  (VLESS_COUNT_REGEN stubs, no systemd)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,7 +15,7 @@ echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
 C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
-[[ "$VER" == "3.5.24" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
+[[ "$VER" == "3.5.25" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: symbols present ==="
 for s in _smart_snapshot_config _smart_validate_config _smart_apply_core _smart_apply_selftest _regenerate_proxy_configs; do
