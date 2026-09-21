@@ -6,12 +6,6 @@ An all-in-one proxy deployment script for Linux servers.
 
 It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, **mieru**, and **SSH Tunnel**.
 
-## Documentation
-
-- **Website:** https://docs.vaiox.de/
-- **Telegram Group:** https://t.me/vless_vaio
-- **Telegram Channel:** https://t.me/vaio_channel
-
 ## Features
 
 - One-click installation and management

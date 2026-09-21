@@ -6,12 +6,6 @@ Linux 服务器一体化代理部署脚本。
 
 它可以帮助你快速部署和管理多种协议，包括 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5**、**SS2022**、**VLESS Encryption + FinalMask (Sudoku)**、**mieru** 和 **SSH Tunnel**。
 
-## 文档
-
-- **网站文档：** https://docs.vaiox.de/
-- **Telegram 群组：** https://t.me/vless_vaio
-- **Telegram 频道：** https://t.me/vaio_channel
-
 ## 功能特性
 
 - 一键安装与管理
