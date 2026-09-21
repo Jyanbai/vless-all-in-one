@@ -19,8 +19,11 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - Built for Debian, Ubuntu, CentOS, and Alpine
 - Xray + Sing-box dual-core architecture
 - User management, routing, subscriptions, and troubleshooting docs
-- **mieru:** TCP/UDP transport, native `port` or `portRange` bindings, Traffic Pattern (Advanced) default Off (Off / Conservative / Custom); official `mierus://` share links
-- **SSH Tunnel:** uses the server’s existing OpenSSH only — key-only auth, TCP `-L` / `-D` / `-R`, no shell/exec/TTY/SFTP, no native UDP, no `ssh://` URI
+- **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
+- **SSH Tunnel** (v3.5.20): existing OpenSSH only — key-only auth, TCP `-L`/`-D`/`-R`, no shell/SFTP/UDP/`ssh://`
+- **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
+- **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
+- **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
 
 ## Quick Install
 
@@ -29,10 +32,6 @@ wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-o
 ```
 
 Current script version: **v3.5.23**
-
-## Documents
-
-- [Website Docs](https://docs.vaiox.de/)
 
 ## Sing-box custom build for traffic stats
 
