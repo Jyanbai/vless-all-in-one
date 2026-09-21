@@ -14462,7 +14462,7 @@ gen_vless_xhttp_server_config() {
 gen_vless_finalmask_server_config() {
     local uuid="$1" port="$2" decryption="$3" encryption="$4"
     local fm_password="$5" fm_ascii="${6:-prefer_entropy}" fm_padding_min="${7:-0}" fm_padding_max="${8:-3}"
-    local new_config stored_config
+    local new_config stored_config stored_ob expected_ob
     mkdir -p "$CFG"
 
     new_config=$(build_config \
@@ -14471,11 +14471,44 @@ gen_vless_finalmask_server_config() {
         password "$fm_password" ascii "$fm_ascii" \
         padding_min "$fm_padding_min" padding_max "$fm_padding_max") || return 1
     _limited_change_begin "vless-finalmask" || { _err "无法备份 FinalMask 现有配置"; return 1; }
-    register_protocol "vless-finalmask" "$new_config"
+    # register_protocol 可能保留/注入 instance_outbound；失败须立刻 fail-closed
+    if ! register_protocol "vless-finalmask" "$new_config"; then
+        _err "FinalMask 注册失败，正在恢复原配置"
+        _limited_change_rollback
+        return 1
+    fi
     stored_config=$(db_get_port_config "xray" "vless-finalmask" "$port" 2>/dev/null) || stored_config=""
-    if [[ -z "$stored_config" ]] ||
-       ! printf '%s\n' "$stored_config" | jq -e --argjson expected "$new_config" '. == $expected' >/dev/null 2>&1; then
+    if [[ -z "$stored_config" ]]; then
         _err "FinalMask 数据库写入校验失败，正在恢复原配置"
+        _limited_change_rollback
+        return 1
+    fi
+    # 协议自有字段精确比对（剥离 instance_outbound）；勿整包 ==（合法出口会误杀）
+    if ! printf '%s\n' "$stored_config" | jq -e --argjson expected "$new_config" \
+        'del(.instance_outbound) == ($expected | del(.instance_outbound))' >/dev/null 2>&1; then
+        _err "FinalMask 数据库写入校验失败，正在恢复原配置"
+        _limited_change_rollback
+        return 1
+    fi
+    # instance_outbound 独立校验：空=继承（禁止字面量 inherit）；否则须为合法词汇且与期望一致（若有）
+    stored_ob=$(printf '%s\n' "$stored_config" | jq -r '.instance_outbound // empty')
+    expected_ob=$(printf '%s\n' "$new_config" | jq -r '.instance_outbound // empty')
+    case "$stored_ob" in
+        "") ;;
+        inherit)
+            _err "FinalMask 实例出口校验失败：禁止字面量 inherit，正在恢复原配置"
+            _limited_change_rollback
+            return 1
+            ;;
+        direct|warp|chain:*|balancer:*) ;;
+        *)
+            _err "FinalMask 实例出口校验失败: ${stored_ob}，正在恢复原配置"
+            _limited_change_rollback
+            return 1
+            ;;
+    esac
+    if [[ -n "$expected_ob" && "$stored_ob" != "$expected_ob" ]]; then
+        _err "FinalMask 实例出口校验失败: 期望 ${expected_ob} 实际 ${stored_ob}，正在恢复原配置"
         _limited_change_rollback
         return 1
     fi
