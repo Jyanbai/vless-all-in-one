@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.22 [服务端]
+#  多协议代理一键部署脚本 v3.5.23 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.22"
+readonly VERSION="3.5.23"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -394,6 +394,80 @@ db_update_port() {
             end
         )
     '
+}
+
+# 实例出口 (instance_outbound): 缺省/空=继承全局; direct|warp|chain:|balancer:
+# 不落库字面量 "inherit"（与用户 .routing 词汇对齐）
+# 用法: db_get_instance_outbound "xray" "vless" "443"
+db_get_instance_outbound() {
+    local core="$1" protocol="$2" port="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    local cfg
+    cfg=$(db_get_port_config "$core" "$protocol" "$port") || return 1
+    [[ -z "$cfg" || "$cfg" == "null" ]] && return 1
+    echo "$cfg" | jq -r '.instance_outbound // empty'
+}
+
+# 用法: db_set_instance_outbound "xray" "vless" "443" "direct|warp|chain:x|balancer:g"
+# 空值 → 清除字段（继承）
+db_set_instance_outbound() {
+    local core="$1" protocol="$2" port="$3" value="${4:-}"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    if [[ -z "$value" || "$value" == "inherit" || "$value" == "null" ]]; then
+        db_clear_instance_outbound "$core" "$protocol" "$port"
+        return $?
+    fi
+    case "$value" in
+        direct|warp|chain:*|balancer:*) ;;
+        *) _err "无效实例出口: $value"; return 1 ;;
+    esac
+    _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --arg v "$value" '
+        def port_key:
+            if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+            else ((.port_range // .portRange // "")|tostring) end;
+        .[$c][$p] = (
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] | map(if port_key == $port then .instance_outbound = $v else . end)
+            else
+                if (.[$c][$p] | port_key) == $port then (.[$c][$p] | .instance_outbound = $v) else .[$c][$p] end
+            end
+        )
+    '
+}
+
+# 用法: db_clear_instance_outbound "xray" "vless" "443"
+db_clear_instance_outbound() {
+    local core="$1" protocol="$2" port="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" '
+        def port_key:
+            if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+            else ((.port_range // .portRange // "")|tostring) end;
+        .[$c][$p] = (
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] | map(if port_key == $port then del(.instance_outbound) else . end)
+            else
+                if (.[$c][$p] | port_key) == $port then (.[$c][$p] | del(.instance_outbound)) else .[$c][$p] end
+            end
+        )
+    '
+}
+
+# 列出引用指定出口的实例 (core|protocol|port|value)，供链式/负载删除守卫
+# 用法: db_list_instances_using_outbound "chain:JP" | "balancer:g1" | "warp"
+db_list_instances_using_outbound() {
+    local target="$1"
+    [[ ! -f "$DB_FILE" || -z "$target" ]] && return 0
+    jq -r --arg t "$target" '
+        .xray // {} | to_entries[] | .key as $proto | .value |
+        if type == "array" then
+            .[] | select((.instance_outbound // "") == $t) |
+            "xray|\($proto)|\(.port // .port_range // "")|\(.instance_outbound)"
+        else
+            select((.instance_outbound // "") == $t) |
+            "xray|\($proto)|\(.port // .port_range // "")|\(.instance_outbound)"
+        end
+    ' "$DB_FILE" 2>/dev/null
 }
 
 # 删除协议
@@ -3699,6 +3773,39 @@ register_protocol() {
         return 1
     fi
 
+    # Xray 共享核：安装时可选实例出口；同端口覆盖时默认保留 instance_outbound
+    if [[ "$core" == "xray" && " $XRAY_PROTOCOLS " == *" $protocol "* ]]; then
+        local _prev_ob=""
+        if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+            _prev_ob=$(db_get_instance_outbound "xray" "$protocol" "$REPLACE_PORT" 2>/dev/null || true)
+        fi
+        # 新配置若未显式带字段，覆盖时保留旧值
+        local _has_ob
+        _has_ob=$(echo "$config_json" | jq -r 'has("instance_outbound")')
+        if [[ "$_has_ob" != "true" && -n "$_prev_ob" ]]; then
+            config_json=$(echo "$config_json" | jq --arg v "$_prev_ob" '.instance_outbound = $v')
+        fi
+        # 交互安装且分流已配置时询问（PENDING_INSTANCE_OUTBOUND 可预置；__skip__ 跳过询问）
+        if [[ -t 0 && "${PENDING_INSTANCE_OUTBOUND:-}" != "__skip__" ]]; then
+            local _ask_ob="${PENDING_INSTANCE_OUTBOUND-__unset__}"
+            if [[ "$_ask_ob" == "__unset__" ]]; then
+                local _cur
+                _cur=$(echo "$config_json" | jq -r '.instance_outbound // empty')
+                if _prompt_instance_outbound "$protocol" "$port" "$_cur"; then
+                    _ask_ob="$SELECTED_INSTANCE_OUTBOUND"
+                else
+                    _ask_ob="$_cur"
+                fi
+            fi
+            if [[ -z "$_ask_ob" ]]; then
+                config_json=$(echo "$config_json" | jq 'del(.instance_outbound)')
+            else
+                config_json=$(echo "$config_json" | jq --arg v "$_ask_ob" '.instance_outbound = $v')
+            fi
+        fi
+        unset PENDING_INSTANCE_OUTBOUND 2>/dev/null || true
+    fi
+
     # ssh-tunnel：同端口视为更新（D→R 等 mode/bind 变更），禁止 db_add_port 跳过导致 drop-in 不重建
     if [[ "$protocol" == "ssh-tunnel" ]]; then
         local _st_ports
@@ -3946,6 +4053,140 @@ gen_xray_user_routing_outbounds() {
     done | sort -u
 }
 
+# 解析实例出口为 Xray outboundTag 或 balancerTag（与用户路由一致）
+# 成功时设置: _INSTANCE_OB_KIND=outbound|balancer  _INSTANCE_OB_TAG=...
+# 失败返回 1（调用方 fail-closed，禁止静默 DIRECT）
+_resolve_instance_outbound_target() {
+    local routing="$1"
+    _INSTANCE_OB_KIND=""
+    _INSTANCE_OB_TAG=""
+    case "$routing" in
+        direct)
+            _INSTANCE_OB_KIND=outbound
+            _INSTANCE_OB_TAG="direct"
+            ;;
+        warp)
+            _INSTANCE_OB_KIND=outbound
+            _INSTANCE_OB_TAG="warp-prefer-ipv4"
+            ;;
+        chain:*)
+            local node_name="${routing#chain:}"
+            if ! db_chain_node_exists "$node_name" 2>/dev/null; then
+                _err "实例出口目标不存在: $routing"
+                return 1
+            fi
+            _INSTANCE_OB_KIND=outbound
+            _INSTANCE_OB_TAG="chain-${node_name}-prefer-ipv4"
+            ;;
+        balancer:*)
+            local group_name="${routing#balancer:}"
+            if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
+                _err "实例出口负载组不存在: $routing"
+                return 1
+            fi
+            _INSTANCE_OB_KIND=balancer
+            _INSTANCE_OB_TAG="balancer-${group_name}"
+            ;;
+        ""|inherit|null)
+            return 1
+            ;;
+        *)
+            _err "无效实例出口: $routing"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# 收集所有非空 instance_outbound 需求 (用于确保 outbound 存在)
+gen_xray_instance_outbound_needs() {
+    local xray_protocols=$(get_xray_protocols)
+    [[ -z "$xray_protocols" ]] && return
+    for proto in $xray_protocols; do
+        # 跳过 mieru / 非共享核协议
+        case "$proto" in
+            mieru|mieru-*|snell*|naive|ssh-tunnel) continue ;;
+        esac
+        local ports
+        ports=$(db_list_ports "xray" "$proto" 2>/dev/null) || continue
+        while IFS= read -r port; do
+            [[ -z "$port" || "$port" == "null" ]] && continue
+            local ob
+            ob=$(db_get_instance_outbound "xray" "$proto" "$port" 2>/dev/null || true)
+            [[ -z "$ob" || "$ob" == "null" ]] && continue
+            case "$ob" in
+                warp|chain:*|balancer:*) echo "$ob" ;;
+            esac
+        done <<< "$ports"
+    done | sort -u
+}
+
+# 生成实例级 inboundTag 路由规则
+# MULTI-IP: 对逻辑实例的 base tag 与全部 ip-in-*-${port} 克隆一并写入 inboundTag；
+# 更具体的多IP规则在 generate_xray_config 中优先于本规则组装，因此多IP显式规则胜出。
+# 缺目标: fail-closed（返回非0，拒绝静默 DIRECT）
+# 返回: JSON 数组；无覆盖时 echo []
+gen_xray_instance_outbound_rules() {
+    local rules="[]"
+    local xray_protocols=$(get_xray_protocols)
+    [[ -z "$xray_protocols" ]] && { echo "[]"; return 0; }
+
+    for proto in $xray_protocols; do
+        case "$proto" in
+            mieru|mieru-*|snell*|naive|ssh-tunnel) continue ;;
+        esac
+        local ports
+        ports=$(db_list_ports "xray" "$proto" 2>/dev/null) || continue
+        while IFS= read -r port; do
+            [[ -z "$port" || "$port" == "null" ]] && continue
+            local ob
+            ob=$(db_get_instance_outbound "xray" "$proto" "$port" 2>/dev/null || true)
+            [[ -z "$ob" || "$ob" == "null" ]] && continue
+
+            if ! _resolve_instance_outbound_target "$ob"; then
+                return 1
+            fi
+
+            local base_tag
+            base_tag=$(_instance_inbound_tag "$proto" "$port")
+            # 收集 base + 同端口多IP克隆 tags
+            local tags_json
+            tags_json=$(jq -n --arg t "$base_tag" '[$t]')
+            if [[ -f "$CFG/config.json" ]]; then
+                local clones
+                clones=$(jq -c --argjson p "$port" '
+                    [.inbounds[]? | select(.port == $p and (.tag|startswith("ip-in-"))) | .tag]
+                ' "$CFG/config.json" 2>/dev/null || echo "[]")
+                tags_json=$(echo "$tags_json" | jq --argjson c "$clones" '. + $c | unique')
+            fi
+            # 无 config 时也按已知多IP规则预生成克隆 tag（与 add_xray_inbound_v2 公式一致）
+            if db_ip_routing_enabled 2>/dev/null; then
+                local ip_rules
+                ip_rules=$(db_get_ip_routing_rules 2>/dev/null || echo "[]")
+                if [[ -n "$ip_rules" && "$ip_rules" != "[]" ]]; then
+                    while IFS= read -r inbound_ip; do
+                        [[ -z "$inbound_ip" ]] && continue
+                        local ip_tag="ip-in-${inbound_ip//[.:]/-}-${port}"
+                        tags_json=$(echo "$tags_json" | jq --arg t "$ip_tag" '. + [$t] | unique')
+                    done < <(echo "$ip_rules" | jq -r '.[].inbound_ip // empty')
+                fi
+            fi
+
+            local rule
+            if [[ "$_INSTANCE_OB_KIND" == "balancer" ]]; then
+                rule=$(jq -n --argjson tags "$tags_json" --arg tag "$_INSTANCE_OB_TAG" \
+                    '{type:"field", inboundTag:$tags, balancerTag:$tag}')
+            else
+                rule=$(jq -n --argjson tags "$tags_json" --arg tag "$_INSTANCE_OB_TAG" \
+                    '{type:"field", inboundTag:$tags, outboundTag:$tag}')
+            fi
+            rules=$(echo "$rules" | jq --argjson r "$rule" '. + [$r]')
+        done <<< "$ports"
+    done
+    echo "$rules"
+}
+
+
 # 生成 Xray 多 inbounds 配置
 generate_xray_config() {
     local xray_protocols=$(get_xray_protocols)
@@ -4175,14 +4416,29 @@ generate_xray_config() {
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
 
-        routing_rules=$(gen_xray_routing_rules)
-        [[ -n "$routing_rules" && "$routing_rules" != "[]" ]] && has_routing=true
-        
-        # 添加用户级路由规则 (优先级高于全局规则)
-        local user_routing_rules=$(gen_xray_user_routing_rules)
-        if [[ -n "$user_routing_rules" && "$user_routing_rules" != "[]" ]]; then
-            # 确保用户路由需要的outbounds存在
-            local user_routing_needs=$(gen_xray_user_routing_outbounds)
+        local global_routing_rules
+        global_routing_rules=$(gen_xray_routing_rules)
+        [[ -z "$global_routing_rules" ]] && global_routing_rules="[]"
+
+        # 用户级 / 实例级路由规则
+        # 组装顺序(后续还会前置 多IP / WARP保护 / API):
+        #   用户 > 实例 > 全局
+        # 最终优先序: API > WARP保护 > 多IP显式 > 用户 > 实例 > 全局 > 默认
+        local user_routing_rules
+        user_routing_rules=$(gen_xray_user_routing_rules)
+        [[ -z "$user_routing_rules" ]] && user_routing_rules="[]"
+
+        local instance_routing_rules
+        if ! instance_routing_rules=$(gen_xray_instance_outbound_rules); then
+            _err "实例出口配置无效或目标缺失，拒绝生成配置（fail-closed）"
+            return 1
+        fi
+        [[ -z "$instance_routing_rules" ]] && instance_routing_rules="[]"
+
+        # 确保用户路由需要的 outbounds 存在
+        if [[ "$user_routing_rules" != "[]" ]]; then
+            local user_routing_needs
+            user_routing_needs=$(gen_xray_user_routing_outbounds)
             for need in $user_routing_needs; do
                 case "$need" in
                     warp)
@@ -4191,6 +4447,9 @@ generate_xray_config() {
                             if [[ -n "$warp_out" ]]; then
                                 local warp_out_v4=$(echo "$warp_out" | jq '.tag = "warp-prefer-ipv4" | .domainStrategy = "ForceIPv4v6"')
                                 outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_v4" '. + [$out]')
+                            else
+                                _err "用户路由需要 WARP 出口但生成失败（fail-closed）"
+                                return 1
                             fi
                         fi
                         ;;
@@ -4199,20 +4458,61 @@ generate_xray_config() {
                         local tag="chain-${node_name}-prefer-ipv4"
                         if ! echo "$outbounds" | jq -e --arg tag "$tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                             local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag" "prefer_ipv4")
-                            [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                            if [[ -z "$chain_out" ]]; then
+                                _err "用户路由链式出口生成失败: $node_name（fail-closed）"
+                                return 1
+                            fi
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                         fi
                         ;;
                 esac
             done
-            
-            # 用户级规则放在最前面，优先匹配
-            if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
-                routing_rules=$(echo "$user_routing_rules" | jq --argjson global_rules "$routing_rules" '. + $global_rules')
-            else
-                routing_rules="$user_routing_rules"
-            fi
-            has_routing=true
         fi
+
+        # 确保实例出口需要的 outbounds 存在（缺目标 fail-closed）
+        if [[ "$instance_routing_rules" != "[]" ]]; then
+            local instance_needs
+            instance_needs=$(gen_xray_instance_outbound_needs)
+            for need in $instance_needs; do
+                case "$need" in
+                    warp)
+                        if ! echo "$outbounds" | jq -e '.[] | select(.tag == "warp-prefer-ipv4")' >/dev/null 2>&1; then
+                            local warp_out=$(gen_xray_warp_outbound)
+                            if [[ -z "$warp_out" ]]; then
+                                _err "实例出口需要 WARP 但生成失败（fail-closed）"
+                                return 1
+                            fi
+                            local warp_out_v4=$(echo "$warp_out" | jq '.tag = "warp-prefer-ipv4" | .domainStrategy = "ForceIPv4v6"')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_v4" '. + [$out]')
+                        fi
+                        ;;
+                    chain:*)
+                        local node_name="${need#chain:}"
+                        local tag="chain-${node_name}-prefer-ipv4"
+                        if ! echo "$outbounds" | jq -e --arg tag "$tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag" "prefer_ipv4")
+                            if [[ -z "$chain_out" ]]; then
+                                _err "实例出口链式节点不可用: $node_name（fail-closed，不回落 DIRECT）"
+                                return 1
+                            fi
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                        fi
+                        ;;
+                    balancer:*)
+                        # balancer 本体在上方 balancers 生成；此处仅校验组仍存在
+                        local group_name="${need#balancer:}"
+                        if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
+                            _err "实例出口负载组不存在: $group_name（fail-closed）"
+                            return 1
+                        fi
+                        ;;
+                esac
+            done
+        fi
+
+        # 用户 > 实例 > 全局
+        routing_rules=$(jq -n             --argjson u "$user_routing_rules"             --argjson i "$instance_routing_rules"             --argjson g "$global_routing_rules"             '$u + $i + $g')
+        [[ "$routing_rules" != "[]" ]] && has_routing=true
         
         # 添加多IP路由的outbound和routing规则
         local ip_routing_outbounds=$(gen_xray_ip_routing_outbounds)
@@ -4374,16 +4674,24 @@ generate_xray_config() {
             ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
         fi
     else
-        # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
+        # 无全局分流规则时，仍然需要检查用户级/实例级路由规则和负载均衡器
         local user_routing_rules=$(gen_xray_user_routing_rules)
+        [[ -z "$user_routing_rules" ]] && user_routing_rules="[]"
+        local instance_routing_rules
+        if ! instance_routing_rules=$(gen_xray_instance_outbound_rules); then
+            _err "实例出口配置无效或目标缺失，拒绝生成配置（fail-closed）"
+            return 1
+        fi
+        [[ -z "$instance_routing_rules" ]] && instance_routing_rules="[]"
         local user_outbounds="[$direct_outbound]"
         local user_balancers="[]"
         
-        if [[ -n "$user_routing_rules" && "$user_routing_rules" != "[]" ]]; then
-            # 用户有自定义路由，需要生成对应的 outbounds 和 balancers
+        if [[ "$user_routing_rules" != "[]" || "$instance_routing_rules" != "[]" ]]; then
+            # 用户/实例有自定义路由，需要生成对应的 outbounds 和 balancers
             
             # 确保用户路由需要的outbounds存在
-            local user_routing_needs=$(gen_xray_user_routing_outbounds)
+            local user_routing_needs=""
+            [[ "$user_routing_rules" != "[]" ]] && user_routing_needs=$(gen_xray_user_routing_outbounds)
             for need in $user_routing_needs; do
                 case "$need" in
                     warp)
@@ -4430,15 +4738,55 @@ generate_xray_config() {
                         ;;
                 esac
             done
+
+            # 确保实例出口需要的 outbounds 存在（fail-closed）
+            if [[ "$instance_routing_rules" != "[]" ]]; then
+                local instance_needs
+                instance_needs=$(gen_xray_instance_outbound_needs)
+                for need in $instance_needs; do
+                    case "$need" in
+                        warp)
+                            if ! echo "$user_outbounds" | jq -e '.[] | select(.tag == "warp-prefer-ipv4")' >/dev/null 2>&1; then
+                                local warp_out=$(gen_xray_warp_outbound)
+                                if [[ -z "$warp_out" ]]; then
+                                    _err "实例出口需要 WARP 但生成失败（fail-closed）"
+                                    return 1
+                                fi
+                                local warp_out_v4=$(echo "$warp_out" | jq '.tag = "warp-prefer-ipv4" | .domainStrategy = "ForceIPv4v6"')
+                                user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$warp_out_v4" '. + [$out]')
+                            fi
+                            ;;
+                        chain:*)
+                            local node_name="${need#chain:}"
+                            local tag="chain-${node_name}-prefer-ipv4"
+                            if ! echo "$user_outbounds" | jq -e --arg tag "$tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                                local chain_out=$(gen_xray_chain_outbound "$node_name" "$tag" "prefer_ipv4")
+                                if [[ -z "$chain_out" ]]; then
+                                    _err "实例出口链式节点不可用: $node_name（fail-closed）"
+                                    return 1
+                                fi
+                                user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                            fi
+                            ;;
+                        balancer:*)
+                            local group_name="${need#balancer:}"
+                            if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
+                                _err "实例出口负载组不存在: $group_name（fail-closed）"
+                                return 1
+                            fi
+                            ;;
+                    esac
+                done
+            fi
             
-            # 添加 API 规则到用户路由规则前面
+            # API > 用户 > 实例
             local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
-            local all_rules=$(echo "$user_routing_rules" | jq --argjson api "$api_rule" '[$api] + .')
+            local all_rules=$(jq -n --argjson api "$api_rule" --argjson u "$user_routing_rules" --argjson i "$instance_routing_rules"                 '[$api] + $u + $i')
             
             # 添加 api outbound
             user_outbounds=$(echo "$user_outbounds" | jq '. + [{protocol: "blackhole", tag: "api"}]')
             
-            # 生成包含用户路由的配置
+            # 生成包含用户/实例路由的配置
             jq -n --argjson outbounds "$user_outbounds" --argjson balancers "$user_balancers" --argjson rules "$all_rules" '{
                 log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
                 api: {tag: "api", services: ["StatsService"]},
@@ -5945,6 +6293,16 @@ _add_single_xray_inbound() {
 }
 
 # 使用 jq 动态构建 inbound (重构版 - 只从数据库读取)
+# 实例 inboundTag：必须与 add_xray_inbound_v2 的 ${base_protocol}-${port} 一致，禁止漂移
+_instance_inbound_tag() {
+    local protocol="$1" port="$2"
+    local base_protocol="$protocol"
+    if [[ "$protocol" =~ ^(.+)_port_[0-9]+$ ]]; then
+        base_protocol="${BASH_REMATCH[1]}"
+    fi
+    echo "${base_protocol}-${port}"
+}
+
 add_xray_inbound_v2() {
     local protocol=$1
     
@@ -5981,8 +6339,9 @@ add_xray_inbound_v2() {
         return 1
     fi
 
-    # 生成唯一的 inbound tag（基础协议名 + 端口）
-    local inbound_tag="${base_protocol}-${port}"
+    # 生成唯一的 inbound tag（基础协议名 + 端口；与 _instance_inbound_tag 同源）
+    local inbound_tag
+    inbound_tag=$(_instance_inbound_tag "$base_protocol" "$port")
     
     # 检测主协议和回落配置（仅当主协议端口为 8443 时才启用回落模式）
     local has_master=false
@@ -17329,6 +17688,24 @@ db_get_balancer_group() {
 db_delete_balancer_group() {
     local name="$1"
     [[ ! -f "$DB_FILE" ]] && return
+    local _refs
+    _refs=$(db_list_instances_using_outbound "balancer:$name" 2>/dev/null || true)
+    if [[ -n "$_refs" ]]; then
+        _warn "以下实例出口仍引用负载组 $name："
+        echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+            echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
+        done
+        local _ans
+        read -rp "  重置这些实例为继承全局并删除负载组? [y/N]: " _ans
+        if [[ ! "$_ans" =~ ^[yY]$ ]]; then
+            _err "已取消删除（保留实例出口引用）"
+            return 1
+        fi
+        while IFS='|' read -r _c _p _port _v; do
+            [[ -z "$_p" || -z "$_port" ]] && continue
+            db_clear_instance_outbound "$_c" "$_p" "$_port" || true
+        done <<< "$_refs"
+    fi
     _db_apply --arg name "$name" \
         '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
 }
@@ -17629,9 +18006,11 @@ _select_outbound() {
 _get_outbound_display_name() {
     local outbound="$1"
     case "$outbound" in
+        ""|null) echo "继承全局" ;;
         direct) echo "直连" ;;
         warp) echo "WARP" ;;
-        chain:*) echo "${outbound#chain:}" ;;
+        chain:*) echo "链路→${outbound#chain:}" ;;
+        balancer:*) echo "负载→${outbound#balancer:}" ;;
         *) echo "$outbound" ;;
     esac
 }
@@ -17732,7 +18111,8 @@ _routing_split_tokens() {
     local src="$1"
     _ROUTING_TOKENS=()
     # 粘贴多行列表时 read 默认只吃第一行；换行视为逗号
-    src="${src//$''/}"
+    src="${src//$'
+'/}"
     src="${src//$'
 '/,}"
     local IFS=','
@@ -18200,6 +18580,22 @@ show_routing_status() {
         echo -e "  代理: ${G}● ${node_count} 个节点${NC}"
     else
         echo -e "  代理: ${D}○ 无节点${NC}"
+    fi
+
+    # 实例出口覆盖（显示名，非内部 tag）
+    local _iob_lines=""
+    local _proto _port _ob
+    for _proto in $XRAY_PROTOCOLS; do
+        db_exists "xray" "$_proto" 2>/dev/null || continue
+        while IFS= read -r _port; do
+            [[ -z "$_port" || "$_port" == "null" ]] && continue
+            _ob=$(db_get_instance_outbound "xray" "$_proto" "$_port" 2>/dev/null || true)
+            [[ -z "$_ob" ]] && continue
+            _iob_lines+=$(printf '%s\n' "  实例: ${G}$(get_protocol_name "$_proto" 2>/dev/null || echo "$_proto"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}")
+        done < <(db_list_ports "xray" "$_proto" 2>/dev/null)
+    done
+    if [[ -n "$_iob_lines" ]]; then
+        echo -e "$_iob_lines"
     fi
     
     _line
@@ -19334,6 +19730,124 @@ setup_warp_ipv6_chain() {
 }
 
 # 分流管理主菜单
+
+# 分流是否已有实质配置（规则/链式/WARP/负载）——决定安装时是否询问实例出口
+_routing_meaningfully_configured() {
+    local rules nodes groups warp_st
+    rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
+    [[ -n "$rules" && "$rules" != "[]" && "$rules" != "null" ]] && return 0
+    nodes=$(db_get_chain_nodes 2>/dev/null || echo '[]')
+    [[ -n "$nodes" && "$nodes" != "[]" && "$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]] && return 0
+    groups=$(db_get_balancer_groups 2>/dev/null || echo '[]')
+    [[ -n "$groups" && "$groups" != "[]" && "$(echo "$groups" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]] && return 0
+    warp_st=$(warp_status 2>/dev/null || true)
+    [[ "$warp_st" == "configured" || "$warp_st" == "connected" || "$warp_st" == "registered" ]] && return 0
+    return 1
+}
+
+# 安装/管理时选择实例出口；默认继承（不落库）
+# 设置 SELECTED_INSTANCE_OUTBOUND；空字符串=继承
+# $1=protocol $2=port $3=current_value(optional)
+_prompt_instance_outbound() {
+    local protocol="${1:-}" port="${2:-}" current="${3:-}"
+    SELECTED_INSTANCE_OUTBOUND=""
+    if ! _routing_meaningfully_configured; then
+        return 0
+    fi
+    echo "" >&2
+    _line >&2
+    echo -e "  ${W}实例出口${NC} ${D}(默认继承全局分流)${NC}" >&2
+    if [[ -n "$current" ]]; then
+        echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
+    fi
+    echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
+    echo -e "  ${G}2${NC}) 指定出口 (直连/WARP/链式/负载)" >&2
+    echo -e "  ${G}0${NC}) 跳过" >&2
+    _line >&2
+    local choice
+    read -rp "  请选择 [1]: " choice
+    choice=${choice:-1}
+    case "$choice" in
+        0) SELECTED_INSTANCE_OUTBOUND="$current"; return 0 ;;
+        1) SELECTED_INSTANCE_OUTBOUND=""; return 0 ;;
+        2)
+            local selected
+            selected=$(_select_outbound "选择实例出口" "no_check") || return 1
+            SELECTED_INSTANCE_OUTBOUND="$selected"
+            return 0
+            ;;
+        *) SELECTED_INSTANCE_OUTBOUND=""; return 0 ;;
+    esac
+}
+
+# 实例出口管理菜单（仅 Xray 共享核协议）
+manage_instance_outbound() {
+    while true; do
+        _header
+        echo -e "  ${W}实例出口管理${NC}"
+        _line
+        echo -e "  ${D}优先序: API > 用户 > 多IP > 实例 > 全局 > 默认${NC}"
+        echo -e "  ${D}缺省/空 = 继承全局；不写入字面量 inherit${NC}"
+        _line
+
+        local entries=()
+        local idx=1
+        local proto port ob
+        for proto in $XRAY_PROTOCOLS; do
+            db_exists "xray" "$proto" 2>/dev/null || continue
+            while IFS= read -r port; do
+                [[ -z "$port" || "$port" == "null" ]] && continue
+                ob=$(db_get_instance_outbound "xray" "$proto" "$port" 2>/dev/null || true)
+                local ob_disp
+                ob_disp=$(_get_outbound_display_name "$ob")
+                local pname
+                pname=$(get_protocol_name "$proto" 2>/dev/null || echo "$proto")
+                echo -e "  ${G}${idx}${NC}) ${pname} :${port}  →  ${C}${ob_disp}${NC}"
+                entries+=("${proto}|${port}|${ob}")
+                ((idx++))
+            done < <(db_list_ports "xray" "$proto" 2>/dev/null)
+        done
+        if [[ ${#entries[@]} -eq 0 ]]; then
+            echo -e "  ${D}暂无 Xray 入站实例${NC}"
+            _pause
+            return
+        fi
+        echo -e "  ${G}0${NC}) 返回"
+        _line
+        local choice
+        read -rp "  选择实例: " choice
+        [[ "$choice" == "0" || -z "$choice" ]] && return
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#entries[@]} ]]; then
+            _err "无效选择"; _pause; continue
+        fi
+        local ent="${entries[$((choice-1))]}"
+        proto="${ent%%|*}"; local rest="${ent#*|}"; port="${rest%%|*}"; local cur_ob="${rest#*|}"
+
+        echo ""
+        echo -e "  当前出口: ${C}$(_get_outbound_display_name "$cur_ob")${NC}"
+        if ! _prompt_instance_outbound "$proto" "$port" "$cur_ob"; then
+            _pause; continue
+        fi
+        local new_ob="$SELECTED_INSTANCE_OUTBOUND"
+        # 相同值不重生
+        if [[ "$new_ob" == "$cur_ob" ]]; then
+            _ok "未变更"
+            _pause
+            continue
+        fi
+        if [[ -z "$new_ob" ]]; then
+            db_clear_instance_outbound "xray" "$proto" "$port" || { _err "清除失败"; _pause; continue; }
+            _ok "已恢复继承全局"
+        else
+            db_set_instance_outbound "xray" "$proto" "$port" "$new_ob" || { _err "设置失败"; _pause; continue; }
+            _ok "已设置: $(_get_outbound_display_name "$new_ob")"
+        fi
+        # 仅重生一次
+        _regenerate_proxy_configs
+        _pause
+    done
+}
+
 manage_routing() {
     while true; do
         _header
@@ -19348,6 +19862,7 @@ manage_routing() {
         _item "6" "访问限制"
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
+        _item "9" "实例出口管理"
         _item "0" "返回"
         _line
         
@@ -19379,6 +19894,7 @@ manage_routing() {
                 _line
                 read -rp "  按回车返回..." _
                 ;;
+            9) manage_instance_outbound ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -19672,6 +20188,25 @@ db_add_chain_node() {
 }
 db_del_chain_node() {
     local name="$1"
+    # 实例出口引用守卫：阻止静默变 DIRECT；询问是否重置为继承
+    local _refs
+    _refs=$(db_list_instances_using_outbound "chain:$name" 2>/dev/null || true)
+    if [[ -n "$_refs" ]]; then
+        _warn "以下实例出口仍引用链式节点 $name："
+        echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+            echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
+        done
+        local _ans
+        read -rp "  重置这些实例为继承全局并删除节点? [y/N]: " _ans
+        if [[ ! "$_ans" =~ ^[yY]$ ]]; then
+            _err "已取消删除（保留实例出口引用）"
+            return 1
+        fi
+        while IFS='|' read -r _c _p _port _v; do
+            [[ -z "$_p" || -z "$_port" ]] && continue
+            db_clear_instance_outbound "$_c" "$_p" "$_port" || true
+        done <<< "$_refs"
+    fi
     _db_apply --arg name "$name" '
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
         | if .chain_proxy.active == $name then del(.chain_proxy.active) else . end
