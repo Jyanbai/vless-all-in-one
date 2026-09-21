@@ -19,6 +19,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
 - **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
 - **Smart apply (v3.5.24):** regenerating proxy configs validates first, then restarts Xray / Sing-box / mieru only when the live config actually changed (`VLESS_SMART_APPLY=0` restores always-restart)
+- **v3.5.25:** Mieru **service-wide** outbound (not per-port) in 实例出口管理 as one row「Mieru（全部实例）」; DB `.service_outbound.mieru`; empty/missing=inherit global; priority service override > global > default; fail-closed; smart-apply via `_regenerate_proxy_configs all`
 
 ## Quick Install
 

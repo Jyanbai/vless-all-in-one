@@ -19,6 +19,7 @@ Linux 服务器一体化代理部署脚本。
 - **v3.5.22：** Mieru 回退路径复用同一套路由 token helpers（修复混合自定义规则导致 Xray 异常）
 - **v3.5.23：** 实例级 Xray 出口（`instance_outbound`）；菜单「实例出口管理」；默认继承全局；优先级 用户 > 实例 > 全局；仅 Xray 共享核心
 - **智能应用（v3.5.24）：** 重新生成代理配置时先校验，仅在 live 配置确有变化时才重启 Xray / Sing-box / mieru（`VLESS_SMART_APPLY=0` 恢复为每次生成后都重启）
+- **v3.5.25：** Mieru **服务级**出口（非按端口）—「实例出口管理」仅一行「Mieru（全部实例）」；库字段 `.service_outbound.mieru`；缺省/空=继承全局；优先级 服务覆盖 > 全局 > 默认；缺目标 fail-closed；经 `_regenerate_proxy_configs all` 智能应用
 
 ## 快速安装
 

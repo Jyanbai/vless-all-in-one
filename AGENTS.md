@@ -10,6 +10,14 @@
   - `当前脚本版本：**v…**` in `README_CN.md`
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
+## v3.5.25 product notes (docs surface)
+- **Mieru service outbound (NOT per-port):** one service-wide egress for the whole mieru service (`db.json` → `xray.mieru` instances/portBindings → one `mieru.json` → one `vless-mieru`/`mita`).
+- DB: `.service_outbound.mieru` via `db_get/set/clear_service_outbound_mieru`. Vocab: empty/missing = inherit | `direct` | `warp` | `chain:<n>` | `balancer:<n>`. Never persist literal `inherit`.
+- Semantics: explicit service outbound > global `routing_rules` > default direct. inherit = exact v3.5.24 `_mieru_compile_egress_plan` path. Fail-closed on missing chain/balancer/warp (no silent DIRECT for those).
+- UI: `manage_instance_outbound` keeps Xray per-port rows; if `db_exists xray/mieru` show one row「Mieru（全部实例）」 / status「Mieru 服务: 全部实例 → …」— never list every port/portRange.
+- Apply: prefer `_regenerate_proxy_configs all` (bridge may move); no manual `vless-mieru`/`xray` restart. Same-value select → no DB/regen/restart. Chain/balancer delete/rename guards Mieru service refs.
+- Local matrix: `tests/test_mieru_service_outbound.sh` (A–M) + regression `tests/test_smart_apply.sh`.
+
 ## v3.5.24 product notes (docs surface)
 - **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; snap restore fail-closed (`restore_fail:`, never false `skip_restart`). `configure_direct_outbound` writes `$CFG/direct_ip_version` then calls it (no private stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0` (always restart after gen). Count: `VLESS_COUNT_REGEN=1` → `VLESS_REGEN_LOG` (default `/tmp/vless-regen.count`) lines `restart:` / `skip_restart:` / `validate_fail:` / `restore_fail:`.
 - Local matrix: `tests/test_smart_apply.sh` (A–K) / `./vless-server.sh --smart-apply-selftest`.
