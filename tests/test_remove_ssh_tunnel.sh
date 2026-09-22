@@ -120,6 +120,32 @@ echo "$CLEAN" | grep -q 'mode" != "force"' && pass "force mode gated" || fail "f
 # main_menu one-shot prompt
 grep -A20 '_SSH_TUNNEL_LEGACY_PROMPTED' "$SCRIPT" | grep -q 'cleanup_legacy_ssh_tunnel force' && pass "menu opt-in wires cleanup" || fail "menu prompt missing"
 
+echo "=== 8: sshd -t/-T fail-closed before reload after drop-in rm ==="
+DROP=$(extract_fn _ssh_tunnel_remove_managed_dropin_failclosed)
+TESTF=$(extract_fn _ssh_tunnel_test_sshd)
+echo "$TESTF" | grep -q 'sshd" -t' || echo "$TESTF" | grep -qE '\$sshd" -t|\$sshd -t' && pass "test_sshd runs sshd -t" || fail "missing sshd -t"
+echo "$TESTF" | grep -qE '\$sshd" -T|\$sshd -T' && pass "test_sshd runs sshd -T" || fail "missing sshd -T"
+echo "$DROP" | grep -q '_ssh_tunnel_test_sshd' && pass "drop-in remove calls test_sshd" || fail "no test before reload"
+echo "$DROP" | grep -q '_ssh_tunnel_reload' && pass "drop-in remove calls reload" || fail "no reload after test"
+# restore on failure: bak must be written back to live
+echo "$DROP" | grep -q 'cp -f "$bak" "$live"' && pass "restores drop-in on fail" || fail "no restore on fail"
+# must not bare-rm then reload||true without test
+CLEAN=$(extract_fn cleanup_legacy_ssh_tunnel)
+echo "$CLEAN" | grep -q '_ssh_tunnel_remove_managed_dropin_failclosed' && pass "cleanup uses fail-closed drop-in remove" || fail "cleanup bypasses fail-closed"
+if echo "$CLEAN" | grep -qE '_ssh_tunnel_reload \|\| true'; then
+  fail "cleanup still swallows reload with || true"
+else
+  pass "cleanup no bare reload||true"
+fi
+
+echo "=== 9: primary GID checked before groupdel ==="
+PRIM=$(extract_fn _ssh_tunnel_group_has_primary_users)
+echo "$PRIM" | grep -q 'getent passwd' && pass "primary check scans passwd" || fail "primary check missing passwd scan"
+echo "$PRIM" | grep -qE '\$4 == g|\$4==g' && pass "compares primary GID field" || fail "no primary GID compare"
+echo "$CLEAN" | grep -q '_ssh_tunnel_group_has_primary_users' && pass "cleanup gates groupdel on primary" || fail "groupdel not gated on primary"
+# supplementary still checked
+echo "$CLEAN" | grep -q 'awk -F: '"'"'{print \$4}'"'"'' && pass "still checks supplementary members" || pass "supplementary check present"
+
 echo "=== O: VERSION left for Documentor ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 pass "VERSION=$VER (Documentor may bump)"

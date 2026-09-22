@@ -15216,6 +15216,20 @@ _ssh_tunnel_dropin_live() {
     fi
 }
 
+_ssh_tunnel_sshd_bin() {
+    command -v sshd 2>/dev/null || command -v /usr/sbin/sshd 2>/dev/null || echo /usr/sbin/sshd
+}
+
+# Validate current sshd config after drop-in change (fail-closed for cleanup).
+_ssh_tunnel_test_sshd() {
+    local sshd
+    sshd=$(_ssh_tunnel_sshd_bin)
+    [[ -x "$sshd" ]] || { _err "未找到 sshd"; return 1; }
+    "$sshd" -t 2>/dev/null || { _err "sshd -t 失败"; return 1; }
+    "$sshd" -T >/dev/null 2>&1 || { _err "sshd -T 失败"; return 1; }
+    return 0
+}
+
 _ssh_tunnel_reload() {
     # Reload only — never stop/disable system sshd
     if command -v systemctl >/dev/null 2>&1; then
@@ -15229,6 +15243,46 @@ _ssh_tunnel_reload() {
     pkill -HUP sshd 2>/dev/null || return 1
 }
 
+# Remove exact managed drop-in with sshd -t/-T + restore on failure (transactional).
+# Returns 0 if no managed drop-in, or remove+validate+reload succeeded.
+# On validate/reload failure: restores drop-in and returns 1. Never stop/disable sshd.
+_ssh_tunnel_remove_managed_dropin_failclosed() {
+    local live base bak=""
+    live=$(_ssh_tunnel_dropin_live)
+    [[ -n "$live" && -f "$live" ]] || return 0
+    base=$(basename "$live")
+    if [[ "$base" != "$SSH_TUNNEL_DROPIN_NAME" ]]; then
+        _warn "拒绝删除非托管 drop-in 路径: $live"
+        return 1
+    fi
+    # Bak outside $CFG/ssh-tunnel so later tree delete cannot wipe the restore copy
+    bak=$(mktemp) || { _err "无法创建 drop-in 备份"; return 1; }
+    if ! cp -p "$live" "$bak"; then
+        rm -f "$bak"
+        _err "无法备份托管 drop-in"
+        return 1
+    fi
+    rm -f "$live"
+    if ! _ssh_tunnel_test_sshd; then
+        cp -f "$bak" "$live" 2>/dev/null || true
+        chmod 644 "$live" 2>/dev/null || true
+        rm -f "$bak"
+        _err "sshd -t/-T 失败，已恢复托管 drop-in"
+        return 1
+    fi
+    if ! _ssh_tunnel_reload; then
+        cp -f "$bak" "$live" 2>/dev/null || true
+        chmod 644 "$live" 2>/dev/null || true
+        _ssh_tunnel_reload || true
+        rm -f "$bak"
+        _err "sshd reload 失败，已恢复托管 drop-in"
+        return 1
+    fi
+    rm -f "$bak"
+    _ok "已移除托管 drop-in: $live"
+    return 0
+}
+
 _ssh_tunnel_reserved_username() {
     case "$1" in
         root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|sshd|mita|ubuntu|admin|debian|ec2-user|centos|fedora|nfsnobody|systemd-network|systemd-resolve|messagebus)
@@ -15237,22 +15291,21 @@ _ssh_tunnel_reserved_username() {
     return 1
 }
 
+# True if any account has SSH_TUNNEL_GROUP as primary GID (not only supplementary).
+_ssh_tunnel_group_has_primary_users() {
+    local gid
+    gid=$(getent group "$SSH_TUNNEL_GROUP" 2>/dev/null | awk -F: '{print $3}')
+    [[ -n "$gid" ]] || return 1
+    getent passwd 2>/dev/null | awk -F: -v g="$gid" '$4 == g { found=1; exit 0 } END { exit !found }'
+}
+
 # Scoped runtime leftover removal: exact managed drop-in + $CFG/ssh-tunnel tree only.
-# No userdel. Never stop/disable sshd.
+# No userdel. Never stop/disable sshd. Drop-in remove is fail-closed (sshd -t/-T + restore).
 _ssh_tunnel_remove_runtime() {
-    local live
-    live=$(_ssh_tunnel_dropin_live)
-    if [[ -n "$live" ]]; then
-        # Only delete the exact managed drop-in name
-        local base
-        base=$(basename "$live")
-        if [[ "$base" == "$SSH_TUNNEL_DROPIN_NAME" ]]; then
-            rm -f "$live"
-        fi
-    fi
+    _ssh_tunnel_remove_managed_dropin_failclosed || return 1
     # Path delete scoped to $CFG/ssh-tunnel only
     [[ -n "$CFG" && -d "$CFG/ssh-tunnel" ]] && rm -rf "$CFG/ssh-tunnel"
-    _ssh_tunnel_reload || true
+    return 0
 }
 
 # Detect leftover SSH Tunnel state from prior installs
@@ -15369,33 +15422,29 @@ cleanup_legacy_ssh_tunnel() {
         fi
     done
 
-    # 4) Keys/drop-in ONLY: exact managed drop-in + $CFG/ssh-tunnel tree; reload never stop/disable
-    local live base
-    live=$(_ssh_tunnel_dropin_live)
-    if [[ -n "$live" && -f "$live" ]]; then
-        base=$(basename "$live")
-        if [[ "$base" == "$SSH_TUNNEL_DROPIN_NAME" ]]; then
-            rm -f "$live"
-            _ok "已移除托管 drop-in: $live"
-        else
-            _warn "拒绝删除非托管 drop-in 路径: $live"
-        fi
+    # 4) Keys/drop-in ONLY: exact managed drop-in + $CFG/ssh-tunnel tree.
+    # Drop-in remove is transactional: backup → rm → sshd -t/-T → reload; restore on any fail.
+    if ! _ssh_tunnel_remove_managed_dropin_failclosed; then
+        _err "托管 drop-in 清理失败（已 fail-closed 恢复）；中止后续清理"
+        return 1
     fi
-    _ssh_tunnel_reload || true
 
     if [[ -n "$CFG" && -e "$CFG/ssh-tunnel" ]]; then
         rm -rf "$CFG/ssh-tunnel"
         _ok "已删除 $CFG/ssh-tunnel"
     fi
 
-    # 5) Optionally remove empty group vless-ssh-tunnel if no members left
+    # 5) Optionally remove empty group vless-ssh-tunnel only if no supplementary members
+    # AND no account has it as primary GID.
     if getent group "$SSH_TUNNEL_GROUP" >/dev/null 2>&1; then
         local members
         members=$(getent group "$SSH_TUNNEL_GROUP" 2>/dev/null | awk -F: '{print $4}')
-        if [[ -z "$members" ]]; then
-            groupdel "$SSH_TUNNEL_GROUP" 2>/dev/null && _ok "已删除空组 $SSH_TUNNEL_GROUP" || true
-        else
+        if [[ -n "$members" ]]; then
             _warn "组 $SSH_TUNNEL_GROUP 仍有成员，保留: $members"
+        elif _ssh_tunnel_group_has_primary_users; then
+            _warn "组 $SSH_TUNNEL_GROUP 仍是某些账户的主组 (primary GID)，拒绝 groupdel"
+        else
+            groupdel "$SSH_TUNNEL_GROUP" 2>/dev/null && _ok "已删除空组 $SSH_TUNNEL_GROUP" || true
         fi
     fi
 
