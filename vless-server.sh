@@ -20287,15 +20287,24 @@ show_routing_status() {
     fi
 
     # 实例出口覆盖（显示名，非内部 tag）
+    # First row: "实例: …"; later rows indent-align without repeating the label (USER DELTA).
     local _iob_lines=""
-    local _proto _port _ob
+    local _iob_n=0
+    local _proto _port _ob _iob_label _iob_body
     for _proto in $XRAY_PROTOCOLS; do
         db_exists "xray" "$_proto" 2>/dev/null || continue
         while IFS= read -r _port; do
             [[ -z "$_port" || "$_port" == "null" ]] && continue
             _ob=$(db_get_instance_outbound "xray" "$_proto" "$_port" 2>/dev/null || true)
             [[ -z "$_ob" ]] && continue
-            _iob_lines+="  实例: ${G}$(get_protocol_name "$_proto" 2>/dev/null || echo "$_proto"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"$'\n'
+            _iob_body="${G}$(get_protocol_name "$_proto" 2>/dev/null || echo "$_proto"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"
+            if (( _iob_n == 0 )); then
+                _iob_label="  实例: "
+            else
+                _iob_label="        "  # align under body after "  实例: "
+            fi
+            _iob_lines+="${_iob_label}${_iob_body}"$'\n'
+            ((_iob_n++))
         done < <(db_list_ports "xray" "$_proto" 2>/dev/null)
     done
     # Mieru is NOT in XRAY_PROTOCOLS — enumerate after Xray via existing DB helpers.
@@ -20304,7 +20313,14 @@ show_routing_status() {
             [[ -z "$_port" || "$_port" == "null" ]] && continue
             _ob=$(db_get_instance_outbound "xray" "mieru" "$_port" 2>/dev/null || true)
             [[ -z "$_ob" ]] && continue
-            _iob_lines+="  实例: ${G}$(get_protocol_name "mieru" 2>/dev/null || echo "mieru"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"$'\n'
+            _iob_body="${G}$(get_protocol_name "mieru" 2>/dev/null || echo "mieru"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"
+            if (( _iob_n == 0 )); then
+                _iob_label="  实例: "
+            else
+                _iob_label="        "
+            fi
+            _iob_lines+="${_iob_label}${_iob_body}"$'\n'
+            ((_iob_n++))
         done < <(db_list_ports "xray" "mieru" 2>/dev/null)
     fi
     if [[ -n "$_iob_lines" ]]; then

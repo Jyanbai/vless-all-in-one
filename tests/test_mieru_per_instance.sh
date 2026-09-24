@@ -144,6 +144,24 @@ elif echo "$srs" | grep -q '_iob_lines+=$(printf'; then
 else
   fail "status missing multiline _iob_lines"
 fi
+# Format: first row label "实例:", later rows indent-only (no repeated 实例:)
+if echo "$srs" | grep -q '_iob_n'; then
+  pass "status first-row-only label counter"
+else
+  fail "status missing _iob_n first-row counter"
+fi
+if echo "$srs" | grep -c '实例: ' | awk '{exit !($1>=1 && $1<=2)}'; then
+  # allow label string twice in if/else arms, but not on every append line
+  pass "status 实例: label limited"
+else
+  fail "status 实例: label count unexpected"
+fi
+# Append path uses _iob_label (not hardcoded 实例: on every +=)
+if echo "$srs" | grep -F '_iob_lines+="${_iob_label}${_iob_body}"' >/dev/null; then
+  pass "status append via _iob_label"
+else
+  fail "status append still hardcodes 实例: each row"
+fi
 # Guard: mieru still absent from XRAY_PROTOCOLS definition
 if grep -m1 '^XRAY_PROTOCOLS=' "$SCRIPT" | grep -qw mieru; then
   fail "mieru wrongly added to XRAY_PROTOCOLS"
