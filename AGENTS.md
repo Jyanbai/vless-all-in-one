@@ -11,8 +11,13 @@
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
 ## v3.5.29 product notes (docs surface)
-- **Mieru in 实例出口管理:** `manage_instance_outbound` lists mieru after the Xray loop via `db_exists`/`db_list_ports` (xray + mieru). NEVER add mieru to `XRAY_PROTOCOLS`. One `portRange` row = one listed instance.
-- **Templates vs profiles:** Templates = matchers-only packs. Wizard creates TWO profiles only: `home`/家宽 + `direct_backup`/直出备用 (Chinese names UI-only; stable ASCII ids). `instance_outbound` stores `profile:home` | `profile:direct_backup`; no nested `profile:*`. Migrate seed/legacy `home_broadband`. Remove duplicate routing menu #11. DA helpers for templates + migration. Stop auto-seeding `finance_crypto`/`telegram_dc`/`ai_media` as profiles (those stay templates).
+- **WITHDRAWN (not normal product entry):** top-level `10) 分流规则集` / `manage_routing_profiles` CRUD. Do not document it as a user-facing menu.
+- **KEEP backend:** `.routing_profiles`, `profile:<id>` vocab, compilers, validation, migration, templates (DA helpers unchanged).
+- **NEW surface — only via `9) 实例出口管理` picker:** inherit / direct / WARP / chain / balancer / 家宽 / 直出备用 / 配置重建 wizard. Stable ASCII ids `home` / `direct_backup` (`instance_outbound` stores `profile:home` | `profile:direct_backup`; no nested `profile:*`). Chinese names are UI-only — never emphasize internal ids in user-facing docs.
+- **Templates:** `finance_crypto` / `telegram_dc` / `ai_media` = matchers-only; stop auto-seeding them as profiles. Migrate seed/legacy `home_broadband`.
+- **Legacy profiles** (id ≠ `home`|`direct_backup`): preserved; show read-only「旧规则集」(keep; no edit/delete from picker).
+- **Wizard:** upserts BOTH `home` + `direct_backup` (finance+TG same on both; AI JP on home / DIRECT on direct_backup).
+- **Mieru in 实例出口管理:** `manage_instance_outbound` lists mieru after the Xray loop via `db_exists`/`db_list_ports` (xray + mieru) + status list. NEVER add mieru to `XRAY_PROTOCOLS`. One `portRange` row = one listed instance.
 - **Self-updater SoT:** configured `SCRIPT_SOURCE_REPO`/`REF`/`PATH`. Manual「脚本更新」ignores 1h cache; cache-bust raw fetch; keep blob SHA + `bash -n`. Tag/release must not mask a newer source-ref `VERSION`.
 - **VERSION sync:** `3.5.29` in `vless-server.sh` + both READMEs.
 
@@ -25,7 +30,7 @@
   - **profile:<id>:** expand the named rule set in order onto that instance’s inboundTag scope (Xray) or per-instance Mieru egress plan — not a service-wide Mieru switch.
 - **Compile:** Xray `_gen_xray_profile_inbound_rules` — inboundTag-scoped, preserve rule order (DIRECT does not reorder), no catch-all → inherit global. Mieru `_mieru_expand_profile_rules` inside `_mieru_compile_egress_plan` only (per-instance). Chain/balancer/WARP guards include profile refs; delete profile refused while in use (`db_list_instances_using_profile`).
 - **Telegram DC (Choice A):** `.telegram_dc_matchers` versioned best-effort known-endpoint seed (IPv4/IPv6) — NOT a full CIDR DB / not permanent. Rule `type=telegram_dc` expands matchers; misses use Telegram fallback (`geosite:telegram` in built-in). **Forbidden in profiles:** fake `geoip:telegram`.
-- **Built-ins** (`db_ensure_routing_profiles_defaults`): originally seeded once `finance_crypto` → `telegram_dc` → `ai_media` as profiles (finance/TG above AI/media for wizard/combined). **v3.5.29:** those packs are templates (matchers-only); wizard profiles are only `home` + `direct_backup`. UI「分流规则集」; wizard「家宽 + 直出备用」; shared-profile edit goes through validate/apply + smart-apply.
+- **Built-ins** (`db_ensure_routing_profiles_defaults`): originally seeded once `finance_crypto` → `telegram_dc` → `ai_media` as profiles (finance/TG above AI/media for wizard/combined). **v3.5.29:** those packs are templates (matchers-only); wizard profiles are only `home` + `direct_backup`. Top-level UI「分流规则集」**withdrawn** — picker surface is `9) 实例出口管理` (家宽 / 直出备用 / 配置重建 wizard); shared-profile edit backend still goes through validate/apply + smart-apply.
 - **Helpers:** `db_list/get/add/update/delete/copy_routing_profile`, rule helpers, `db_get/set/seed_telegram_dc_matchers*`, `db_ensure_routing_profiles_defaults`.
 - Local matrix: `tests/test_instance_routing_profiles.sh` (A–AB) + regressions (smart_apply, instance_outbound, mieru_per_instance, mieru_migrate, finalmask, remove_ssh, bash -n).
 

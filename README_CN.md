@@ -15,8 +15,8 @@ Linux 服务器一体化代理部署脚本。
 - 提供用户管理、路由、订阅与故障排查文档
 - **mieru**（v3.5.20）：TCP/UDP、`port`/`portRange`、流量模式默认关闭；官方 `mierus://` 分享链接
 - **v3.5.26：** 从产品面移除 **SSH Tunnel**（选择/安装/创建）；仅保留可选遗留清理（`cleanup_legacy_ssh_tunnel`）；永不 stop/disable 系统 sshd
-- **v3.5.29：** 「实例出口管理」恢复列出 Mieru（Xray 循环后经 db 枚举；绝不把 mieru 加入 XRAY_PROTOCOLS）。分流 **模板**（仅 matchers）与 **规则集** 分离（向导创建 `home`/家宽 + `direct_backup`/直出备用；不再自动把 finance_crypto/telegram_dc/ai_media 种成规则集）。自更新以配置的 `SCRIPT_SOURCE_REPO`/`REF`/`PATH` 为准（手动「脚本更新」忽略 1h 缓存；不以过期 tag/release 盖住源分支 VERSION）。
-- **v3.5.28：** 实例级**分流规则集**（`profile:<id>`）— matcher 包 `ai_media` / `finance_crypto` / `telegram_dc`（matchers + Telegram 回退；禁止伪造 `geoip:telegram`；自 v3.5.29 起种为模板而非自动规则集）；菜单「分流规则集」；「家宽+直出备用」向导；共享规则集 smart-apply
+- **v3.5.29：** 「实例出口管理」列出 Mieru（含状态列表；Xray 循环后经 db 枚举；绝不把 mieru 加入 XRAY_PROTOCOLS）。分流 **模板**（仅 matchers）与 **规则集** 分离；向导/选择器经 **「实例出口管理」** 创建或绑定「家宽」+「直出备用」（选择项：家宽 / 直出备用 / 配置重建向导；稳定 id `home`/`direct_backup` — 中文仅作 UI 显示）。无顶层通用规则集 CRUD 菜单；不再自动把 finance_crypto/telegram_dc/ai_media 种成规则集（保留为模板）。自更新以配置的 `SCRIPT_SOURCE_REPO`/`REF`/`PATH` 为准（手动「脚本更新」忽略 1h 缓存；不以过期 tag/release 盖住源分支 VERSION）。
+- **v3.5.28：** 实例级**分流规则集**（`profile:<id>`）— matcher 包 `ai_media` / `finance_crypto` / `telegram_dc`（matchers + Telegram 回退；禁止伪造 `geoip:telegram`）。**自 v3.5.29 起：** 上述包仅为模板（matchers），不再自动种成规则集；顶层菜单「分流规则集」/ 规则集 CRUD **已撤回** — 仅通过「实例出口管理」选择器绑定「家宽」/「直出备用」（及「配置重建」向导）；共享规则集 smart-apply 后端保留
 - **v3.5.27：** Mieru **实例级**运行时与出口 — 每个 port/`portRange` = 一个 mita（独立 JSON/UDS/unit/metrics，状态目录 `/var/lib/vless-mieru/<slug>`）；库字段 `.xray.mieru[].instance_outbound`（缺省/空=继承；从不写入字面量 `inherit`）；最终模型 **无** `.service_outbound.mieru`（菜单启动时 fail-closed 迁移）；「实例出口管理」按端口列出 mieru（无「Mieru（全部实例）」）
 - **v3.5.21：** 添加链式节点时延迟/批量 regenerate（未使用仅写库；添加+路由 ≤1 次 regen）；自定义路由 token 解析器，支持混合 geosite/域名/IP（Xray + Sing-box）
 - **v3.5.22：** Mieru 回退路径复用同一套路由 token helpers（修复混合自定义规则导致 Xray 异常）
