@@ -90,7 +90,7 @@ else
   pass "FinalMask verify free of service_outbound.mieru"
 fi
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-[[ "$VER" == "3.5.26" ]] && pass "VERSION=$VER (pre-3.5.27 bump)" || fail "VERSION=$VER unexpected"
+[[ "$VER" == "3.5.27" ]] && pass "VERSION=$VER (3.5.27)" || fail "VERSION=$VER unexpected"
 
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

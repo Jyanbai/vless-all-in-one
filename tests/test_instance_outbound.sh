@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local semantic tests for per-instance outbound (v3.5.26)
+# Local semantic tests for per-instance outbound (v3.5.27)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/vless-server.sh"
@@ -14,7 +14,7 @@ echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
 C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
-[[ "$VER" == "3.5.26" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
+[[ "$VER" == "3.5.27" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: symbols present ==="
 for s in db_get_instance_outbound db_set_instance_outbound db_clear_instance_outbound \
