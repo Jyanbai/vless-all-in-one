@@ -19541,7 +19541,7 @@ _select_outbound() {
     for i in "${!display_names[@]}"; do
         local info="${display_names[$i]}"
         local type=$(echo "$info" | cut -d$'\t' -f2)
-        if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" || "$type" == "profile" ]]; then
+        if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" ]]; then
             latency_results+=("-|$info|-")
         else
             if [[ "$check_mode" == "check_latency" ]]; then
@@ -19586,8 +19586,6 @@ _select_outbound() {
             if [[ "$type" == "balancer" ]]; then
                 # 负载均衡组排在 WARP 后面，排序值为 1
                 sort_data+=("1|$i|-|${name}|balancer|${server}|${port}")
-            elif [[ "$type" == "profile" ]]; then
-                sort_data+=("2|$i|-|${name}|profile|${server}|${port}")
             else
                 local latency="${result%%|*}"
                 local latency_num=99999
@@ -19613,8 +19611,6 @@ _select_outbound() {
         elif [[ "$type" == "balancer" ]]; then
             # server 字段存储的是策略，port 字段存储的是节点数量
             echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(负载均衡: ${server}, ${port})${NC}" >&2
-        elif [[ "$type" == "profile" ]]; then
-            echo -e "  ${G}${display_idx}${NC}) ${C}规则集${NC} ${name} ${D}(${port})${NC}" >&2
         elif [[ -n "$latency_badge" ]]; then
             echo -e "  ${G}${display_idx}${NC}) ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
         else
