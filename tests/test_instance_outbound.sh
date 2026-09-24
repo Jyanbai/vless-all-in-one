@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local semantic tests for per-instance outbound (v3.5.23)
+# Local semantic tests for per-instance outbound (v3.5.26)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/vless-server.sh"
@@ -14,7 +14,7 @@ echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
 C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
-[[ "$VER" == "3.5.23" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
+[[ "$VER" == "3.5.26" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: symbols present ==="
 for s in db_get_instance_outbound db_set_instance_outbound db_clear_instance_outbound \
@@ -49,15 +49,15 @@ else
   grep -q 'ip-in-' "$SCRIPT" && pass "ip-in tags referenced" || fail "no multi-IP note"
 fi
 
-echo "=== H: mieru isolation ==="
-# instance generators must skip mieru
-if grep -A20 '^gen_xray_instance_outbound_rules()' "$SCRIPT" | grep -q 'mieru'; then pass "mieru skipped in instance rules"
-else fail "mieru not skipped"; fi
-# must not feed instance_outbound into mieru compile
-if grep -n '_mieru_compile_egress_plan\|gen_mieru' "$SCRIPT" | grep -i instance_outbound; then
-  fail "instance_outbound leaks into mieru"
+echo "=== H: mieru isolation (Xray rules skip; mieru uses own instance_outbound) ==="
+# Xray inboundTag instance generators must still skip mieru
+if grep -A20 '^gen_xray_instance_outbound_rules()' "$SCRIPT" | grep -q 'mieru'; then pass "mieru skipped in xray instance rules"
+else fail "mieru not skipped in xray rules"; fi
+# v3.5.27: mieru compile intentionally reads db_get_instance_outbound
+if grep -A30 '^_mieru_compile_egress_plan()' "$SCRIPT" | grep -q 'db_get_instance_outbound'; then
+  pass "mieru compile wires instance_outbound"
 else
-  pass "no instance_outbound in mieru paths"
+  fail "mieru compile missing instance_outbound"
 fi
 
 echo "=== I: jq rule shape unit ==="

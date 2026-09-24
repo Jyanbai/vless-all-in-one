@@ -15,13 +15,16 @@
 - Legacy: opt-in `cleanup_legacy_ssh_tunnel` only — schema-lock snapshot → DB delete → scoped drop-in + `$CFG/ssh-tunnel`; proven-ownership `userdel`; never stop/disable system `sshd`.
 - Local matrix: `tests/test_remove_ssh_tunnel.sh`.
 
-## v3.5.25 product notes (docs surface)
-- **Mieru service outbound (NOT per-port):** one service-wide egress for the whole mieru service (`db.json` → `xray.mieru` instances/portBindings → one `mieru.json` → one `vless-mieru`/`mita`).
-- DB: `.service_outbound.mieru` via `db_get/set/clear_service_outbound_mieru`. Vocab: empty/missing = inherit | `direct` | `warp` | `chain:<n>` | `balancer:<n>`. Never persist literal `inherit`.
-- Semantics: explicit service outbound > global `routing_rules` > default direct. inherit = exact v3.5.24 `_mieru_compile_egress_plan` path. Fail-closed on missing chain/balancer/warp (no silent DIRECT for those).
-- UI: `manage_instance_outbound` keeps Xray per-port rows; if `db_exists xray/mieru` show one row「Mieru（全部实例）」 / status「Mieru 服务: 全部实例 → …」— never list every port/portRange.
-- Apply: prefer `_regenerate_proxy_configs all` (bridge may move); no manual `vless-mieru`/`xray` restart. Same-value select → no DB/regen/restart. Chain/balancer delete/rename guards Mieru service refs.
-- Local matrix: `tests/test_mieru_service_outbound.sh` (A–M) + regression `tests/test_smart_apply.sh`.
+## v3.5.27 product notes (docs surface)
+- **Mieru per-instance runtime + outbound:** one DB row (port OR portRange) = one mita = own JSON/UDS/unit/outbound/metrics state. portRange is ONE logical instance.
+- Layout: `$CFG/mieru/<slug>.json`, UDS `/run/mita/<slug>/mita.sock`, unit `vless-mieru-<slug>`, state `/var/lib/vless-mieru/<slug>` bind-mounted over `/var/lib/mita` (metrics.pb hardcoded — systemd `BindPaths=` / OpenRC `unshare -m`+bind).
+- DB: `.xray.mieru[].instance_outbound` via `db_get/set/clear_instance_outbound xray mieru <port|range>`; empty/missing = inherit (never store literal `inherit`). FINAL model has NO `.service_outbound.mieru` (DA migrate: `db_migrate_mieru_service_outbound_to_instances`).
+- Compile: `_mieru_compile_egress_plan <key>` reads instance_outbound only (not service getter). Fail-closed on missing warp/chain/balancer.
+- UI: `manage_instance_outbound` lists mieru like Xray via `db_list_ports` — no「Mieru（全部实例）」. Same-value → no regen. smart_apply restarts only changed instances.
+- Local matrix: `tests/test_mieru_per_instance.sh` + `tests/test_mieru_instance_outbound_migrate.sh` + `tests/test_smart_apply.sh`.
+
+## v3.5.25 product notes (superseded by 3.5.27)
+- Was: one service-wide Mieru egress (`.service_outbound.mieru` + single `mieru.json`/`vless-mieru`). Replaced by per-instance model above.
 
 ## v3.5.24 product notes (docs surface)
 - **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; snap restore fail-closed (`restore_fail:`, never false `skip_restart`). `configure_direct_outbound` writes `$CFG/direct_ip_version` then calls it (no private stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0` (always restart after gen). Count: `VLESS_COUNT_REGEN=1` → `VLESS_REGEN_LOG` (default `/tmp/vless-regen.count`) lines `restart:` / `skip_restart:` / `validate_fail:` / `restore_fail:`.
@@ -32,7 +35,7 @@
 - Menu `9) 实例出口管理`; install prompt only when routing is meaningfully configured; same-port replace preserves the field.
 - Emit `inboundTag` rules as user → instance → global (API rule prepended). Multi-IP: base tag + `ip-in-*-$port` clones get the instance override; more-specific multi-IP rules stay higher.
 - Fail-closed on missing chain/WARP/balancer targets (no silent DIRECT). Deleting a referenced chain/balancer asks to clear refs → inherit (never auto-DIRECT).
-- Not on mieru / standalone / Snell / Naive / SSH-Tunnel engine path. Sing-box per-inbound detour needs inbound matchers — follow-up, not this patch.
+- Not on Xray-inboundTag path for mieru (mieru uses own instance_outbound as of 3.5.27); not on standalone / Snell / Naive / SSH-Tunnel engine path. Sing-box per-inbound detour needs inbound matchers — follow-up, not this patch.
 - Local matrix: `tests/test_instance_outbound.sh`.
 
 ## v3.5.20 product notes (docs surface)

@@ -77,15 +77,20 @@ else
   pass "verify fail path present"
 fi
 
-echo "=== I: no Mieru service-outbound mix on this branch ==="
-if grep -q 'db_get_service_outbound_mieru\|service_outbound\.mieru\|Mieru（全部实例）' "$SCRIPT"; then
-  fail "Mieru service-outbound symbols present (scope creep)"
+echo "=== I: FinalMask path free of live Mieru service-outbound UI ==="
+# DA may keep temporary getters for migration; UI must not show 全部实例; FinalMask verify must not call service getter
+if grep -q 'Mieru（全部实例）' "$SCRIPT"; then
+  fail "Mieru（全部实例） UI still present"
 else
-  pass "no Mieru service-outbound mix"
+  pass "no Mieru（全部实例） UI"
 fi
-# hotfix still on 3.5.24 tip VERSION
+if awk '/^_verify_finalmask_db_write\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT" | grep -q 'db_get_service_outbound_mieru\|service_outbound\.mieru'; then
+  fail "FinalMask verify touches service_outbound.mieru"
+else
+  pass "FinalMask verify free of service_outbound.mieru"
+fi
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-[[ "$VER" == "3.5.24" ]] && pass "VERSION stays 3.5.24 (no Mieru bump)" || fail "VERSION=$VER unexpected"
+[[ "$VER" == "3.5.26" ]] && pass "VERSION=$VER (pre-3.5.27 bump)" || fail "VERSION=$VER unexpected"
 
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
