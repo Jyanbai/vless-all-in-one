@@ -98,6 +98,9 @@ grep -A55 '^uninstall_warp()' "$SCRIPT" | grep -q '_list_profiles_referencing_ou
 echo "=== M: shared-profile edit transactional markers ==="
 grep -q 'profile-apply' "$SCRIPT" && pass "profile-apply marker" || fail "no profile-apply"
 grep -q '_routing_profile_validate_and_apply' "$SCRIPT" && pass "validate_and_apply" || fail "no validate helper"
+grep -A35 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'Dry-run Xray' && pass "dry-compile xray unused" || fail "no xray dry-compile"
+grep -A40 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'Dry-run Mieru' && pass "dry-compile mieru unused" || fail "no mieru dry-compile"
+grep -A40 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'dry-compile' && pass "dry-compile marker" || fail "no dry-compile marker"
 
 echo "=== N: seed ids + fallback=inherit ==="
 for id in ai_media finance_crypto telegram_dc; do

@@ -20664,7 +20664,7 @@ _smart_apply_core() {
     fi
 
     # live 现为新内容 → 挪到候选，立即还原旧 live（fail-closed）
-    candidate=$(mktemp "${TMPDIR:-/tmp}/vless-smart-cand.XXXXXX") || {
+    candidate=$(mktemp "${TMPDIR:-/tmp}/vless-smart-cand.XXXXXX.json") || {
         [[ -n "$snap" && -f "$snap" ]] && cp -a "$snap" "$live" 2>/dev/null || true
         rm -f "$snap"
         return 1
@@ -21460,11 +21460,35 @@ manage_instance_outbound() {
 # v3.5.28 分流规则集 (routing profiles) UI + 家宽向导 + 共享编辑 smart-apply
 #═══════════════════════════════════════════════════════════════════════════════
 
-# 共享规则集变更后：校验所有引用实例；失败由调用方负责 snap 还原
-# 成功则 Xray 一次 + 仅变更 mieru 实例重载。markers: profile-apply validate restore
+# 共享规则集变更后：始终 dry-compile（即便无引用），再按引用实例 apply
+# 失败由调用方负责 snap 还原。markers: profile-apply validate restore dry-compile
 _routing_profile_validate_and_apply() {
     local pid="$1"
     local refs has_xray=0 has_mieru=0
+    local dry_tags dry_rules
+
+    if [[ -z "$pid" ]] || ! db_routing_profile_exists "$pid" 2>/dev/null; then
+        _err "规则集不存在: profile:${pid:-?}（fail-closed）"
+        return 1
+    fi
+
+    # Dry-run Xray compile even when unused — catch bad rule outbounds before attach
+    dry_tags=$(jq -n '["dry-profile-validate"]')
+    if ! dry_rules=$(_gen_xray_profile_inbound_rules "$dry_tags" "$pid"); then
+        _err "规则集 Xray dry-compile 失败: profile:$pid（fail-closed）"
+        return 1
+    fi
+    echo "$dry_rules" | jq empty >/dev/null 2>&1 || {
+        _err "规则集 Xray dry-compile JSON 无效: profile:$pid"
+        return 1
+    }
+
+    # Dry-run Mieru profile expand even when unused
+    if ! _mieru_expand_profile_rules "$pid" >/dev/null; then
+        _err "规则集 Mieru dry-compile 失败: profile:$pid（fail-closed）"
+        return 1
+    fi
+
     refs=$(db_list_instances_using_profile "$pid" 2>/dev/null || true)
     while IFS='|' read -r _c _p _port _v; do
         [[ -z "$_p" ]] && continue
@@ -21496,6 +21520,7 @@ _routing_profile_validate_and_apply() {
     fi
     return 0
 }
+
 
 # 家宽 + 直出备用：家宽链主 + 直连备用（fallback=inherit → 未匹配走全局直连）
 wizard_home_broadband_direct_backup() {

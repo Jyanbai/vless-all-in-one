@@ -69,6 +69,9 @@ else
   pass "critical snap restore has no || true"
 fi
 
+echo "=== smart-cand .json suffix (xray -test format) ==="
+grep -n 'vless-smart-cand.XXXXXX.json' "$SCRIPT" | grep -q . && pass "smart-cand .json" || fail "smart-cand missing .json suffix"
+
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]
