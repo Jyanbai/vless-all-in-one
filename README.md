@@ -14,7 +14,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - Xray + Sing-box dual-core architecture
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
-- **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create); opt-in legacy cleanup only (`cleanup_legacy_ssh_tunnel`); never stop/disable system sshd
+- **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create). Legacy installs: opt-in `cleanup_legacy_ssh_tunnel` only (detect → confirm → scoped cleanup); never stop/disable system sshd
 - **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
 - **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
