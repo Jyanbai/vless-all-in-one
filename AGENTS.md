@@ -12,7 +12,7 @@
 
 ## v3.5.26 product notes (docs surface)
 - **Remove SSH Tunnel** from supported product surface (select menu, STANDALONE/PROTO tables, install/create). No new `ssh-tunnel` DB writes (`db_add`/`db_add_port`/`db_update_port` reject).
-- Legacy: opt-in `cleanup_legacy_ssh_tunnel` only — schema-lock snapshot → DB delete → scoped drop-in + `$CFG/ssh-tunnel`; proven-ownership `userdel`; never stop/disable system `sshd`.
+- **Migration (legacy installs):** on detect, menu prompts opt-in `cleanup_legacy_ssh_tunnel` (never auto). Flow: snapshot metadata → `db_del` → proven-ownership `userdel` → managed drop-in + `$CFG/ssh-tunnel` only; `sshd -t`/`-T` fail-closed restore; never stop/disable system `sshd`.
 - Local matrix: `tests/test_remove_ssh_tunnel.sh`.
 
 ## v3.5.25 product notes (docs surface)
@@ -37,7 +37,7 @@
 
 ## v3.5.20 product notes (docs surface)
 - **mieru:** TCP|UDP; exclusive `port` or `port_range`; Traffic Pattern Advanced default off (UI Off/Conservative/Custom → store `off`/`conservative`/`unlocked`); `mierus://`; no port→user ACL; runtime-only `trafficPattern` object (not in db.json).
-- **SSH Tunnel:** system OpenSSH only; Match Group; key-only; client TCP `-N -L/-D/-R`; no shell/exec/TTY/SFTP; no native UDP; no `ssh://` URI; keys on disk `0600` via `authorized_keys_path` only (never raw keys in db.json); candidate → `sshd -t/-T` → reload → admin verify → commit else rollback.
+- **SSH Tunnel (removed in v3.5.26):** was system OpenSSH only (Match Group, key-only, TCP `-N -L/-D/-R`). Do not document as supported. Leftovers → `cleanup_legacy_ssh_tunnel` (see v3.5.26 notes).
 
 ## Do not
 - Force-push / FF `main` from feature work unless explicitly ordered.
