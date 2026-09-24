@@ -19517,17 +19517,9 @@ _select_outbound() {
         done < <(echo "$balancer_groups" | jq -r '.[] | [.name // "", .strategy // "", (.nodes | length)] | @tsv')
     fi
 
-    # v3.5.28 分流规则集 profile:<id>
-    db_ensure_routing_profiles_defaults 2>/dev/null || true
-    local _profiles
-    _profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
-    if [[ -n "$_profiles" && "$_profiles" != "[]" ]]; then
-        while IFS=$'\t' read -r pid pname; do
-            [[ -z "$pid" ]] && continue
-            outbounds+=("profile:${pid}")
-            display_names+=("${pname}"$'\t'"profile"$'\t'"规则集"$'\t'"${pid}")
-        done < <(echo "$_profiles" | jq -r '.[] | [.id // "", .name // .id] | @tsv')
-    fi
+    # v3.5.29: REAL outbound only (direct/warp/chain/balancer).
+    # profile:* belongs in _select_instance_outbound_policy (instance_outbound).
+    # Rule editors must not nest profile:* (DB rejects; UI must not offer).
 
     # 检测延迟（跳过直连、WARP 和负载均衡组）
     local need_latency_check=false
@@ -19649,6 +19641,65 @@ _select_outbound() {
         return 0
     fi
     
+    return 1
+}
+
+# 实例策略选择器：仅 profile:<id>（推荐 home / direct_backup）
+# 与 _select_outbound（真实出口）拆分；instance_outbound 产品路径用规则集策略
+_select_instance_outbound_policy() {
+    local prompt="${1:-选择实例策略}"
+    db_ensure_routing_profiles_defaults 2>/dev/null || true
+    local outbounds=() display_names=()
+    local _profiles pid pname
+    _profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
+
+    # Prefer interview-lock ids first, then any other profiles (advanced).
+    local prefer=("home" "direct_backup")
+    local seen=" "
+    for pid in "${prefer[@]}"; do
+        if db_routing_profile_exists "$pid" 2>/dev/null; then
+            pname=$(db_get_routing_profile "$pid" 2>/dev/null | jq -r '.name // .id' 2>/dev/null || echo "$pid")
+            outbounds+=("profile:${pid}")
+            display_names+=("${pname}"$'\t'"${pid}")
+            seen+=" ${pid} "
+        fi
+    done
+    if [[ -n "$_profiles" && "$_profiles" != "[]" ]]; then
+        while IFS=$'\t' read -r pid pname; do
+            [[ -z "$pid" ]] && continue
+            [[ "$seen" == *" ${pid} "* ]] && continue
+            outbounds+=("profile:${pid}")
+            display_names+=("${pname:-$pid}"$'\t'"${pid}")
+        done < <(echo "$_profiles" | jq -r '.[] | [.id // "", .name // .id] | @tsv')
+    fi
+
+    echo "" >&2
+    echo -e "  ${W}${prompt}${NC}" >&2
+    echo -e "  ${D}实例出口仅绑定规则集策略（profile:id）；真实出口在规则集内配置${NC}" >&2
+    _line >&2
+    if [[ ${#outbounds[@]} -eq 0 ]]; then
+        echo -e "  ${Y}暂无规则集${NC} — 请先运行「家宽 + 直出备用」向导" >&2
+        echo -e "  ${G}0${NC}) 返回" >&2
+        _line >&2
+        return 1
+    fi
+    local i
+    for i in "${!outbounds[@]}"; do
+        local info="${display_names[$i]}"
+        local name="${info%%$'\t'*}"
+        local id="${info#*$'\t'}"
+        echo -e "  ${G}$((i+1))${NC}) ${C}${name}${NC} ${D}(profile:${id})${NC}" >&2
+    done
+    echo -e "  ${G}0${NC}) 返回" >&2
+    _line >&2
+    local choice
+    read -rp "  $prompt [1]: " choice
+    choice=${choice:-1}
+    [[ "$choice" == "0" ]] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#outbounds[@]} ]]; then
+        echo "${outbounds[$((choice-1))]}"
+        return 0
+    fi
     return 1
 }
 
@@ -21671,11 +21722,12 @@ _prompt_instance_outbound() {
     echo "" >&2
     _line >&2
     echo -e "  ${W}实例出口${NC} ${D}(默认继承全局分流)${NC}" >&2
+    echo -e "  ${D}产品路径: profile:home / profile:direct_backup（真实出口在规则集内）${NC}" >&2
     if [[ -n "$current" ]]; then
         echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
     fi
     echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
-    echo -e "  ${G}2${NC}) 指定出口 (直连/WARP/链式/负载/规则集)" >&2
+    echo -e "  ${G}2${NC}) 指定规则集策略 (profile:…)" >&2
     echo -e "  ${G}0${NC}) 跳过" >&2
     _line >&2
     local choice
@@ -21686,7 +21738,7 @@ _prompt_instance_outbound() {
         1) SELECTED_INSTANCE_OUTBOUND=""; return 0 ;;
         2)
             local selected
-            selected=$(_select_outbound "选择实例出口" "no_check") || return 1
+            selected=$(_select_instance_outbound_policy "选择实例策略") || return 1
             SELECTED_INSTANCE_OUTBOUND="$selected"
             return 0
             ;;
@@ -21851,57 +21903,84 @@ _routing_profile_validate_and_apply() {
 }
 
 
-# 家宽 + 直出备用：家宽链主 + 直连备用（fallback=inherit → 未匹配走全局直连）
+# 家宽 + 直出备用向导（v3.5.29）
+# 创建两个规则集：home(家宽) + direct_backup(直出备用)；id 稳定，中文名仅 UI。
+# 模板语义：finance+TG 同出口；AI = JP(家宽主出口) vs DIRECT；fallback=inherit。
+# 函数名保留 wizard_home_broadband_direct_backup（兼容测试/调用点）。
 wizard_home_broadband_direct_backup() {
     _header
     echo -e "  ${W}家宽 + 直出备用${NC}"
     _line
-    echo -e "  ${D}创建/选择规则集：金融/TG/AI 走家宽链路，未匹配继承全局（建议全局直连）${NC}"
+    echo -e "  ${D}创建规则集 home(家宽) + direct_backup(直出备用)；未匹配 inherit 全局${NC}"
+    echo -e "  ${D}金融/TG → 家宽主出口（相同）；AI → 家宽=JP主出口 / 直出备用=DIRECT${NC}"
     echo -e "  ${D}规则优先级: 金融/加密 → Telegram DC → AI/流媒体（DIRECT 不重排）${NC}"
     _line
+
+    # Migrate legacy home_broadband→home + retire unused seed profiles (DA helper)
+    if ! db_migrate_routing_profiles_v3529; then
+        _err "分流规则集迁移失败"; _pause; return 1
+    fi
     db_ensure_routing_profiles_defaults || true
 
     local home_ob
-    home_ob=$(_select_outbound "选择家宽主出口" "no_check") || { _err "已取消"; _pause; return 1; }
+    home_ob=$(_select_outbound "选择家宽主出口 (JP/链式等真实出口)" "no_check") || { _err "已取消"; _pause; return 1; }
     case "$home_ob" in
         direct)
             _warn "家宽主出口选了直连，将仅作占位；建议选链式/WARP"
             ;;
         profile:*)
-            _err "家宽主出口不能再套规则集"
+            _err "家宽主出口不能再套规则集（请选真实出口）"
             _pause
             return 1
             ;;
     esac
 
-    local pid="home_broadband"
-    local name="家宽+直出备用"
-    # 组合内置规则，出口改写为家宽；顺序 finance → tg → ai
-    local rules
-    rules=$(jq -n --arg out "$home_ob" '[
-        {id:"hb_fc_crypto", type:"custom", domains:"geosite:category-cryptocurrency", outbound:$out, ip_version:"prefer_ipv4"},
-        {id:"hb_fc_bank", type:"custom", domains:"geosite:category-bank-cn,geosite:category-finance", outbound:$out, ip_version:"prefer_ipv4"},
-        {id:"hb_tg_dc", type:"telegram_dc", outbound:$out, ip_version:"prefer_ipv4"},
-        {id:"hb_tg_fb", type:"custom", domains:"geosite:telegram", outbound:$out, ip_version:"prefer_ipv4"},
-        {id:"hb_ai", type:"custom", domains:"geosite:category-ai-!cn,geosite:openai", outbound:$out, ip_version:"prefer_ipv4"},
-        {id:"hb_media", type:"custom", domains:"geosite:netflix,geosite:disney,geosite:youtube,geosite:spotify,geosite:tiktok", outbound:$out, ip_version:"prefer_ipv4"}
-    ]')
+    # Build rules from DA templates (matchers only; not seeded as profiles)
+    local fc tg ai_jp ai_direct rules_home rules_backup
+    fc=$(db_routing_template_rules_finance_crypto "$home_ob") || { _err "金融模板失败"; _pause; return 1; }
+    tg=$(db_routing_template_rules_telegram_dc "$home_ob") || { _err "TG 模板失败"; _pause; return 1; }
+    ai_jp=$(db_routing_template_rules_ai_media "$home_ob") || { _err "AI 模板失败"; _pause; return 1; }
+    ai_direct=$(db_routing_template_rules_ai_media "direct") || { _err "AI DIRECT 模板失败"; _pause; return 1; }
+    # home: finance+TG+AI → home_ob (JP); direct_backup: finance+TG → home_ob (identical), AI → DIRECT
+    rules_home=$(jq -c -n --argjson a "$fc" --argjson b "$tg" --argjson c "$ai_jp" '$a + $b + $c') || {
+        _err "组合家宽规则失败"; _pause; return 1
+    }
+    rules_backup=$(jq -c -n --argjson a "$fc" --argjson b "$tg" --argjson c "$ai_direct" '$a + $b + $c') || {
+        _err "组合直出备用规则失败"; _pause; return 1
+    }
 
+    local pid name rules
+    # 1) home / 家宽
+    pid="home"; name="家宽"; rules="$rules_home"
     if db_routing_profile_exists "$pid" 2>/dev/null; then
         if ! db_update_routing_profile "$pid" "$name" "$rules"; then
-            _err "更新规则集失败"; _pause; return 1
+            _err "更新规则集失败: $pid"; _pause; return 1
         fi
         _ok "已更新规则集: $name ($pid)"
     else
         if ! db_add_routing_profile "$pid" "$name" "$rules"; then
-            _err "创建规则集失败"; _pause; return 1
+            _err "创建规则集失败: $pid"; _pause; return 1
+        fi
+        _ok "已创建规则集: $name ($pid)"
+    fi
+    # 2) direct_backup / 直出备用
+    pid="direct_backup"; name="直出备用"; rules="$rules_backup"
+    if db_routing_profile_exists "$pid" 2>/dev/null; then
+        if ! db_update_routing_profile "$pid" "$name" "$rules"; then
+            _err "更新规则集失败: $pid"; _pause; return 1
+        fi
+        _ok "已更新规则集: $name ($pid)"
+    else
+        if ! db_add_routing_profile "$pid" "$name" "$rules"; then
+            _err "创建规则集失败: $pid"; _pause; return 1
         fi
         _ok "已创建规则集: $name ($pid)"
     fi
 
     echo ""
-    echo -e "  ${Y}提示:${NC} 全局分流建议保留直连作备用；实例出口选 ${C}规则集→${name}${NC}"
-    read -rp "  是否立即为某个实例绑定此规则集? [y/N]: " _ans
+    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}profile:home${NC} 或 ${C}profile:direct_backup${NC}（非真实出口）"
+    echo -e "  ${D}重命名只改显示名，不改稳定 id${NC}"
+    read -rp "  是否立即为某个实例绑定规则集策略? [y/N]: " _ans
     if [[ "$_ans" =~ ^[yY]$ ]]; then
         manage_instance_outbound
     fi
@@ -22105,7 +22184,6 @@ manage_routing() {
         _item "8" "查看当前配置"
         _item "9" "实例出口管理"
         _item "10" "分流规则集"
-        _item "11" "家宽 + 直出备用"
         _item "0" "返回"
         _line
         
@@ -22139,7 +22217,6 @@ manage_routing() {
                 ;;
             9) manage_instance_outbound ;;
             10) manage_routing_profiles ;;
-            11) wizard_home_broadband_direct_backup ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac

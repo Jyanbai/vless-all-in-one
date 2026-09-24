@@ -36,7 +36,8 @@ for s in db_routing_profile_exists db_list_routing_profiles db_get_routing_profi
          _resolve_profile_rule_outbound _gen_xray_profile_inbound_rules \
          _gen_xray_profile_outbound_needs _mieru_expand_profile_rules \
          _list_profiles_referencing_outbound _routing_profile_validate_and_apply \
-         manage_routing_profiles wizard_home_broadband_direct_backup; do
+         manage_routing_profiles wizard_home_broadband_direct_backup \
+         _select_instance_outbound_policy; do
   if grep -q "^${s}()" "$SCRIPT"; then pass "symbol $s"; else fail "missing $s"; fi
 done
 grep -q '分流规则集' "$SCRIPT" && pass "UI marker 分流规则集" || fail "UI marker missing"
@@ -108,12 +109,26 @@ grep -q 'fallback: "inherit"\|fallback:"inherit"\|fallback = "inherit"' "$SCRIPT
 echo "=== O: display name profile ==="
 grep -A20 '^_get_outbound_display_name()' "$SCRIPT" | grep -q 'profile:\*' && pass "display profile" || fail "display missing profile"
 
-echo "=== P: select_outbound includes profiles ==="
-grep -A80 '^_select_outbound()' "$SCRIPT" | grep -q 'profile:' && pass "select profiles" || fail "select no profile"
+echo "=== P: selectors split (REAL vs INSTANCE policy) ==="
+# REAL outbound selector must NOT offer profile:*
+if grep -A80 '^_select_outbound()' "$SCRIPT" | grep -q 'outbounds+=("profile:'; then
+  fail "select_outbound still offers profile"
+else
+  pass "select_outbound REAL only (no profile)"
+fi
+grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && pass "instance policy selector symbol" || fail "no instance policy selector"
+grep -A40 '^_select_instance_outbound_policy()' "$SCRIPT" | grep -q 'profile:' && pass "policy selector offers profile" || fail "policy no profile"
+grep -A25 '^_prompt_instance_outbound()' "$SCRIPT" | grep -q '_select_instance_outbound_policy' && pass "prompt uses policy selector" || fail "prompt still uses REAL select"
 
-echo "=== Q: menu 10/11 ==="
+echo "=== Q: menu 10 present; duplicate menu 11 removed ==="
 grep -A40 '^manage_routing()' "$SCRIPT" | grep -q '分流规则集' && pass "menu 10" || fail "menu 10"
-grep -A40 '^manage_routing()' "$SCRIPT" | grep -q '家宽' && pass "menu 11" || fail "menu 11"
+if grep -A50 '^manage_routing()' "$SCRIPT" | grep -q '_item "11"'; then
+  fail "menu 11 duplicate still present"
+else
+  pass "menu 11 duplicate removed"
+fi
+# wizard still reachable from 分流规则集
+grep -A40 '^manage_routing_profiles()' "$SCRIPT" | grep -q '家宽' && pass "wizard via profiles menu" || fail "wizard not in profiles menu"
 
 echo "=== R: jq unit — profile rule inboundTag shape ==="
 rule=$(jq -n --argjson tags '["vless-443"]' --arg tag "direct-prefer-ipv4" \
@@ -170,8 +185,12 @@ echo "=== X: mieru profile merges global (pref + glob) ==="
 grep -n '\$p + \$g\|$p + $g' "$SCRIPT" | grep -q . && pass "mieru merge profile+global" || \
   grep -q "\$p + \$g" "$SCRIPT" && pass "mieru merge" || fail "no merge"
 
-echo "=== Y: home_broadband wizard id (legacy; migrate renames) ==="
-grep -q 'home_broadband' "$SCRIPT" && pass "home_broadband id" || fail "no home_broadband"
+echo "=== Y: wizard home+direct_backup; migrate keeps home_broadband legacy ==="
+grep -q 'home_broadband' "$SCRIPT" && pass "home_broadband legacy (migrate)" || fail "no home_broadband"
+grep -A5 'pid="home"' "$SCRIPT" | grep -q '家宽' && pass "wizard creates home/家宽" ||   grep -n 'pid="home"' "$SCRIPT" | grep -q . && pass "wizard home id" || fail "wizard no home id"
+grep -q 'pid="direct_backup"' "$SCRIPT" && pass "wizard creates direct_backup" || fail "wizard no direct_backup"
+grep -A30 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_routing_template_rules' && pass "wizard uses templates" || fail "wizard no templates"
+grep -A40 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_migrate_routing_profiles_v3529' && pass "wizard calls migrate" || fail "wizard no migrate call"
 grep -q 'db_migrate_routing_profiles_v3529' "$SCRIPT" && pass "migrate symbol wired in script" || fail "no migrate"
 
 echo "=== Z: v3.5.28/29 markers present (no forced VERSION bump) ==="
