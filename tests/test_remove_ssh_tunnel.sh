@@ -123,13 +123,32 @@ grep -A20 '_SSH_TUNNEL_LEGACY_PROMPTED' "$SCRIPT" | grep -q 'cleanup_legacy_ssh_
 echo "=== 8: sshd -t/-T fail-closed before reload after drop-in rm ==="
 DROP=$(extract_fn _ssh_tunnel_remove_managed_dropin_failclosed)
 TESTF=$(extract_fn _ssh_tunnel_test_sshd)
-echo "$TESTF" | grep -q 'sshd" -t' || echo "$TESTF" | grep -qE '\$sshd" -t|\$sshd -t' && pass "test_sshd runs sshd -t" || fail "missing sshd -t"
+REST=$(extract_fn _ssh_tunnel_restore_dropin_from_bak)
+echo "$TESTF" | grep -qE '\$sshd" -t|\$sshd -t' && pass "test_sshd runs sshd -t" || fail "missing sshd -t"
 echo "$TESTF" | grep -qE '\$sshd" -T|\$sshd -T' && pass "test_sshd runs sshd -T" || fail "missing sshd -T"
 echo "$DROP" | grep -q '_ssh_tunnel_test_sshd' && pass "drop-in remove calls test_sshd" || fail "no test before reload"
 echo "$DROP" | grep -q '_ssh_tunnel_reload' && pass "drop-in remove calls reload" || fail "no reload after test"
-# restore on failure: bak must be written back to live
-echo "$DROP" | grep -q 'cp -f "$bak" "$live"' && pass "restores drop-in on fail" || fail "no restore on fail"
-# must not bare-rm then reload||true without test
+echo "$DROP" | grep -q '_ssh_tunnel_restore_dropin_from_bak' && pass "uses checked restore helper" || fail "no checked restore helper"
+# checked rm: must not bare rm -f without failure handling
+echo "$DROP" | grep -qE 'if ! rm -f "\$live"' && pass "rm outcome checked" || fail "rm unchecked"
+echo "$DROP" | grep -q '\[\[ -e "\$live" \]\]' && pass "verifies drop-in gone after rm" || fail "no post-rm existence check"
+# restore helper must check cp and never || true swallow
+echo "$REST" | grep -qE 'if ! cp -f "\$bak" "\$live"' && pass "restore checks cp" || fail "restore cp unchecked"
+if echo "$REST" | grep -qE 'cp -f "\$bak" "\$live".*\|\| true'; then
+  fail "restore still swallows cp with || true"
+else
+  pass "restore no cp||true"
+fi
+echo "$REST" | grep -q '备份仍保留' && pass "restore-fail retains bak path" || fail "no bak retain on restore fail"
+# failure paths: claim restored only after successful restore helper
+echo "$DROP" | grep -A3 '_ssh_tunnel_restore_dropin_from_bak' | grep -q '已恢复托管 drop-in' && pass "claims restored only after helper success" || fail "restored claim not gated"
+echo "$DROP" | grep -q '恢复 drop-in 失败；备份仍保留' && pass "hard-fail path retains bak" || fail "missing restore-fail message"
+# forbid unchecked restore pattern in drop fn
+if echo "$DROP" | grep -qE 'cp -f "\$bak" "\$live".*\|\| true'; then
+  fail "dropin fn still has unchecked cp||true"
+else
+  pass "dropin fn no unchecked cp||true"
+fi
 CLEAN=$(extract_fn cleanup_legacy_ssh_tunnel)
 echo "$CLEAN" | grep -q '_ssh_tunnel_remove_managed_dropin_failclosed' && pass "cleanup uses fail-closed drop-in remove" || fail "cleanup bypasses fail-closed"
 if echo "$CLEAN" | grep -qE '_ssh_tunnel_reload \|\| true'; then

@@ -15243,9 +15243,30 @@ _ssh_tunnel_reload() {
     pkill -HUP sshd 2>/dev/null || return 1
 }
 
+# Checked restore helper: never claim restored unless cp succeeded.
+# On failure retain bak and report its path (hard failure).
+_ssh_tunnel_restore_dropin_from_bak() {
+    local bak="$1" live="$2"
+    if [[ -z "$bak" || -z "$live" || ! -f "$bak" ]]; then
+        _err "无法恢复托管 drop-in（备份无效）"
+        return 1
+    fi
+    if ! cp -f "$bak" "$live"; then
+        _err "无法恢复托管 drop-in 到 $live；备份仍保留: $bak"
+        return 1
+    fi
+    chmod 644 "$live" 2>/dev/null || true
+    [[ -f "$live" ]] || {
+        _err "恢复后 drop-in 仍不存在: $live；备份仍保留: $bak"
+        return 1
+    }
+    return 0
+}
+
 # Remove exact managed drop-in with sshd -t/-T + restore on failure (transactional).
 # Returns 0 if no managed drop-in, or remove+validate+reload succeeded.
-# On validate/reload failure: restores drop-in and returns 1. Never stop/disable sshd.
+# On validate/reload failure: restore must succeed before claiming restored; if restore
+# fails, retain bak path and return 1 (never claim restored). Never stop/disable sshd.
 _ssh_tunnel_remove_managed_dropin_failclosed() {
     local live base bak=""
     live=$(_ssh_tunnel_dropin_live)
@@ -15262,20 +15283,35 @@ _ssh_tunnel_remove_managed_dropin_failclosed() {
         _err "无法备份托管 drop-in"
         return 1
     fi
-    rm -f "$live"
-    if ! _ssh_tunnel_test_sshd; then
-        cp -f "$bak" "$live" 2>/dev/null || true
-        chmod 644 "$live" 2>/dev/null || true
+    # Checked remove: fail closed before validate/reload if delete did not succeed
+    if ! rm -f "$live"; then
         rm -f "$bak"
-        _err "sshd -t/-T 失败，已恢复托管 drop-in"
+        _err "无法删除托管 drop-in: $live"
+        return 1
+    fi
+    if [[ -e "$live" ]]; then
+        rm -f "$bak"
+        _err "托管 drop-in 删除后仍存在: $live"
+        return 1
+    fi
+    if ! _ssh_tunnel_test_sshd; then
+        if _ssh_tunnel_restore_dropin_from_bak "$bak" "$live"; then
+            rm -f "$bak"
+            _err "sshd -t/-T 失败，已恢复托管 drop-in"
+        else
+            # retain bak — do not claim restored
+            _err "sshd -t/-T 失败且恢复 drop-in 失败；备份仍保留: $bak"
+        fi
         return 1
     fi
     if ! _ssh_tunnel_reload; then
-        cp -f "$bak" "$live" 2>/dev/null || true
-        chmod 644 "$live" 2>/dev/null || true
-        _ssh_tunnel_reload || true
-        rm -f "$bak"
-        _err "sshd reload 失败，已恢复托管 drop-in"
+        if _ssh_tunnel_restore_dropin_from_bak "$bak" "$live"; then
+            _ssh_tunnel_reload || true
+            rm -f "$bak"
+            _err "sshd reload 失败，已恢复托管 drop-in"
+        else
+            _err "sshd reload 失败且恢复 drop-in 失败；备份仍保留: $bak"
+        fi
         return 1
     fi
     rm -f "$bak"
