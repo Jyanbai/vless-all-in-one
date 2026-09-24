@@ -132,6 +132,25 @@ fi
 echo "=== O: inherit via empty instance_outbound (db_set inherit→clear) ==="
 if grep -A12 '^db_set_instance_outbound()' "$SCRIPT" | grep -q 'inherit'; then pass "inherit→clear"; else fail "inherit not cleared"; fi
 
+echo "=== P: show_routing_status lists Mieru after Xray (multiline _iob_lines) ==="
+srs=$(awk '/^show_routing_status\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
+if echo "$srs" | grep -q 'db_exists "xray" "mieru"'; then pass "status db_exists mieru"; else fail "status missing db_exists mieru"; fi
+if echo "$srs" | grep -q 'db_list_ports "xray" "mieru"'; then pass "status db_list_ports mieru"; else fail "status missing db_list_ports mieru"; fi
+# Multiline: append uses $'\n', not jammed $(printf ...)
+if echo "$srs" | grep -F "_iob_lines+=" | grep -F "$'\n'" >/dev/null; then
+  pass "status multiline _iob_lines"
+elif echo "$srs" | grep -q '_iob_lines+=$(printf'; then
+  fail "status still jams via $(printf)"
+else
+  fail "status missing multiline _iob_lines"
+fi
+# Guard: mieru still absent from XRAY_PROTOCOLS definition
+if grep -m1 '^XRAY_PROTOCOLS=' "$SCRIPT" | grep -qw mieru; then
+  fail "mieru wrongly added to XRAY_PROTOCOLS"
+else
+  pass "XRAY_PROTOCOLS untouched (no mieru)"
+fi
+
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -20295,9 +20295,18 @@ show_routing_status() {
             [[ -z "$_port" || "$_port" == "null" ]] && continue
             _ob=$(db_get_instance_outbound "xray" "$_proto" "$_port" 2>/dev/null || true)
             [[ -z "$_ob" ]] && continue
-            _iob_lines+=$(printf '%s\n' "  实例: ${G}$(get_protocol_name "$_proto" 2>/dev/null || echo "$_proto"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}")
+            _iob_lines+="  实例: ${G}$(get_protocol_name "$_proto" 2>/dev/null || echo "$_proto"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"$'\n'
         done < <(db_list_ports "xray" "$_proto" 2>/dev/null)
     done
+    # Mieru is NOT in XRAY_PROTOCOLS — enumerate after Xray via existing DB helpers.
+    if db_exists "xray" "mieru" 2>/dev/null; then
+        while IFS= read -r _port; do
+            [[ -z "$_port" || "$_port" == "null" ]] && continue
+            _ob=$(db_get_instance_outbound "xray" "mieru" "$_port" 2>/dev/null || true)
+            [[ -z "$_ob" ]] && continue
+            _iob_lines+="  实例: ${G}$(get_protocol_name "mieru" 2>/dev/null || echo "mieru"):${_port}${NC} → ${C}$(_get_outbound_display_name "$_ob")${NC}"$'\n'
+        done < <(db_list_ports "xray" "mieru" 2>/dev/null)
+    fi
     if [[ -n "$_iob_lines" ]]; then
         echo -e "$_iob_lines"
     fi
