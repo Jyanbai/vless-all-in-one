@@ -19671,7 +19671,7 @@ _select_instance_outbound_policy() {
 
     echo "" >&2
     echo -e "  ${W}${prompt}${NC}" >&2
-    echo -e "  ${D}实例出口仅绑定规则集策略（profile:id）；真实出口在规则集内配置${NC}" >&2
+    echo -e "  ${D}实例出口仅绑定规则集策略；真实出口在规则集内配置${NC}" >&2
     _line >&2
     if [[ ${#outbounds[@]} -eq 0 ]]; then
         echo -e "  ${Y}暂无规则集${NC} — 请先运行「家宽 + 直出备用」向导" >&2
@@ -19684,7 +19684,7 @@ _select_instance_outbound_policy() {
         local info="${display_names[$i]}"
         local name="${info%%$'\t'*}"
         local id="${info#*$'\t'}"
-        echo -e "  ${G}$((i+1))${NC}) ${C}${name}${NC} ${D}(profile:${id})${NC}" >&2
+        echo -e "  ${G}$((i+1))${NC}) ${C}${name}${NC}" >&2
     done
     echo -e "  ${G}0${NC}) 返回" >&2
     _line >&2
@@ -21838,8 +21838,8 @@ _prompt_instance_outbound() {
         echo -e "  ${G}3${NC}) WARP" >&2
         echo -e "  ${G}4${NC}) 链式代理" >&2
         echo -e "  ${G}5${NC}) 负载均衡" >&2
-        echo -e "  ${G}6${NC}) 家宽 ${D}(profile:home)${NC}" >&2
-        echo -e "  ${G}7${NC}) 直出备用 ${D}(profile:direct_backup)${NC}" >&2
+        echo -e "  ${G}6${NC}) 家宽" >&2
+        echo -e "  ${G}7${NC}) 直出备用" >&2
         echo -e "  ${G}8${NC}) 配置/重建家宽+直出备用 ${D}(向导)${NC}" >&2
         echo -e "  ${G}0${NC}) 返回" >&2
         _line >&2
@@ -21889,7 +21889,7 @@ _prompt_instance_outbound() {
             6)
                 db_ensure_routing_profiles_defaults 2>/dev/null || true
                 if ! db_routing_profile_exists "home" 2>/dev/null; then
-                    _warn "规则集 home 尚未创建 — 请先选 8 运行向导" >&2
+                    _warn "「家宽」尚未创建 — 请先选 8 运行向导" >&2
                     continue
                 fi
                 SELECTED_INSTANCE_OUTBOUND="profile:home"
@@ -21898,7 +21898,7 @@ _prompt_instance_outbound() {
             7)
                 db_ensure_routing_profiles_defaults 2>/dev/null || true
                 if ! db_routing_profile_exists "direct_backup" 2>/dev/null; then
-                    _warn "规则集 direct_backup 尚未创建 — 请先选 8 运行向导" >&2
+                    _warn "「直出备用」尚未创建 — 请先选 8 运行向导" >&2
                     continue
                 fi
                 SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"
@@ -22174,32 +22174,32 @@ wizard_home_broadband_direct_backup() {
     pid="home"; name="家宽"; rules="$rules_home"
     if db_routing_profile_exists "$pid" 2>/dev/null; then
         if ! db_update_routing_profile "$pid" "$name" "$rules"; then
-            _err "更新规则集失败: $pid"; _pause; return 1
+            _err "更新失败: $name"; _pause; return 1
         fi
-        _ok "已更新规则集: $name ($pid)"
+        _ok "已更新: $name"
     else
         if ! db_add_routing_profile "$pid" "$name" "$rules"; then
-            _err "创建规则集失败: $pid"; _pause; return 1
+            _err "创建失败: $name"; _pause; return 1
         fi
-        _ok "已创建规则集: $name ($pid)"
+        _ok "已创建: $name"
     fi
     # 2) direct_backup / 直出备用
     pid="direct_backup"; name="直出备用"; rules="$rules_backup"
     if db_routing_profile_exists "$pid" 2>/dev/null; then
         if ! db_update_routing_profile "$pid" "$name" "$rules"; then
-            _err "更新规则集失败: $pid"; _pause; return 1
+            _err "更新失败: $name"; _pause; return 1
         fi
-        _ok "已更新规则集: $name ($pid)"
+        _ok "已更新: $name"
     else
         if ! db_add_routing_profile "$pid" "$name" "$rules"; then
-            _err "创建规则集失败: $pid"; _pause; return 1
+            _err "创建失败: $name"; _pause; return 1
         fi
-        _ok "已创建规则集: $name ($pid)"
+        _ok "已创建: $name"
     fi
 
     echo ""
-    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}6) 家宽${NC} 或 ${C}7) 直出备用${NC}（profile:home / profile:direct_backup）"
-    echo -e "  ${D}重命名只改显示名，不改稳定 id；其它旧 profile:* 数据保留只读${NC}"
+    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}6) 家宽${NC} 或 ${C}7) 直出备用${NC}"
+    echo -e "  ${D}重命名只改显示名；其它旧规则集数据保留只读${NC}"
     _pause
 }
 

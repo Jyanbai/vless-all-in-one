@@ -121,8 +121,16 @@ fi
 grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && pass "instance policy selector symbol (kept)" || fail "no instance policy selector"
 # Fixed instance outbound menu: 1 inherit … 6 home 7 direct_backup 8 wizard
 prompt_block=$(awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-echo "$prompt_block" | grep -q 'profile:home' && pass "prompt offers profile:home" || fail "prompt no home"
-echo "$prompt_block" | grep -q 'profile:direct_backup' && pass "prompt offers profile:direct_backup" || fail "prompt no direct_backup"
+# UI must not show internal ids; code still assigns profile:home / profile:direct_backup
+echo "$prompt_block" | grep -qE '家宽' && pass "prompt offers 家宽" || fail "prompt no 家宽"
+echo "$prompt_block" | grep -qE '直出备用' && pass "prompt offers 直出备用" || fail "prompt no 直出备用"
+echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:home"' && pass "prompt binds profile:home internally" || fail "prompt missing home assign"
+echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"' && pass "prompt binds profile:direct_backup internally" || fail "prompt missing direct_backup assign"
+if echo "$prompt_block" | grep -E 'echo .*\(profile:(home|direct_backup)\)' >/dev/null; then
+  fail "prompt still shows profile: ids in UI echo"
+else
+  pass "prompt UI hides profile: ids"
+fi
 echo "$prompt_block" | grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' && pass "prompt item 8 wizard" || fail "prompt no wizard"
 echo "$prompt_block" | grep -q '_prompt_pick_chain_outbound' && pass "prompt chain pick" || fail "prompt no chain"
 echo "$prompt_block" | grep -q '_prompt_pick_balancer_outbound' && pass "prompt balancer pick" || fail "prompt no balancer"
