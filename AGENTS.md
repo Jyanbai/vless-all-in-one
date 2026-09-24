@@ -10,6 +10,11 @@
   - `当前脚本版本：**v…**` in `README_CN.md`
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
+## v3.5.26 product notes (docs surface)
+- **Remove SSH Tunnel** from supported product surface (select menu, STANDALONE/PROTO tables, install/create). No new `ssh-tunnel` DB writes (`db_add`/`db_add_port`/`db_update_port` reject).
+- Legacy: opt-in `cleanup_legacy_ssh_tunnel` only — schema-lock snapshot → DB delete → scoped drop-in + `$CFG/ssh-tunnel`; proven-ownership `userdel`; never stop/disable system `sshd`.
+- Local matrix: `tests/test_remove_ssh_tunnel.sh`.
+
 ## v3.5.25 product notes (docs surface)
 - **Mieru service outbound (NOT per-port):** one service-wide egress for the whole mieru service (`db.json` → `xray.mieru` instances/portBindings → one `mieru.json` → one `vless-mieru`/`mita`).
 - DB: `.service_outbound.mieru` via `db_get/set/clear_service_outbound_mieru`. Vocab: empty/missing = inherit | `direct` | `warp` | `chain:<n>` | `balancer:<n>`. Never persist literal `inherit`.

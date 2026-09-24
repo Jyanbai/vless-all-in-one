@@ -4,7 +4,7 @@
 
 An all-in-one proxy deployment script for Linux servers.
 
-It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, **mieru**, and **SSH Tunnel**.
+It helps you quickly deploy and manage multiple protocols in one place, including **VLESS**, **VMess**, **Trojan**, **Hysteria2**, **TUIC**, **NaiveProxy**, **Snell**, **SOCKS5**, **SS2022**, **VLESS Encryption + FinalMask (Sudoku)**, **mieru**.
 
 ## Features
 
@@ -14,7 +14,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - Xray + Sing-box dual-core architecture
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
-- **SSH Tunnel** (v3.5.20): existing OpenSSH only — key-only auth, TCP `-L`/`-D`/`-R`, no shell/SFTP/UDP/`ssh://`
+- **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create); opt-in legacy cleanup only (`cleanup_legacy_ssh_tunnel`); never stop/disable system sshd
 - **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
 - **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
@@ -27,7 +27,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.25**
+Current script version: **v3.5.26**
 
 ## Sing-box custom build for traffic stats
 
