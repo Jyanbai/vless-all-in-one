@@ -40,8 +40,9 @@ for s in db_routing_profile_exists db_list_routing_profiles db_get_routing_profi
          _select_instance_outbound_policy; do
   if grep -q "^${s}()" "$SCRIPT"; then pass "symbol $s"; else fail "missing $s"; fi
 done
-grep -q '分流规则集' "$SCRIPT" && pass "UI marker 分流规则集" || fail "UI marker missing"
-grep -q '家宽 + 直出备用' "$SCRIPT" && pass "wizard marker" || fail "wizard marker missing"
+grep -q '分流规则集' "$SCRIPT" && pass "marker 分流规则集 (errors/dead OK)" || fail "marker missing"
+grep -q '家宽 + 直出备用\|家宽 + 直出备用向导' "$SCRIPT" && pass "wizard marker" || fail "wizard marker missing"
+grep -q '旧规则集' "$SCRIPT" && pass "legacy marker" || fail "legacy marker missing"
 
 echo "=== D: profile:<id> vocab resolve fail-closed missing ==="
 awk '/^_resolve_instance_outbound_target\(\)/,/^gen_xray_instance_outbound_needs|^# v3.5.28 product/' "$SCRIPT" | grep -q 'db_routing_profile_exists'   && pass "resolve checks exists" || fail "resolve missing exists"
@@ -107,28 +108,52 @@ done
 grep -q 'fallback: "inherit"\|fallback:"inherit"\|fallback = "inherit"' "$SCRIPT" && pass "fallback inherit" || fail "no fallback inherit"
 
 echo "=== O: display name profile ==="
-grep -A20 '^_get_outbound_display_name()' "$SCRIPT" | grep -q 'profile:\*' && pass "display profile" || fail "display missing profile"
+grep -A40 '^_get_outbound_display_name()' "$SCRIPT" | grep -q 'profile:\*' && pass "display profile" || fail "display missing profile"
+grep -A40 '^_get_outbound_display_name()' "$SCRIPT" | grep -q '旧规则集' && pass "legacy display 旧规则集" || fail "no legacy display"
 
-echo "=== P: selectors split (REAL vs INSTANCE policy) ==="
+echo "=== P: selectors split (REAL vs INSTANCE fixed menu) ==="
 # REAL outbound selector must NOT offer profile:*
 if grep -A80 '^_select_outbound()' "$SCRIPT" | grep -q 'outbounds+=("profile:'; then
   fail "select_outbound still offers profile"
 else
   pass "select_outbound REAL only (no profile)"
 fi
-grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && pass "instance policy selector symbol" || fail "no instance policy selector"
-grep -A40 '^_select_instance_outbound_policy()' "$SCRIPT" | grep -q 'profile:' && pass "policy selector offers profile" || fail "policy no profile"
-grep -A25 '^_prompt_instance_outbound()' "$SCRIPT" | grep -q '_select_instance_outbound_policy' && pass "prompt uses policy selector" || fail "prompt still uses REAL select"
+grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && pass "instance policy selector symbol (kept)" || fail "no instance policy selector"
+# Fixed instance outbound menu: 1 inherit … 6 home 7 direct_backup 8 wizard
+prompt_block=$(awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
+echo "$prompt_block" | grep -q 'profile:home' && pass "prompt offers profile:home" || fail "prompt no home"
+echo "$prompt_block" | grep -q 'profile:direct_backup' && pass "prompt offers profile:direct_backup" || fail "prompt no direct_backup"
+echo "$prompt_block" | grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' && pass "prompt item 8 wizard" || fail "prompt no wizard"
+echo "$prompt_block" | grep -q '_prompt_pick_chain_outbound' && pass "prompt chain pick" || fail "prompt no chain"
+echo "$prompt_block" | grep -q '_prompt_pick_balancer_outbound' && pass "prompt balancer pick" || fail "prompt no balancer"
+echo "$prompt_block" | grep -q '旧规则集' && pass "prompt legacy path" || fail "prompt no legacy"
 
-echo "=== Q: menu 10 present; duplicate menu 11 removed ==="
-grep -A40 '^manage_routing()' "$SCRIPT" | grep -q '分流规则集' && pass "menu 10" || fail "menu 10"
+echo "=== Q: menu 10 分流规则集 withdrawn; wizard on instance item 8 ==="
+mgr=$(awk '/^manage_routing\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
+if echo "$mgr" | grep -q '分流规则集'; then
+  fail "menu still exposes 分流规则集"
+else
+  pass "no top-level 分流规则集 in manage_routing"
+fi
+if echo "$mgr" | grep -q '_item "10"'; then
+  fail "manage_routing still has item 10"
+else
+  pass "manage_routing has no item 10"
+fi
+if echo "$mgr" | grep -q 'manage_routing_profiles'; then
+  fail "manage_routing still calls manage_routing_profiles"
+else
+  pass "manage_routing_profiles unhooked from manage_routing"
+fi
 if grep -A50 '^manage_routing()' "$SCRIPT" | grep -q '_item "11"'; then
   fail "menu 11 duplicate still present"
 else
   pass "menu 11 duplicate removed"
 fi
-# wizard still reachable from 分流规则集
-grep -A40 '^manage_routing_profiles()' "$SCRIPT" | grep -q '家宽' && pass "wizard via profiles menu" || fail "wizard not in profiles menu"
+# wizard reachable from instance outbound item 8 (not generic profiles CRUD)
+awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT" | grep -q 'wizard_home_broadband_direct_backup' && pass "wizard via instance menu 8" || fail "wizard not in instance menu"
+# generic CRUD menu must not be in product manage_routing path (dead-code leave OK)
+grep -q '^manage_routing_profiles()' "$SCRIPT" && pass "profiles fn kept (dead/unhooked OK)" || fail "profiles fn deleted unexpectedly"
 
 echo "=== R: jq unit — profile rule inboundTag shape ==="
 rule=$(jq -n --argjson tags '["vless-443"]' --arg tag "direct-prefer-ipv4" \
@@ -189,8 +214,13 @@ echo "=== Y: wizard home+direct_backup; migrate keeps home_broadband legacy ==="
 grep -q 'home_broadband' "$SCRIPT" && pass "home_broadband legacy (migrate)" || fail "no home_broadband"
 grep -A5 'pid="home"' "$SCRIPT" | grep -q '家宽' && pass "wizard creates home/家宽" ||   grep -n 'pid="home"' "$SCRIPT" | grep -q . && pass "wizard home id" || fail "wizard no home id"
 grep -q 'pid="direct_backup"' "$SCRIPT" && pass "wizard creates direct_backup" || fail "wizard no direct_backup"
-grep -A30 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_routing_template_rules' && pass "wizard uses templates" || fail "wizard no templates"
-grep -A40 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_migrate_routing_profiles_v3529' && pass "wizard calls migrate" || fail "wizard no migrate call"
+awk '/^wizard_home_broadband_direct_backup\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT" | grep -q 'db_routing_template_rules' && pass "wizard uses templates" || fail "wizard no templates"
+grep -A80 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_migrate_routing_profiles_v3529' && pass "wizard calls migrate" || fail "wizard no migrate call"
+wiz=$(awk '/^wizard_home_broadband_direct_backup\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
+echo "$wiz" | grep -q '步骤 1/5' && pass "wizard multi-step" || fail "wizard not multi-step"
+echo "$wiz" | grep -q 'pid="home"' && pass "wizard upserts home" || fail "wizard no home upsert"
+echo "$wiz" | grep -q 'pid="direct_backup"' && pass "wizard upserts direct_backup" || fail "wizard no backup upsert"
+echo "$wiz" | grep -q 'ai_direct\|db_routing_template_rules_ai_media "direct"' && pass "wizard AI direct_backup=DIRECT" || fail "wizard AI semantics"
 grep -q 'db_migrate_routing_profiles_v3529' "$SCRIPT" && pass "migrate symbol wired in script" || fail "no migrate"
 
 echo "=== Z: v3.5.28/29 markers present (no forced VERSION bump) ==="

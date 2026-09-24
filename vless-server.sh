@@ -19708,13 +19708,23 @@ _get_outbound_display_name() {
         warp) echo "WARP" ;;
         chain:*) echo "链路→${outbound#chain:}" ;;
         balancer:*) echo "负载→${outbound#balancer:}" ;;
+        profile:home)
+            local _pname
+            _pname=$(db_get_routing_profile "home" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+            echo "${_pname:-家宽}"
+            ;;
+        profile:direct_backup)
+            local _pname
+            _pname=$(db_get_routing_profile "direct_backup" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+            echo "${_pname:-直出备用}"
+            ;;
         profile:*)
             local _pid="${outbound#profile:}" _pname
             _pname=$(db_get_routing_profile "$_pid" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
             if [[ -n "$_pname" ]]; then
-                echo "规则集→${_pname}"
+                echo "旧规则集: ${_pname}"
             else
-                echo "规则集→${_pid}"
+                echo "旧规则集: ${_pid}"
             fi
             ;;
         *) echo "$outbound" ;;
@@ -21734,37 +21744,176 @@ _routing_meaningfully_configured() {
 # 安装/管理时选择实例出口；默认继承（不落库）
 # 设置 SELECTED_INSTANCE_OUTBOUND；空字符串=继承
 # $1=protocol $2=port $3=current_value(optional)
+# 仅挑选链式节点（实例出口菜单 4）
+_prompt_pick_chain_outbound() {
+    local nodes node_count name type server port
+    nodes=$(db_get_chain_nodes 2>/dev/null || echo '[]')
+    node_count=$(echo "$nodes" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "$node_count" -eq 0 ]]; then
+        _err "暂无链式节点" >&2
+        return 1
+    fi
+    local outbounds=() i=1
+    echo "" >&2
+    echo -e "  ${W}选择链式出口${NC}" >&2
+    _line >&2
+    while IFS=$'\t' read -r name type server port; do
+        [[ -z "$name" ]] && continue
+        outbounds+=("chain:${name}")
+        echo -e "  ${G}${i}${NC}) ${name} ${D}(${type:-?} ${server:-}-${port:-})${NC}" >&2
+        ((i++))
+    done < <(echo "$nodes" | jq -r '.[] | [.name // "", .type // "", .server // "", .port // ""] | @tsv')
+    echo -e "  ${G}0${NC}) 返回" >&2
+    _line >&2
+    local choice
+    read -rp "  请选择: " choice
+    [[ "$choice" == "0" || -z "$choice" ]] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#outbounds[@]} ]]; then
+        echo "${outbounds[$((choice-1))]}"
+        return 0
+    fi
+    return 1
+}
+
+# 仅挑选负载均衡组（实例出口菜单 5）
+_prompt_pick_balancer_outbound() {
+    local groups group_count name strategy ncount
+    groups=$(db_get_balancer_groups 2>/dev/null || echo '[]')
+    group_count=$(echo "$groups" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "$group_count" -eq 0 ]]; then
+        _err "暂无负载均衡组" >&2
+        return 1
+    fi
+    local outbounds=() i=1
+    echo "" >&2
+    echo -e "  ${W}选择负载均衡出口${NC}" >&2
+    _line >&2
+    while IFS=$'\t' read -r name strategy ncount; do
+        [[ -z "$name" ]] && continue
+        outbounds+=("balancer:${name}")
+        echo -e "  ${G}${i}${NC}) ${name} ${D}(${strategy:-?}, ${ncount:-0}节点)${NC}" >&2
+        ((i++))
+    done < <(echo "$groups" | jq -r '.[] | [.name // "", .strategy // "", (.nodes | length)] | @tsv')
+    echo -e "  ${G}0${NC}) 返回" >&2
+    _line >&2
+    local choice
+    read -rp "  请选择: " choice
+    [[ "$choice" == "0" || -z "$choice" ]] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#outbounds[@]} ]]; then
+        echo "${outbounds[$((choice-1))]}"
+        return 0
+    fi
+    return 1
+}
+
 _prompt_instance_outbound() {
     local protocol="${1:-}" port="${2:-}" current="${3:-}"
     SELECTED_INSTANCE_OUTBOUND=""
     if ! _routing_meaningfully_configured; then
         return 0
     fi
-    echo "" >&2
-    _line >&2
-    echo -e "  ${W}实例出口${NC} ${D}(默认继承全局分流)${NC}" >&2
-    echo -e "  ${D}产品路径: profile:home / profile:direct_backup（真实出口在规则集内）${NC}" >&2
-    if [[ -n "$current" ]]; then
-        echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
-    fi
-    echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
-    echo -e "  ${G}2${NC}) 指定规则集策略 (profile:…)" >&2
-    echo -e "  ${G}0${NC}) 跳过" >&2
-    _line >&2
-    local choice
-    read -rp "  请选择 [1]: " choice
-    choice=${choice:-1}
-    case "$choice" in
-        0) SELECTED_INSTANCE_OUTBOUND="$current"; return 0 ;;
-        1) SELECTED_INSTANCE_OUTBOUND=""; return 0 ;;
-        2)
-            local selected
-            selected=$(_select_instance_outbound_policy "选择实例策略") || return 1
-            SELECTED_INSTANCE_OUTBOUND="$selected"
-            return 0
+
+    local cur_pid="" is_legacy=0
+    case "$current" in
+        profile:home|profile:direct_backup) ;;
+        profile:*)
+            cur_pid="${current#profile:}"
+            is_legacy=1
             ;;
-        *) SELECTED_INSTANCE_OUTBOUND=""; return 0 ;;
     esac
+
+    while true; do
+        echo "" >&2
+        _line >&2
+        echo -e "  ${W}实例出口${NC} ${D}(默认继承全局分流)${NC}" >&2
+        if [[ -n "$current" ]]; then
+            echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
+        fi
+        if [[ "$is_legacy" -eq 1 ]]; then
+            echo -e "  ${Y}旧规则集只读保留${NC} ${D}(.routing_profiles 数据不销毁)${NC}" >&2
+            echo -e "  ${G}k${NC}) 保持旧规则集" >&2
+        fi
+        echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
+        echo -e "  ${G}2${NC}) 直连 (direct)" >&2
+        echo -e "  ${G}3${NC}) WARP" >&2
+        echo -e "  ${G}4${NC}) 链式代理" >&2
+        echo -e "  ${G}5${NC}) 负载均衡" >&2
+        echo -e "  ${G}6${NC}) 家宽 ${D}(profile:home)${NC}" >&2
+        echo -e "  ${G}7${NC}) 直出备用 ${D}(profile:direct_backup)${NC}" >&2
+        echo -e "  ${G}8${NC}) 配置/重建家宽+直出备用 ${D}(向导)${NC}" >&2
+        echo -e "  ${G}0${NC}) 返回" >&2
+        _line >&2
+        local choice
+        read -rp "  请选择 [1]: " choice
+        choice=${choice:-1}
+        case "$choice" in
+            0)
+                return 1
+                ;;
+            k|K)
+                if [[ "$is_legacy" -eq 1 ]]; then
+                    SELECTED_INSTANCE_OUTBOUND="$current"
+                    return 0
+                fi
+                _err "无效选择" >&2
+                ;;
+            1)
+                SELECTED_INSTANCE_OUTBOUND=""
+                return 0
+                ;;
+            2)
+                SELECTED_INSTANCE_OUTBOUND="direct"
+                return 0
+                ;;
+            3)
+                local warp_st
+                warp_st=$(warp_status 2>/dev/null || true)
+                if [[ "$warp_st" != "configured" && "$warp_st" != "connected" ]]; then
+                    _warn "WARP 未配置/未连接，仍可绑定；请稍后在 WARP 管理中完成" >&2
+                fi
+                SELECTED_INSTANCE_OUTBOUND="warp"
+                return 0
+                ;;
+            4)
+                local selected
+                selected=$(_prompt_pick_chain_outbound) || continue
+                SELECTED_INSTANCE_OUTBOUND="$selected"
+                return 0
+                ;;
+            5)
+                local selected
+                selected=$(_prompt_pick_balancer_outbound) || continue
+                SELECTED_INSTANCE_OUTBOUND="$selected"
+                return 0
+                ;;
+            6)
+                db_ensure_routing_profiles_defaults 2>/dev/null || true
+                if ! db_routing_profile_exists "home" 2>/dev/null; then
+                    _warn "规则集 home 尚未创建 — 请先选 8 运行向导" >&2
+                    continue
+                fi
+                SELECTED_INSTANCE_OUTBOUND="profile:home"
+                return 0
+                ;;
+            7)
+                db_ensure_routing_profiles_defaults 2>/dev/null || true
+                if ! db_routing_profile_exists "direct_backup" 2>/dev/null; then
+                    _warn "规则集 direct_backup 尚未创建 — 请先选 8 运行向导" >&2
+                    continue
+                fi
+                SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"
+                return 0
+                ;;
+            8)
+                wizard_home_broadband_direct_backup
+                # 向导只重建规则集；回到本菜单再选 6/7 绑定
+                continue
+                ;;
+            *)
+                _err "无效选择" >&2
+                ;;
+        esac
+    done
 }
 
 # 实例出口管理菜单（Xray + Mieru 每实例一行）
@@ -21930,10 +22079,10 @@ _routing_profile_validate_and_apply() {
 # 函数名保留 wizard_home_broadband_direct_backup（兼容测试/调用点）。
 wizard_home_broadband_direct_backup() {
     _header
-    echo -e "  ${W}家宽 + 直出备用${NC}"
+    echo -e "  ${W}家宽 + 直出备用向导${NC}"
     _line
-    echo -e "  ${D}创建规则集 home(家宽) + direct_backup(直出备用)；未匹配 inherit 全局${NC}"
-    echo -e "  ${D}金融/TG → 家宽主出口（相同）；AI → 家宽=JP主出口 / 直出备用=DIRECT${NC}"
+    echo -e "  ${D}创建/重建规则集 home(家宽) + direct_backup(直出备用)；未匹配 inherit 全局${NC}"
+    echo -e "  ${D}金融/TG → 两规则集相同；AI → 家宽=主出口 / 直出备用=DIRECT${NC}"
     echo -e "  ${D}规则优先级: 金融/加密 → Telegram DC → AI/流媒体（DIRECT 不重排）${NC}"
     _line
 
@@ -21943,6 +22092,8 @@ wizard_home_broadband_direct_backup() {
     fi
     db_ensure_routing_profiles_defaults || true
 
+    # ---- 步骤 1: AI JP / 家宽主出口 ----
+    echo -e "  ${C}步骤 1/5${NC} 选择家宽主出口（AI→此出口；金融/TG 亦用此出口）"
     local home_ob
     home_ob=$(_select_outbound "选择家宽主出口 (JP/链式等真实出口)" "no_check") || { _err "已取消"; _pause; return 1; }
     case "$home_ob" in
@@ -21955,6 +22106,37 @@ wizard_home_broadband_direct_backup() {
             return 1
             ;;
     esac
+
+    # ---- 步骤 2: finance TW（两规则集相同）----
+    echo ""
+    echo -e "  ${C}步骤 2/5${NC} 金融/加密 → ${C}$(_get_outbound_display_name "$home_ob")${NC}（家宽与直出备用相同）"
+    read -rp "  确认金融出口? [Y/n]: " _ans
+    if [[ "$_ans" =~ ^[nN]$ ]]; then
+        _err "已取消"; _pause; return 1
+    fi
+
+    # ---- 步骤 3: TG DC 映射 ----
+    echo ""
+    echo -e "  ${C}步骤 3/5${NC} Telegram DC 映射（matchers，非 geoip:telegram）"
+    db_seed_telegram_dc_matchers_if_absent || true
+    local _tg_m
+    _tg_m=$(db_get_telegram_dc_matchers 2>/dev/null || echo '{}')
+    local _tg_src _tg_n
+    _tg_src=$(echo "$_tg_m" | jq -r '.source // "seed"' 2>/dev/null || echo seed)
+    _tg_n=$(echo "$_tg_m" | jq -r '[keys[] | select(startswith("dc"))] | length' 2>/dev/null || echo 0)
+    echo -e "  ${D}source=${_tg_src}, DC 条目≈${_tg_n}${NC}"
+    read -rp "  继续使用当前 TG DC 映射? [Y/n]: " _ans
+    if [[ "$_ans" =~ ^[nN]$ ]]; then
+        _err "已取消"; _pause; return 1
+    fi
+
+    # ---- 步骤 4: TG fallback ----
+    echo ""
+    echo -e "  ${C}步骤 4/5${NC} TG 未知 DC 回落 ${C}geosite:telegram${NC} → $(_get_outbound_display_name "$home_ob")"
+    read -rp "  确认 TG 回落? [Y/n]: " _ans
+    if [[ "$_ans" =~ ^[nN]$ ]]; then
+        _err "已取消"; _pause; return 1
+    fi
 
     # Build rules from DA templates (matchers only; not seeded as profiles)
     local fc tg ai_jp ai_direct rules_home rules_backup
@@ -21970,6 +22152,23 @@ wizard_home_broadband_direct_backup() {
         _err "组合直出备用规则失败"; _pause; return 1
     }
 
+    # ---- 步骤 5: preview + confirm ----
+    echo ""
+    echo -e "  ${C}步骤 5/5${NC} 预览（确认后原子写入两个规则集）"
+    _line
+    local n_home n_backup
+    n_home=$(echo "$rules_home" | jq 'length')
+    n_backup=$(echo "$rules_backup" | jq 'length')
+    echo -e "  ${W}home / 家宽${NC}  ${D}${n_home} 条${NC}  AI→$(_get_outbound_display_name "$home_ob")  金融/TG→同"
+    echo -e "  ${W}direct_backup / 直出备用${NC}  ${D}${n_backup} 条${NC}  AI→直连  金融/TG→$(_get_outbound_display_name "$home_ob")"
+    echo -e "  ${D}fallback=inherit（未匹配继承全局）${NC}"
+    _line
+    read -rp "  确认写入 home + direct_backup? [y/N]: " _ans
+    if [[ ! "$_ans" =~ ^[yY]$ ]]; then
+        _err "已取消"; _pause; return 1
+    fi
+
+    # Atomic-ish upsert: both profiles after single confirm (DA helpers; no backend rewrite)
     local pid name rules
     # 1) home / 家宽
     pid="home"; name="家宽"; rules="$rules_home"
@@ -21999,12 +22198,8 @@ wizard_home_broadband_direct_backup() {
     fi
 
     echo ""
-    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}profile:home${NC} 或 ${C}profile:direct_backup${NC}（非真实出口）"
-    echo -e "  ${D}重命名只改显示名，不改稳定 id${NC}"
-    read -rp "  是否立即为某个实例绑定规则集策略? [y/N]: " _ans
-    if [[ "$_ans" =~ ^[yY]$ ]]; then
-        manage_instance_outbound
-    fi
+    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}6) 家宽${NC} 或 ${C}7) 直出备用${NC}（profile:home / profile:direct_backup）"
+    echo -e "  ${D}重命名只改显示名，不改稳定 id；其它旧 profile:* 数据保留只读${NC}"
     _pause
 }
 
@@ -22022,6 +22217,7 @@ _show_routing_profile_users() {
     done
 }
 
+# WITHDRAWN from product menus (v3.5.29): generic CRUD UI unhooked; keep body for DA/tests.
 manage_routing_profiles() {
     while true; do
         _header
@@ -22204,7 +22400,6 @@ manage_routing() {
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
         _item "9" "实例出口管理"
-        _item "10" "分流规则集"
         _item "0" "返回"
         _line
         
@@ -22237,7 +22432,6 @@ manage_routing() {
                 read -rp "  按回车返回..." _
                 ;;
             9) manage_instance_outbound ;;
-            10) manage_routing_profiles ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
