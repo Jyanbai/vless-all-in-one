@@ -210,15 +210,50 @@ u1=$(jq -r '.xray.vless.users[0].uuid' "$TMPF/db.json")
 rm -f "$HARNESS"
 rm -rf "$TMPF"
 
-echo "=== G: VERSION not bumped ==="
+echo "=== G: VERSION present (Documentor-owned) ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-[[ "$VER" == "3.5.26" ]] && pass "VERSION still 3.5.26" || fail "VERSION=$VER (expected 3.5.26)"
-if [[ -f "$ROOT/VERSION" ]]; then
-  VFILE=$(tr -d ' \n' < "$ROOT/VERSION" || true)
-  [[ -z "$VFILE" || "$VFILE" == "3.5.26" ]] && pass "VERSION file ok" || fail "VERSION file=$VFILE"
+[[ -n "$VER" ]] && pass "VERSION=$VER" || fail "VERSION missing"
+
+echo "=== H: service setter hard-error (no new writes) ==="
+if grep -A8 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q '_db_apply'; then
+  fail "db_set_service_outbound_mieru still writes via _db_apply"
 else
-  pass "no VERSION file (ok)"
+  pass "setter has no _db_apply write path"
 fi
+if grep -A6 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q 'return 1'; then
+  pass "setter returns 1"
+else
+  fail "setter missing return 1"
+fi
+if grep -A5 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q '已移除'; then
+  pass "setter hard-error message"
+else
+  fail "setter missing hard-error message"
+fi
+# comment: migration-only get/clear
+if grep -q 'migration-only get/clear' "$SCRIPT"; then
+  pass "migration-only get/clear comment"
+else
+  fail "stale service comment"
+fi
+if grep -q 'Kept until Implementer rewires callers' "$SCRIPT"; then
+  fail "stale Implementer-rewire comment still present"
+else
+  pass "stale Implementer-rewire comment gone"
+fi
+TMPH=$(mktemp -d)
+HARNESS=$(_load_db_harness "$TMPH")
+echo '{}' > "$TMPH/db.json"
+if bash -c "source '$HARNESS'; db_set_service_outbound_mieru direct"; then
+  fail "setter unexpectedly succeeded"
+else
+  pass "runtime setter call fails"
+fi
+# must not create service_outbound.mieru
+has=$(jq -r '(.service_outbound // {}) | has("mieru")' "$TMPH/db.json")
+[[ "$has" == "false" ]] && pass "setter did not write service field" || fail "service field written"
+rm -f "$HARNESS"
+rm -rf "$TMPH"
 
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

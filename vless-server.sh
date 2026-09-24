@@ -486,35 +486,24 @@ db_list_instances_using_outbound() {
     ' "$DB_FILE" 2>/dev/null
 }
 
-# Mieru 服务级出口 (.service_outbound.mieru) — TEMPORARY for migration / unmigrated DBs.
+# Mieru legacy .service_outbound.mieru — migration-only get/clear (v3.5.27).
 # FINAL model: per-instance .xray.mieru[].instance_outbound (see db_migrate_mieru_service_outbound_to_instances).
-# Migration removes .service_outbound.mieru; do not persist literal inherit. Kept until Implementer rewires callers.
+# Do not persist new service values; setter is a hard error. Never store literal inherit.
 # 用法: db_get_service_outbound_mieru
 db_get_service_outbound_mieru() {
     [[ ! -f "$DB_FILE" ]] && return 1
     jq -r '.service_outbound.mieru // empty' "$DB_FILE" 2>/dev/null
 }
 
-# 用法: db_set_service_outbound_mieru "direct|warp|chain:x|balancer:g"
-# 空/inherit/null → 清除. FINAL model writes instance_outbound instead.
+# REMOVED as writable API (FINAL model). Hard-error stub so accidental callers cannot reintroduce the field.
+# 用法: db_set_service_outbound_mieru — always fails; use db_set_instance_outbound instead.
 db_set_service_outbound_mieru() {
-    local value="${1:-}"
-    [[ ! -f "$DB_FILE" ]] && return 1
-    if [[ -z "$value" || "$value" == "inherit" || "$value" == "null" ]]; then
-        db_clear_service_outbound_mieru
-        return $?
-    fi
-    case "$value" in
-        direct|warp|chain:*|balancer:*) ;;
-        *) _err "无效 Mieru 服务出口: $value"; return 1 ;;
-    esac
-    _db_apply --arg v "$value" '
-        .service_outbound = ((.service_outbound // {}) + {mieru: $v})
-    '
+    _err "db_set_service_outbound_mieru 已移除：请使用 db_set_instance_outbound（per-instance）"
+    return 1
 }
 
 # 用法: db_clear_service_outbound_mieru
-# FINAL model: field removed by migration; clear remains no-op-safe for unmigrated DBs / delete guards.
+# Migration / delete-guard only; no-op-safe when field already absent.
 db_clear_service_outbound_mieru() {
     [[ ! -f "$DB_FILE" ]] && return 1
     _db_apply '
