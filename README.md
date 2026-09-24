@@ -15,11 +15,12 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
 - **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create); opt-in legacy cleanup only (`cleanup_legacy_ssh_tunnel`); never stop/disable system sshd
+- **v3.5.27:** Mieru **per-instance** runtime + outbound — each port/`portRange` = one mita (own JSON/UDS/unit/metrics under `/var/lib/vless-mieru/<slug>`); DB `.xray.mieru[].instance_outbound` (empty/missing=inherit; never store `inherit`); **no** `.service_outbound.mieru` in final model (fail-closed migrate on menu start); 实例出口管理 lists mieru like Xray (no「Mieru（全部实例）」)
 - **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
 - **v3.5.23:** per-instance Xray outbound (`instance_outbound`); menu 实例出口管理; inherit global by default; priority user > instance > global; Xray shared-core only
 - **Smart apply (v3.5.24):** regenerating proxy configs validates first, then restarts Xray / Sing-box / mieru only when the live config actually changed (`VLESS_SMART_APPLY=0` restores always-restart)
-- **v3.5.25:** Mieru **service-wide** outbound (not per-port) in 实例出口管理 as one row「Mieru（全部实例）」; DB `.service_outbound.mieru`; empty/missing=inherit global; priority service override > global > default; fail-closed; smart-apply via `_regenerate_proxy_configs all`
+- **v3.5.25:** Mieru service-wide outbound (`.service_outbound.mieru` +「Mieru（全部实例）」) — **superseded by v3.5.27**
 
 ## Quick Install
 
@@ -27,7 +28,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.26**
+Current script version: **v3.5.27**
 
 ## Sing-box custom build for traffic stats
 
