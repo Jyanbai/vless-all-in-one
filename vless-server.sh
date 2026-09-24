@@ -494,14 +494,53 @@ db_list_instances_using_outbound() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# v3.5.28 Routing profiles (.routing_profiles[]) + Telegram DC matchers
-# Missing keys ⇒ identical to 3.5.27 (no migrate). fallback fixed to inherit.
-# profile:<id> is instance_outbound vocab; compile is Implementer's job.
+# v3.5.28/3.5.29 Routing profiles (.routing_profiles[]) + Telegram DC matchers
+# Missing keys ⇒ identical to 3.5.27. fallback fixed to inherit.
+# profile:<id> is instance_outbound vocab only (NOT rule outbound; no nested profiles).
+# v3.5.29: templates (not auto-seed profiles) + db_migrate_routing_profiles_v3529.
 #═══════════════════════════════════════════════════════════════════════════════
 
 # Stable id: [a-z0-9][a-z0-9_-]{0,63}
 _db_routing_profile_id_ok() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]
+}
+
+# Profile/global RULE outbound vocab: direct|warp|block|reject|chain:*|balancer:*
+# instance_outbound MAY use profile:<id>; rule outbounds MUST NOT (no nested profiles).
+# 用法: _db_routing_rule_outbound_ok "direct"
+_db_routing_rule_outbound_ok() {
+    local outbound="$1"
+    case "$outbound" in
+        direct|warp|block|reject|chain:*|balancer:*) return 0 ;;
+        profile:*)
+            _err "规则出口不能嵌套规则集: $outbound"
+            return 1
+            ;;
+        "")
+            _err "规则出口不能为空"
+            return 1
+            ;;
+        *)
+            _err "规则出口无效: $outbound"
+            return 1
+            ;;
+    esac
+}
+
+# Validate every rule.outbound in a JSON rules array (fail closed).
+# 用法: _db_routing_rules_outbounds_ok '[{...}]'
+_db_routing_rules_outbounds_ok() {
+    local rules_json="$1"
+    local outs o
+    outs=$(echo "$rules_json" | jq -r '.[]? | .outbound // empty' 2>/dev/null) || {
+        _err "规则数组无法解析"
+        return 1
+    }
+    while IFS= read -r o; do
+        [[ -z "$o" ]] && continue
+        _db_routing_rule_outbound_ok "$o" || return 1
+    done <<< "$outs"
+    return 0
 }
 
 # 用法: db_routing_profile_exists "home"
@@ -539,6 +578,7 @@ db_add_routing_profile() {
         _err "db_add_routing_profile: rules 必须是 JSON 数组"
         return 1
     fi
+    _db_routing_rules_outbounds_ok "$rules_json" || return 1
     [[ ! -f "$DB_FILE" ]] && init_db
     if db_routing_profile_exists "$id"; then
         _err "分流规则集已存在: $id"
@@ -565,6 +605,7 @@ db_update_routing_profile() {
             _err "db_update_routing_profile: rules 必须是 JSON 数组"
             return 1
         fi
+        _db_routing_rules_outbounds_ok "$rules_json" || return 1
         _db_apply --arg id "$id" --arg name "$name" --argjson rules "$rules_json" '
             .routing_profiles = ((.routing_profiles // []) | map(
                 if .id == $id then .name = $name | .fallback = "inherit" | .rules = $rules else . end
@@ -636,6 +677,7 @@ db_set_routing_profile_rules() {
         _err "db_set_routing_profile_rules: rules 必须是 JSON 数组"
         return 1
     fi
+    _db_routing_rules_outbounds_ok "$rules_json" || return 1
     _db_apply --arg id "$id" --argjson rules "$rules_json" '
         .routing_profiles = ((.routing_profiles // []) | map(
             if .id == $id then .rules = $rules | .fallback = "inherit" else . end
@@ -653,6 +695,9 @@ db_add_routing_profile_rule() {
         _err "db_add_routing_profile_rule: rule 必须是 JSON 对象"
         return 1
     fi
+    local ob
+    ob=$(echo "$rule_json" | jq -r '.outbound // empty' 2>/dev/null || true)
+    _db_routing_rule_outbound_ok "$ob" || return 1
     _db_apply --arg id "$id" --argjson rule "$rule_json" '
         .routing_profiles = ((.routing_profiles // []) | map(
             if .id == $id then .rules = ((.rules // []) + [$rule]) else . end
@@ -713,8 +758,70 @@ db_seed_telegram_dc_matchers_if_absent() {
     db_set_telegram_dc_matchers "$seed"
 }
 
+#── Template helpers (matchers only; do NOT write profiles to DB) ──────────────
+# Optional outbound arg (default direct) so wizard can inject a chosen outbound.
+# Priority note for wizard/combined: finance_crypto & telegram_dc ABOVE ai_media.
+# DIRECT does not reorder. fallback always inherit (profile-level, not in templates).
+
+# 用法: db_routing_template_rules_finance_crypto [outbound]
+db_routing_template_rules_finance_crypto() {
+    local outbound="${1:-direct}"
+    jq -n --arg out "$outbound" '[
+        {id:"fc_crypto", type:"custom", domains:"geosite:category-cryptocurrency", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"fc_bank", type:"custom", domains:"geosite:category-bank-cn,geosite:category-finance", outbound:$out, ip_version:"prefer_ipv4"}
+    ]'
+}
+
+# 用法: db_routing_template_rules_telegram_dc [outbound]
+# type=telegram_dc → compile expands matchers; plus geosite:telegram fallback (NOT geoip:telegram)
+db_routing_template_rules_telegram_dc() {
+    local outbound="${1:-direct}"
+    jq -n --arg out "$outbound" '[
+        {id:"tg_dc", type:"telegram_dc", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"tg_fallback", type:"custom", domains:"geosite:telegram", outbound:$out, ip_version:"prefer_ipv4"}
+    ]'
+}
+
+# 用法: db_routing_template_rules_ai_media [outbound]
+db_routing_template_rules_ai_media() {
+    local outbound="${1:-direct}"
+    jq -n --arg out "$outbound" '[
+        {id:"ai_intl", type:"custom", domains:"geosite:category-ai-!cn,geosite:openai", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"media", type:"custom", domains:"geosite:netflix,geosite:disney,geosite:youtube,geosite:spotify,geosite:tiktok", outbound:$out, ip_version:"prefer_ipv4"}
+    ]'
+}
+
+# 用法: db_routing_template_rules "finance_crypto|telegram_dc|ai_media" [outbound]
+db_routing_template_rules() {
+    local kind="$1" outbound="${2:-direct}"
+    case "$kind" in
+        finance_crypto) db_routing_template_rules_finance_crypto "$outbound" ;;
+        telegram_dc)    db_routing_template_rules_telegram_dc "$outbound" ;;
+        ai_media)       db_routing_template_rules_ai_media "$outbound" ;;
+        *)
+            _err "未知规则模板: $kind"
+            return 1
+            ;;
+    esac
+}
+
+# Canonical compare: profile rules == exact v3.5.28 seed (outbound=direct).
+# 用法: _db_routing_profile_rules_exact_seed "finance_crypto"
+_db_routing_profile_rules_exact_seed() {
+    local id="$1"
+    local cur seed
+    cur=$(db_get_routing_profile_rules "$id" 2>/dev/null) || return 1
+    seed=$(db_routing_template_rules "$id" "direct" 2>/dev/null) || return 1
+    # Normalize via jq -c (stable field order from templates/seed)
+    local a b
+    a=$(echo "$cur" | jq -c '.') || return 1
+    b=$(echo "$seed" | jq -c '.') || return 1
+    [[ "$a" == "$b" ]]
+}
+
 # 用法: db_ensure_routing_profiles_defaults
-# Ensure array + telegram matchers; seed built-ins once (finance_crypto, telegram_dc, ai_media).
+# Ensure .routing_profiles is an array + telegram matchers.
+# Does NOT auto-create profiles finance_crypto / telegram_dc / ai_media (templates only).
 # Priority note for wizard/combined: finance_crypto & telegram_dc ABOVE ai_media.
 # DIRECT does not reorder. fallback always inherit.
 db_ensure_routing_profiles_defaults() {
@@ -723,28 +830,220 @@ db_ensure_routing_profiles_defaults() {
         if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
     '
     db_seed_telegram_dc_matchers_if_absent
-
-    # Seed order = priority for combined/wizard defaults
-    if ! db_routing_profile_exists "finance_crypto" 2>/dev/null; then
-        db_add_routing_profile "finance_crypto" "金融/加密" "$(jq -n '[
-            {id:"fc_crypto", type:"custom", domains:"geosite:category-cryptocurrency", outbound:"direct", ip_version:"prefer_ipv4"},
-            {id:"fc_bank", type:"custom", domains:"geosite:category-bank-cn,geosite:category-finance", outbound:"direct", ip_version:"prefer_ipv4"}
-        ]')" || true
-    fi
-    if ! db_routing_profile_exists "telegram_dc" 2>/dev/null; then
-        # type=telegram_dc → compile expands matchers; plus geosite:telegram fallback (NOT geoip:telegram)
-        db_add_routing_profile "telegram_dc" "Telegram DC" "$(jq -n '[
-            {id:"tg_dc", type:"telegram_dc", outbound:"direct", ip_version:"prefer_ipv4"},
-            {id:"tg_fallback", type:"custom", domains:"geosite:telegram", outbound:"direct", ip_version:"prefer_ipv4"}
-        ]')" || true
-    fi
-    if ! db_routing_profile_exists "ai_media" 2>/dev/null; then
-        db_add_routing_profile "ai_media" "AI/流媒体" "$(jq -n '[
-            {id:"ai_intl", type:"custom", domains:"geosite:category-ai-!cn,geosite:openai", outbound:"direct", ip_version:"prefer_ipv4"},
-            {id:"media", type:"custom", domains:"geosite:netflix,geosite:disney,geosite:youtube,geosite:spotify,geosite:tiktok", outbound:"direct", ip_version:"prefer_ipv4"}
-        ]')" || true
-    fi
 }
+
+# Scan all profile rules for illegal nested outbound profile:*.
+# 返回: 0 无嵌套; 1 发现嵌套（打印 profile_id|rule_id|outbound）
+# 用法: db_audit_routing_profiles_nested
+db_audit_routing_profiles_nested() {
+    [[ ! -f "$DB_FILE" ]] && return 0
+    local hits
+    hits=$(jq -r '
+        [.routing_profiles[]? | .id as $pid | (.rules // [])[]? |
+         select((.outbound // "") | startswith("profile:")) |
+         "\($pid)|\(.id // "?")|\(.outbound)"] | .[]
+    ' "$DB_FILE" 2>/dev/null || true)
+    if [[ -z "$hits" ]]; then
+        return 0
+    fi
+    echo "$hits"
+    return 1
+}
+
+# Remove rules whose outbound is profile:* (fail-closed). Snapshot+restore on apply failure.
+# Prefer strip illegal rules; never leave nested profile:* in rules.
+# 返回: 0 已清理或无需; 1 失败（已恢复快照）
+# 用法: db_repair_routing_profiles_nested
+db_repair_routing_profiles_nested() {
+    [[ ! -f "$DB_FILE" ]] && return 0
+
+    if db_audit_routing_profiles_nested >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local snap
+    snap="${DB_FILE}.mig-rp-nested.$$"
+    if ! cp -p "$DB_FILE" "$snap"; then
+        _err "规则集嵌套修复: 无法创建快照"
+        return 1
+    fi
+
+    if ! _db_apply '
+        .routing_profiles = ((.routing_profiles // []) | map(
+            .rules = ((.rules // []) | map(select((.outbound // "") | startswith("profile:") | not)))
+        ))
+    '; then
+        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+        rm -f "$snap"
+        _err "规则集嵌套修复: 写入失败（已恢复）"
+        return 1
+    fi
+
+    if ! db_audit_routing_profiles_nested >/dev/null 2>&1; then
+        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+        rm -f "$snap"
+        _err "规则集嵌套修复: 清理后仍有嵌套（已恢复）"
+        return 1
+    fi
+
+    rm -f "$snap"
+    return 0
+}
+
+# Internal: delete built-in seed profile only if unused AND rules still exact seed.
+# KEEP if referenced by instance_outbound OR rules modified.
+# 用法: _db_migrate_drop_unused_exact_seed_profile "finance_crypto"
+_db_migrate_drop_unused_exact_seed_profile() {
+    local id="$1"
+    db_routing_profile_exists "$id" 2>/dev/null || return 0
+    local users
+    users=$(db_list_instances_using_profile "$id" 2>/dev/null || true)
+    if [[ -n "$users" ]]; then
+        # used → keep as user profile
+        return 0
+    fi
+    if ! _db_routing_profile_rules_exact_seed "$id"; then
+        # modified → keep
+        return 0
+    fi
+    # unused + exact seed → delete (bypass delete helper's users check already empty)
+    _db_apply --arg id "$id" '
+        .routing_profiles = ((.routing_profiles // []) | map(select(.id != $id)))
+    ' || return 1
+    return 0
+}
+
+# Rewrite all xray instance_outbound values old→new (profile: home_broadband→home).
+# 用法: _db_rewrite_instance_outbound_value "profile:home_broadband" "profile:home"
+_db_rewrite_instance_outbound_value() {
+    local old="$1" new="$2"
+    [[ -z "$old" || -z "$new" || "$old" == "$new" ]] && return 1
+    _db_apply --arg old "$old" --arg new "$new" '
+        if .xray then
+            .xray = (
+              .xray | with_entries(
+                .value |= (
+                  if type == "array" then
+                    map(if (.instance_outbound // "") == $old then .instance_outbound = $new else . end)
+                  elif type == "object" and ((.instance_outbound // "") == $old) then
+                    .instance_outbound = $new
+                  else . end
+                )
+              )
+            )
+          else . end
+    '
+}
+
+# v3.5.29: retire auto-seeded finance/tg/ai profiles; rename legacy home_broadband→home;
+# strip nested profile:* rule outbounds. Fail-closed with snap restore.
+# Does NOT create home / direct_backup (Implementer/wizard owns creation).
+# A/B/C: delete finance_crypto/telegram_dc/ai_media only if unused AND exact seed; else keep.
+# Legacy: home_broadband→home when home absent; if home exists leave home_broadband.
+# 用法: db_migrate_routing_profiles_v3529
+# 返回: 0 成功/无需; 1 失败（已恢复快照）
+db_migrate_routing_profiles_v3529() {
+    [[ ! -f "$DB_FILE" ]] && return 0
+
+    local snap
+    snap="${DB_FILE}.mig-rp-v3529.$$"
+    if ! cp -p "$DB_FILE" "$snap"; then
+        _err "分流规则集迁移: 无法创建快照"
+        return 1
+    fi
+
+    # Ensure array exists (no profile auto-create)
+    if ! _db_apply '
+        if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
+    '; then
+        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+        rm -f "$snap"
+        _err "分流规则集迁移: 初始化 routing_profiles 失败（已恢复）"
+        return 1
+    fi
+
+    # A/B/C — drop unused exact seeds
+    local _seed_id
+    for _seed_id in finance_crypto telegram_dc ai_media; do
+        if ! _db_migrate_drop_unused_exact_seed_profile "$_seed_id"; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "分流规则集迁移: 清理 $_seed_id 失败（已恢复）"
+            return 1
+        fi
+    done
+
+    # Legacy home_broadband → home
+    if db_routing_profile_exists "home_broadband" 2>/dev/null; then
+        if db_routing_profile_exists "home" 2>/dev/null; then
+            # do not clobber; leave home_broadband safely
+            :
+        else
+            # rename id via jq; set name to 家宽 if old wizard name
+            if ! _db_apply '
+                .routing_profiles = ((.routing_profiles // []) | map(
+                    if .id == "home_broadband" then
+                        .id = "home"
+                        | .name = (if .name == "家宽+直出备用" then "家宽" else .name end)
+                        | .fallback = "inherit"
+                    else . end
+                ))
+            '; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "分流规则集迁移: home_broadband→home 重命名失败（已恢复）"
+                return 1
+            fi
+            if ! db_routing_profile_exists "home" 2>/dev/null; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "分流规则集迁移: 重命名后 home 不存在（已恢复）"
+                return 1
+            fi
+            if db_routing_profile_exists "home_broadband" 2>/dev/null; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "分流规则集迁移: 重命名后 home_broadband 仍在（已恢复）"
+                return 1
+            fi
+            if ! _db_rewrite_instance_outbound_value "profile:home_broadband" "profile:home"; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "分流规则集迁移: 重写 instance_outbound 失败（已恢复）"
+                return 1
+            fi
+            # verify no leftover refs
+            local still
+            still=$(db_list_instances_using_outbound "profile:home_broadband" 2>/dev/null || true)
+            if [[ -n "$still" ]]; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "分流规则集迁移: 仍有 profile:home_broadband 引用（已恢复）"
+                return 1
+            fi
+        fi
+    fi
+
+    # Nested profile:* audit + repair (fail closed)
+    if ! db_audit_routing_profiles_nested >/dev/null 2>&1; then
+        if ! db_repair_routing_profiles_nested; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "分流规则集迁移: 嵌套规则修复失败（已恢复）"
+            return 1
+        fi
+        if ! db_audit_routing_profiles_nested >/dev/null 2>&1; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "分流规则集迁移: 嵌套规则仍存在（已恢复）"
+            return 1
+        fi
+    fi
+
+    rm -f "$snap"
+    return 0
+}
+
 
 # Mieru legacy .service_outbound.mieru — migration-only get/clear (v3.5.27).
 # FINAL model: per-instance .xray.mieru[].instance_outbound (see db_migrate_mieru_service_outbound_to_instances).
@@ -18834,10 +19133,17 @@ declare -A ROUTING_PRESET_NAMES=(
 # 规则优先级：直连规则 > custom > 预设规则 > all（全局）
 db_add_routing_rule() {
     local rule_type="$1"    # openai, netflix, custom, all
-    local outbound="$2"     # 出口标识: direct, warp, chain:节点名
+    local outbound="$2"     # 出口标识: direct, warp, chain:节点名（禁止 profile:*）
     local domains="$3"      # 自定义域名 (仅 custom 类型)
     
     [[ ! -f "$DB_FILE" ]] && init_db
+
+    # 规则出口禁止嵌套规则集（instance_outbound 才允许 profile:<id>）
+    if declare -F _db_routing_rule_outbound_ok >/dev/null 2>&1; then
+        _db_routing_rule_outbound_ok "$outbound" || return 1
+    else
+        case "$outbound" in profile:*) _err "规则出口不能嵌套规则集: $outbound"; return 1 ;; esac
+    fi
 
     # 获取 IP 版本选项 (第4个参数)
     local ip_version="${4:-prefer_ipv4}"
@@ -35084,6 +35390,11 @@ main_menu() {
     # v3.5.27 mieru outbound migrate: .service_outbound.mieru → per-instance instance_outbound (fail-closed)
     if ! db_migrate_mieru_service_outbound_to_instances; then
         _err "Mieru 出口迁移失败（数据库已恢复）；拒绝继续以免破坏出口配置"
+        exit 1
+    fi
+    # v3.5.29 routing profiles migrate: retire seed profiles / home_broadband→home / nested strip (fail-closed)
+    if ! db_migrate_routing_profiles_v3529; then
+        _err "分流规则集迁移失败（数据库已恢复）；拒绝继续以免破坏分流配置"
         exit 1
     fi
     ensure_singbox_runtime_consistency 2>/dev/null || true
