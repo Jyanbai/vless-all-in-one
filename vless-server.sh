@@ -472,13 +472,16 @@ db_list_instances_using_outbound() {
     local target="$1"
     [[ ! -f "$DB_FILE" || -z "$target" ]] && return 0
     jq -r --arg t "$target" '
+        def port_key:
+            if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+            else ((.port_range // .portRange // "")|tostring) end;
         .xray // {} | to_entries[] | .key as $proto | .value |
         if type == "array" then
             .[] | select((.instance_outbound // "") == $t) |
-            "xray|\($proto)|\(.port // .port_range // "")|\(.instance_outbound)"
+            "xray|\($proto)|\(port_key)|\(.instance_outbound)"
         else
             select((.instance_outbound // "") == $t) |
-            "xray|\($proto)|\(.port // .port_range // "")|\(.instance_outbound)"
+            "xray|\($proto)|\(port_key)|\(.instance_outbound)"
         end
     ' "$DB_FILE" 2>/dev/null
 }
@@ -3960,7 +3963,7 @@ _limited_change_begin() {
     _limited_change_protocol="$protocol"
     case "$protocol" in
         vless-finalmask) config_file="$CFG/config.json"; _limited_change_service="vless-reality" ;;
-        mieru) config_file="$CFG/mieru.json"; _limited_change_service="vless-mieru" ;;
+        mieru) config_file="$CFG/mieru"; _limited_change_service="mieru-multi" ;;
         *) _limited_change_commit; return 1 ;;
     esac
     if [[ -f "$DB_FILE" ]]; then
@@ -3968,12 +3971,25 @@ _limited_change_begin() {
     else
         : > "$_limited_change_dir/db.missing"
     fi
-    if [[ -f "$config_file" ]]; then
+    if [[ -d "$config_file" ]]; then
+        mkdir -p "$_limited_change_dir/runtime.dir" || { _limited_change_commit; return 1; }
+        cp -a "$config_file/." "$_limited_change_dir/runtime.dir/" || { _limited_change_commit; return 1; }
+    elif [[ -f "$config_file" ]]; then
         cp -p "$config_file" "$_limited_change_dir/runtime.json" || { _limited_change_commit; return 1; }
     else
         : > "$_limited_change_dir/runtime.missing"
     fi
-    svc status "$_limited_change_service" >/dev/null 2>&1 && _limited_change_was_running=true || _limited_change_was_running=false
+    if [[ "$_limited_change_service" == "mieru-multi" ]]; then
+        _limited_change_was_running=false
+        local _k _s
+        while IFS= read -r _k; do
+            [[ -z "$_k" ]] && continue
+            _s=$(_mieru_instance_svc_name "$_k") || continue
+            if svc status "$_s" >/dev/null 2>&1; then _limited_change_was_running=true; break; fi
+        done < <(_mieru_list_instance_keys 2>/dev/null)
+    else
+        svc status "$_limited_change_service" >/dev/null 2>&1 && _limited_change_was_running=true || _limited_change_was_running=false
+    fi
 }
 
 _limited_change_commit() {
@@ -3994,7 +4010,7 @@ _limited_change_rollback() {
     [[ -n "$dir" && -d "$dir" ]] || return 0
     case "$_limited_change_protocol" in
         vless-finalmask) config_file="$CFG/config.json" ;;
-        mieru) config_file="$CFG/mieru.json" ;;
+        mieru) config_file="$CFG/mieru" ;;
         *) return 1 ;;
     esac
 
@@ -4003,13 +4019,29 @@ _limited_change_rollback() {
     else
         rm -f "$DB_FILE"
     fi
-    if [[ -f "$dir/runtime.json" ]]; then
+    if [[ -d "$dir/runtime.dir" ]]; then
+        mkdir -p "$config_file"
+        rm -rf "${config_file:?}/"*
+        cp -a "$dir/runtime.dir/." "$config_file/" || return 1
+    elif [[ -f "$dir/runtime.json" ]]; then
         cp -p "$dir/runtime.json" "$config_file" || return 1
     else
-        rm -f "$config_file"
+        rm -rf "$config_file"
     fi
 
-    if [[ "$_limited_change_was_running" == "true" ]]; then
+    if [[ "$_limited_change_service" == "mieru-multi" ]]; then
+        if [[ "$_limited_change_was_running" == "true" ]]; then
+            local _k _s
+            while IFS= read -r _k; do
+                [[ -z "$_k" ]] && continue
+                _s=$(_mieru_instance_svc_name "$_k") || continue
+                svc restart "$_s" >/dev/null 2>&1 || svc start "$_s" >/dev/null 2>&1 || {
+                    _err "旧配置已恢复，但 $_s 服务恢复失败"
+                    service_ok=false
+                }
+            done < <(_mieru_list_instance_keys 2>/dev/null)
+        fi
+    elif [[ "$_limited_change_was_running" == "true" ]]; then
         svc restart "$_limited_change_service" >/dev/null 2>&1 || svc start "$_limited_change_service" >/dev/null 2>&1 || {
             _err "旧配置已恢复，但 $_limited_change_service 服务恢复失败"
             service_ok=false
@@ -5306,23 +5338,31 @@ _maybe_refresh_mieru_chain_after_import() {
 # 是否需要任一 Xray SOCKS 桥（非 socks 节点或 routing-fallback）
 _mieru_chain_needs_xray_bridge() {
     db_exists "xray" "mieru" || return 1
-    local svc_ob=""
-    svc_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
-    if [[ -n "$svc_ob" ]] || _mieru_needs_multi_egress; then
-        local plan
-        plan=$(_mieru_compile_egress_plan 2>/dev/null) || return 1
-        echo "$plan" | jq -e '(.bridges | length) > 0' >/dev/null 2>&1
-        return $?
+    local key plan inst_ob
+    # Any instance with explicit outbound that needs a bridge, or global multi-egress
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        inst_ob=$(db_get_instance_outbound "xray" "mieru" "$key" 2>/dev/null || true)
+        if [[ -n "$inst_ob" ]] || _mieru_needs_multi_egress; then
+            plan=$(_mieru_compile_egress_plan "$key" 2>/dev/null) || continue
+            if echo "$plan" | jq -e '(.bridges | length) > 0' >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done < <(_mieru_list_instance_keys)
+    # Legacy single-chain inference (no per-instance override)
+    if ! _mieru_needs_multi_egress; then
+        local name node type
+        name=$(_mieru_chain_node_name) || return 1
+        node=$(db_get_chain_node "$name") || return 1
+        type=$(echo "$node" | jq -r '.type // empty')
+        case "$type" in
+            socks|socks5) return 1 ;;
+            "") return 1 ;;
+            *) return 0 ;;
+        esac
     fi
-    local name node type
-    name=$(_mieru_chain_node_name) || return 1
-    node=$(db_get_chain_node "$name") || return 1
-    type=$(echo "$node" | jq -r '.type // empty')
-    case "$type" in
-        socks|socks5) return 1 ;;
-        "") return 1 ;;
-        *) return 0 ;;
-    esac
+    return 1
 }
 
 _ensure_mieru_xray_adapter() {
@@ -5377,9 +5417,10 @@ _mieru_resolve_proxy_endpoint() {
 # { mode:"legacy"|"multi", proxies:[], rules:[], bridges:[{name,port,tag,inbound}],
 #   allowLoopbackIP:bool, fallback_rules:[], legacy_name:"" }
 _mieru_compile_service_override_plan() {
-    # 显式 Mieru 服务出口 → 单一 egress plan；缺目标 fail-closed（不静默 DIRECT）
+    # 显式 Mieru 实例出口 → 单一 egress plan；缺目标 fail-closed（不静默 DIRECT）
+    # $1=routing vocab; $2=socks base port for this instance
     local routing="$1"
-    local port="${MIERU_CHAIN_SOCKS_PORT:-40100}"
+    local port="${2:-${MIERU_CHAIN_SOCKS_PORT:-40100}}"
     local node_name group_name warp_st _ep_raw host user pass proxy_name kind val needs_br
     local proxies='[]' erules='[]' bridges='[]' allow_loop=false
 
@@ -5396,38 +5437,45 @@ _mieru_compile_service_override_plan() {
             warp_st=$(warp_status 2>/dev/null || true)
             case "$warp_st" in
                 configured|connected|registered) ;;
-                *) _err "Mieru 服务出口需要 WARP 但未就绪（fail-closed）"; return 1 ;;
+                *) _err "Mieru 实例出口需要 WARP 但未就绪（fail-closed）"; return 1 ;;
             esac
             allow_loop=true
             proxies=$(jq -n --argjson port "$port" '[{
-                name:"proxy-svc-warp", protocol:"SOCKS5_PROXY_PROTOCOL",
+                name:"proxy-inst-warp", protocol:"SOCKS5_PROXY_PROTOCOL",
                 host:"127.0.0.1", port:$port
             }]')
             erules=$(jq -n '[
                 {ipRanges:["127.0.0.1/32"], action:"DIRECT"},
-                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-svc-warp"]}
+                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-inst-warp"]}
             ]')
-            bridges=$(jq -n --argjson port "$port" '[{
-                name:"warp", port:$port, inbound:"mieru-bridge-svc-warp",
+            bridges=$(jq -n --argjson port "$port" --arg slug "warp" '[{
+                name:"warp", port:$port, inbound:("mieru-bridge-"+$slug+"-"+($port|tostring)),
                 tag:"warp-prefer-ipv4", kind:"warp"
             }]')
             ;;
         chain:*)
             node_name="${routing#chain:}"
             if ! db_chain_node_exists "$node_name" 2>/dev/null; then
-                _err "Mieru 服务出口链式节点不存在: $routing（fail-closed）"
+                _err "Mieru 实例出口链式节点不存在: $routing（fail-closed）"
                 return 1
             fi
+            # idx 0 relative to this instance's socks base
+            local node_idx=0
+            # _mieru_resolve_proxy_endpoint uses global base; pass absolute via env override
+            local _saved_base="${MIERU_CHAIN_SOCKS_PORT:-}"
+            MIERU_CHAIN_SOCKS_PORT="$port"
             if ! _ep_raw=$(_mieru_resolve_proxy_endpoint "$node_name" 0); then
-                _err "Mieru 服务出口链式节点不可用: $routing（fail-closed）"
+                [[ -n "$_saved_base" ]] && MIERU_CHAIN_SOCKS_PORT="$_saved_base" || unset MIERU_CHAIN_SOCKS_PORT
+                _err "Mieru 实例出口链式节点不可用: $routing（fail-closed）"
                 return 1
             fi
+            [[ -n "$_saved_base" ]] && MIERU_CHAIN_SOCKS_PORT="$_saved_base" || unset MIERU_CHAIN_SOCKS_PORT
             local _ep=()
             mapfile -t _ep <<< "$_ep_raw"
             host="${_ep[0]}"; port="${_ep[1]}"; user="${_ep[2]}"; pass="${_ep[3]}"
             proxy_name="${_ep[4]}"; kind="${_ep[5]}"; val="${_ep[6]}"; needs_br="${_ep[7]}"
             [[ -n "$host" && "$port" =~ ^[0-9]+$ && -n "$proxy_name" ]] || {
-                _err "Mieru 服务出口链式端点无效: $routing（fail-closed）"
+                _err "Mieru 实例出口链式端点无效: $routing（fail-closed）"
                 return 1
             }
             proxies=$(jq -n --arg name "$proxy_name" --arg host "$host" --argjson port "$port" \
@@ -5448,7 +5496,7 @@ _mieru_compile_service_override_plan() {
             if [[ "$needs_br" == "1" ]]; then
                 allow_loop=true
                 bridges=$(jq -n --arg name "$node_name" --argjson port "$port" --arg slug "$(_mieru_proxy_slug "$node_name")" '[
-                    {name:$name, port:$port, inbound:("mieru-bridge-"+$slug),
+                    {name:$name, port:$port, inbound:("mieru-bridge-"+$slug+"-"+($port|tostring)),
                      tag:("chain-"+$name+"-prefer-ipv4"), kind:"chain"}
                 ]')
             elif [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
@@ -5458,25 +5506,25 @@ _mieru_compile_service_override_plan() {
         balancer:*)
             group_name="${routing#balancer:}"
             if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
-                _err "Mieru 服务出口负载组不存在: $routing（fail-closed）"
+                _err "Mieru 实例出口负载组不存在: $routing（fail-closed）"
                 return 1
             fi
             allow_loop=true
             proxies=$(jq -n --argjson port "$port" '[{
-                name:"proxy-svc-balancer", protocol:"SOCKS5_PROXY_PROTOCOL",
+                name:"proxy-inst-balancer", protocol:"SOCKS5_PROXY_PROTOCOL",
                 host:"127.0.0.1", port:$port
             }]')
             erules=$(jq -n '[
                 {ipRanges:["127.0.0.1/32"], action:"DIRECT"},
-                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-svc-balancer"]}
+                {ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-inst-balancer"]}
             ]')
             bridges=$(jq -n --argjson port "$port" --arg g "$group_name" '[{
-                name:$g, port:$port, inbound:("mieru-bridge-svc-bal-"+$g),
+                name:$g, port:$port, inbound:("mieru-bridge-bal-"+$g+"-"+($port|tostring)),
                 tag:("balancer-"+$g), kind:"balancer"
             }]')
             ;;
         *)
-            _err "无效 Mieru 服务出口: $routing"
+            _err "无效 Mieru 实例出口: $routing"
             return 1
             ;;
     esac
@@ -5487,25 +5535,33 @@ _mieru_compile_service_override_plan() {
 }
 
 _mieru_compile_egress_plan() {
+    # $1=optional instance key (port|portRange). Explicit instance_outbound > global > default.
+    # Do NOT call db_get_service_outbound_mieru in this final path.
+    local inst_key="${1:-}"
     local rules proxies='[]' erules='[]' bridges='[]' allow_loop=false
     local fallback_rules='[]' seen_nodes='' node_idx=0
     local rule outbound action proxy_name host port user pass slug kind val needs_br
     local domains rule_type item domain_list ip_list hit_unsafe=0
     local -A node_port_map=()
     local -A node_proxy_map=()
-    local svc_ob=""
+    local inst_ob="" socks_base _saved_base="${MIERU_CHAIN_SOCKS_PORT:-}" _plan_out _rc
 
-    # 显式服务出口 > 全局 routing_rules > 默认
-    svc_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
-    if [[ -n "$svc_ob" ]]; then
-        _mieru_compile_service_override_plan "$svc_ob"
+    socks_base="${MIERU_CHAIN_SOCKS_PORT:-40100}"
+    if [[ -n "$inst_key" ]]; then
+        socks_base=$(_mieru_instance_socks_base "$inst_key")
+        inst_ob=$(db_get_instance_outbound "xray" "mieru" "$inst_key" 2>/dev/null || true)
+    fi
+    if [[ -n "$inst_ob" ]]; then
+        _mieru_compile_service_override_plan "$inst_ob" "$socks_base"
         return $?
     fi
 
+    MIERU_CHAIN_SOCKS_PORT="$socks_base"
     rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
     if ! _mieru_needs_multi_egress; then
         local legacy
         legacy=$(_infer_global_chain_node 2>/dev/null || true)
+        if [[ -n "$_saved_base" ]]; then MIERU_CHAIN_SOCKS_PORT="$_saved_base"; else unset MIERU_CHAIN_SOCKS_PORT 2>/dev/null || true; fi
         jq -n --arg n "${legacy:-}" '{mode:"legacy", legacy_name:$n, proxies:[], rules:[], bridges:[], allowLoopbackIP:false, fallback_rules:[]}'
         return 0
     fi
@@ -5544,7 +5600,7 @@ _mieru_compile_egress_plan() {
         if [[ "$needs_br" == "1" ]]; then
             allow_loop=true
             bridges=$(echo "$bridges" | jq -c --arg name "$node_name" --argjson port "$port" --arg slug "$(_mieru_proxy_slug "$node_name")" '
-                . + [{name:$name, port:$port, inbound:("mieru-bridge-"+$slug), tag:("chain-"+$name+"-prefer-ipv4")}]')
+                . + [{name:$name, port:$port, inbound:("mieru-bridge-"+$slug+"-"+($port|tostring)), tag:("chain-"+$name+"-prefer-ipv4")}]')
             node_idx=$((node_idx + 1))
         elif [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
             allow_loop=true
@@ -5646,12 +5702,19 @@ _mieru_compile_egress_plan() {
             . + [{ipRanges:["127.0.0.1/32"], action:"DIRECT"}]
              + [{ipRanges:["*"], domainNames:["*"], action:"PROXY", proxyNames:["proxy-routing-fallback"]}]')
         bridges=$(echo "$bridges" | jq -c --argjson port "$fb_port" '
-            . + [{name:"routing-fallback", port:$port, inbound:"mieru-routing-fallback", tag:"mieru-routing-fallback-out", fallback:true}]')
+            . + [{name:"routing-fallback", port:$port, inbound:("mieru-routing-fallback-"+($port|tostring)), tag:"mieru-routing-fallback-out", fallback:true}]')
     fi
 
+    _plan_out=$(
     jq -n --argjson proxies "$proxies" --argjson rules "$erules" --argjson bridges "$bridges" \
         --argjson fb "$fallback_rules" --argjson loop "$allow_loop" \
         '{mode:"multi", legacy_name:"", proxies:$proxies, rules:$rules, bridges:$bridges, allowLoopbackIP:$loop, fallback_rules:$fb}'
+
+    )
+    _rc=$?
+    if [[ -n "$_saved_base" ]]; then MIERU_CHAIN_SOCKS_PORT="$_saved_base"; else unset MIERU_CHAIN_SOCKS_PORT 2>/dev/null || true; fi
+    [[ $_rc -eq 0 ]] || return $_rc
+    printf '%s\n' "$_plan_out"
 }
 
 # 把 compile plan 的 egress 写入 candidate mieru.json
@@ -5734,10 +5797,12 @@ _mieru_strip_orphan_bridges() {
     local tmp
     tmp=$(mktemp) || return 1
     if jq '
-        .inbounds = [.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]
+        def is_mieru_bridge:
+            startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback" or startswith("mieru-routing-fallback-") or startswith("mieru-routing-fallback-");
+        .inbounds = [.inbounds[]? | select((.tag // "") | is_mieru_bridge | not)]
         | if .routing then . else . end
         | .routing.rules = ((.routing.rules // []) | map(select(
-            ((.inboundTag // []) | map(startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | any) | not
+            ((.inboundTag // []) | map(is_mieru_bridge) | any) | not
           )))
     ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$CFG/config.json"
@@ -5755,8 +5820,33 @@ _inject_mieru_chain_bridge() {
         _mieru_strip_orphan_bridges
         return 0
     fi
-    local plan bridges tmp
-    plan=$(_mieru_compile_egress_plan) || return 1
+    local plan bridges tmp key _p _merged='{"mode":"multi","bridges":[],"fallback_rules":[]}' _any_multi=0 _any_legacy=0
+    # Aggregate bridges across all mieru instances (unique ports/inbound tags)
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        _p=$(_mieru_compile_egress_plan "$key" 2>/dev/null) || continue
+        if [[ "$(echo "$_p" | jq -r '.mode')" == "multi" ]]; then
+            _any_multi=1
+            _merged=$(echo "$_merged" "$_p" | jq -s '
+                .[0] as $acc | .[1] as $p |
+                $acc * {
+                    bridges: (($acc.bridges // []) + ($p.bridges // []) | unique_by(.inbound // .port)),
+                    fallback_rules: (($acc.fallback_rules // []) + ($p.fallback_rules // []))
+                }
+            ')
+        else
+            _any_legacy=1
+            plan="$_p"
+        fi
+    done < <(_mieru_list_instance_keys)
+
+    if [[ "$_any_multi" == "1" ]]; then
+        plan="$_merged"
+    elif [[ "$_any_legacy" == "1" ]]; then
+        :
+    else
+        plan=$(_mieru_compile_egress_plan 2>/dev/null) || return 1
+    fi
 
     if [[ "$(echo "$plan" | jq -r '.mode')" != "multi" ]]; then
         # legacy 单桥
@@ -5771,7 +5861,7 @@ _inject_mieru_chain_bridge() {
         }')
         tmp=$(mktemp) || return 1
         if jq --argjson inbound "$inbound" --argjson outbound "$chain_out" --arg tag "$out_tag" '
-            .inbounds = (([.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]) + [$inbound])
+            .inbounds = (([.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback" or startswith("mieru-routing-fallback-")) | not)]) + [$inbound])
             | if ([.outbounds[]? | .tag] | index($tag)) then . else .outbounds = ((.outbounds // []) + [$outbound]) end
             | if .routing then . else .routing = {domainStrategy:"IPIfNonMatch", rules:[]} end
             | (.routing.rules // []) as $rules
@@ -5797,10 +5887,10 @@ _inject_mieru_chain_bridge() {
     # strip old mieru bridge inbounds/rules
     tmp=$(mktemp) || return 1
     jq '
-        .inbounds = [.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | not)]
+        .inbounds = [.inbounds[]? | select((.tag // "") | (startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback" or startswith("mieru-routing-fallback-")) | not)]
         | if .routing then . else .routing = {domainStrategy:"IPIfNonMatch", rules:[]} end
         | .routing.rules = ((.routing.rules // []) | map(select(
-            ((.inboundTag // []) | map(startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback") | any) | not
+            ((.inboundTag // []) | map(startswith("mieru-bridge-") or . == "mieru-chain-in" or . == "mieru-routing-fallback" or startswith("mieru-routing-fallback-")) | any) | not
           )))
     ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
 
@@ -6358,15 +6448,140 @@ _mieru_new_install_json() {
     echo "[$binding]"
 }
 
+
+#═══════════════════════════════════════════════════════════════════════════════
+# mieru per-instance runtime (v3.5.27)
+# One DB row (port OR portRange) == one mita process == own JSON + UDS + unit +
+# metrics state. portRange is ONE logical instance (not per-port inside range).
+# Layout:
+#   Config:  $CFG/mieru/<slug>.json
+#   UDS:     /run/mita/<slug>/mita.sock  (MITA_UDS_PATH)
+#   Unit:    vless-mieru-<slug>
+#   State:   /var/lib/vless-mieru/<slug>  bind-mounted onto /var/lib/mita
+#            (metrics.pb is hardcoded in mita — isolate via private mount)
+# SOCKS bridges: base MIERU_CHAIN_SOCKS_PORT + instance_index*32 + node_idx
+#═══════════════════════════════════════════════════════════════════════════════
+
+_mieru_instance_slug() {
+    local key="${1:-}"
+    [[ -n "$key" ]] || return 1
+    # filesystem / systemd-safe: keep alnum . _ - ; collapse others
+    local s
+    s=$(printf '%s' "$key" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+    [[ -n "$s" ]] || return 1
+    printf '%s\n' "$s"
+}
+
+_mieru_instance_config_path() {
+    local slug
+    slug=$(_mieru_instance_slug "$1") || return 1
+    printf '%s\n' "$CFG/mieru/${slug}.json"
+}
+
+_mieru_instance_svc_name() {
+    local slug
+    slug=$(_mieru_instance_slug "$1") || return 1
+    printf '%s\n' "vless-mieru-${slug}"
+}
+
+_mieru_instance_uds_path() {
+    local slug
+    slug=$(_mieru_instance_slug "$1") || return 1
+    printf '%s\n' "/run/mita/${slug}/mita.sock"
+}
+
+_mieru_instance_state_dir() {
+    local slug
+    slug=$(_mieru_instance_slug "$1") || return 1
+    printf '%s\n' "/var/lib/vless-mieru/${slug}"
+}
+
+# Stable 0-based index among sorted instance keys (for SOCKS bridge offset)
+_mieru_instance_index() {
+    local key="$1" i=0 k
+    while IFS= read -r k; do
+        [[ -z "$k" ]] && continue
+        if [[ "$k" == "$key" ]]; then
+            printf '%s\n' "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done < <(db_list_ports xray mieru 2>/dev/null | sort)
+    printf '0\n'
+}
+
+_mieru_instance_socks_base() {
+    local idx
+    idx=$(_mieru_instance_index "$1")
+    printf '%s\n' $(( ${MIERU_CHAIN_SOCKS_PORT:-40100} + idx * 32 ))
+}
+
+_mieru_list_instance_keys() {
+    db_list_ports xray mieru 2>/dev/null
+}
+
+# Ensure per-instance dirs exist (config parent + state + UDS parent)
+_mieru_prepare_instance_dirs() {
+    local key="$1" cfg_path state uds_dir
+    cfg_path=$(_mieru_instance_config_path "$key") || return 1
+    state=$(_mieru_instance_state_dir "$key") || return 1
+    uds_dir=$(dirname "$(_mieru_instance_uds_path "$key")")
+    mkdir -p "$(dirname "$cfg_path")" "$state" "$uds_dir" 2>/dev/null || true
+    chmod 755 "$(dirname "$cfg_path")" "$state" "$uds_dir" 2>/dev/null || true
+}
+
+# Retire legacy single-unit layout (vless-mieru + $CFG/mieru.json)
+
+_mieru_any_live_config_invalid() {
+    local key cfg
+    if [[ -s "$CFG/mieru.json" ]] && ! _mieru_validate_candidate "$CFG/mieru.json"; then
+        return 0
+    fi
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        cfg=$(_mieru_instance_config_path "$key") || continue
+        if [[ -s "$cfg" ]] && ! _mieru_validate_candidate "$cfg"; then
+            return 0
+        fi
+    done < <(_mieru_list_instance_keys 2>/dev/null)
+    return 1
+}
+
+_mieru_retire_legacy_unit() {
+    if [[ -f /etc/systemd/system/vless-mieru.service ]] || [[ -f /etc/init.d/vless-mieru ]]; then
+        svc stop vless-mieru 2>/dev/null || true
+        svc disable vless-mieru 2>/dev/null || true
+        if [[ "${DISTRO:-}" == "alpine" ]]; then
+            rm -f /etc/init.d/vless-mieru
+        else
+            rm -f /etc/systemd/system/vless-mieru.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+    # Keep legacy file only if no per-instance configs yet (first migrate)
+    :
+}
+
 _mieru_runtime_from_db() {
-    local cfg="$1" migrated rc
+    # $1=db cfg json (array/object); $2=optional instance key (port|portRange)
+    local cfg="$1" key="${2:-}" migrated rc
     migrated=$(_mieru_migrate_to_v2 "$cfg")
     rc=$?
     [[ $rc -eq 0 ]] || return "$rc"
-    local users settings
+    local users settings filtered
     users=$(echo "$migrated" | jq -c '.[0].users // []')
     users=$(_mieru_active_users_json "$users")
     settings=$(echo "$migrated" | jq -c '.[0].mieru_settings // {}')
+    if [[ -n "$key" ]]; then
+        filtered=$(echo "$migrated" | jq -c --arg k "$key" '
+            def port_key:
+                if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+                else ((.port_range // .portRange // "")|tostring) end;
+            map(select(port_key == $k))
+        ')
+        [[ "$(echo "$filtered" | jq 'length')" -gt 0 ]] || return 1
+        migrated="$filtered"
+    fi
     echo "$migrated" | jq -c --argjson users "$users" --argjson s "$settings" '
         def bind:
             (if .port != null and .port != "" then {port:(.port|tonumber), protocol:(.transport // "TCP")}
@@ -6494,67 +6709,89 @@ _mieru_share_server_fields() {
 
 # 从数据库重建 mita 运行时配置（v2：TCP/UDP、port|portRange、trafficPattern）
 generate_mieru_config() {
-    local cfg="" candidate=""
+    # Generate all mieru instances, or a single key if $1 given.
+    # Each instance → $CFG/mieru/<slug>.json ; legacy $CFG/mieru.json retired.
+    local only_key="${1:-}"
     if ! db_exists "xray" "mieru"; then
         _err "mieru 配置不存在"
         return 1
     fi
+    local cfg
     cfg=$(db_get "xray" "mieru")
     [[ -z "$cfg" || "$cfg" == "null" ]] && { _err "mieru 配置为空"; return 1; }
 
-    mkdir -p "$CFG"
-    candidate=$(mktemp "$CFG/.mieru.json.XXXXXX") || { _err "创建 mieru 候选配置失败"; return 1; }
-    local runtime rc
-    runtime=$(_mieru_runtime_from_db "$cfg")
-    rc=$?
-    if [[ $rc -eq 2 ]]; then
-        rm -f "$candidate"
-        _err "mieru 用户名冲突（同名不同密码），未改动运行配置"
-        return 1
+    mkdir -p "$CFG/mieru"
+    local keys key ok=0 fail=0
+    if [[ -n "$only_key" ]]; then
+        keys="$only_key"
+    else
+        keys=$(_mieru_list_instance_keys)
     fi
-    if [[ $rc -ne 0 ]] || ! printf '%s\n' "$runtime" | jq '.' > "$candidate"; then
-        rm -f "$candidate"
-        _err "生成 mieru.json 基础配置失败"
-        return 1
+    [[ -n "$keys" ]] || { _err "mieru 无实例"; return 1; }
+
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        _mieru_prepare_instance_dirs "$key" || { fail=$((fail+1)); continue; }
+        local candidate live runtime rc egress_plan
+        live=$(_mieru_instance_config_path "$key") || { fail=$((fail+1)); continue; }
+        candidate=$(mktemp "$CFG/mieru/.${key}.XXXXXX") || { _err "创建 mieru 候选配置失败"; fail=$((fail+1)); continue; }
+        runtime=$(_mieru_runtime_from_db "$cfg" "$key")
+        rc=$?
+        if [[ $rc -eq 2 ]]; then
+            rm -f "$candidate"
+            _err "mieru 用户名冲突（同名不同密码），未改动运行配置"
+            return 1
+        fi
+        if [[ $rc -ne 0 ]] || ! printf '%s\n' "$runtime" | jq '.' > "$candidate"; then
+            rm -f "$candidate"
+            _err "生成 mieru 实例 $key 基础配置失败"
+            fail=$((fail+1)); continue
+        fi
+        local has_ports has_users
+        has_ports=$(jq -r '(.portBindings // []) | length' "$candidate" 2>/dev/null)
+        has_users=$(jq -r '(.users // []) | length' "$candidate" 2>/dev/null)
+        if [[ -z "$has_ports" || "$has_ports" -le 0 || -z "$has_users" || "$has_users" -le 0 ]]; then
+            rm -f "$candidate"
+            _err "mieru 实例 $key 缺少有效端口或用户凭据"
+            fail=$((fail+1)); continue
+        fi
+        egress_plan=$(_mieru_compile_egress_plan "$key") || {
+            rm -f "$candidate"
+            _err "mieru 实例 $key egress 编译失败"
+            fail=$((fail+1)); continue
+        }
+        if ! _mieru_apply_egress_to_candidate "$candidate" "$egress_plan"; then
+            rm -f "$candidate"
+            fail=$((fail+1)); continue
+        fi
+        if ! jq empty "$candidate" 2>/dev/null; then
+            rm -f "$candidate"
+            _err "mieru 实例 $key 配置 JSON 格式错误"
+            fail=$((fail+1)); continue
+        fi
+        if ! _mieru_validate_candidate "$candidate"; then
+            rm -f "$candidate"
+            fail=$((fail+1)); continue
+        fi
+        if ! mv -f "$candidate" "$live"; then
+            rm -f "$candidate"
+            _err "提交 mieru 实例 $key 配置失败"
+            fail=$((fail+1)); continue
+        fi
+        ok=$((ok+1))
+    done <<< "$keys"
+
+    # Drop legacy aggregate file once instances exist
+    if [[ $ok -gt 0 && -f "$CFG/mieru.json" ]]; then
+        rm -f "$CFG/mieru.json"
     fi
 
-    local has_ports has_users
-    has_ports=$(jq -r '(.portBindings // []) | length' "$candidate" 2>/dev/null)
-    has_users=$(jq -r '(.users // []) | length' "$candidate" 2>/dev/null)
-    if [[ -z "$has_ports" || "$has_ports" -le 0 || -z "$has_users" || "$has_users" -le 0 ]]; then
-        rm -f "$candidate"
-        _err "mieru 配置缺少有效端口或用户凭据"
+    if [[ $ok -le 0 ]]; then
+        _err "mieru 配置生成失败"
         return 1
     fi
-
-    # 分流管理 → mieru egress（multi 编译器；legacy 单链保留 socks5-chain）
-    local egress_plan
-    egress_plan=$(_mieru_compile_egress_plan) || {
-        rm -f "$candidate"
-        _err "mieru egress 编译失败"
-        return 1
-    }
-    if ! _mieru_apply_egress_to_candidate "$candidate" "$egress_plan"; then
-        rm -f "$candidate"
-        return 1
-    fi
-
-    if ! jq empty "$candidate" 2>/dev/null; then
-        rm -f "$candidate"
-        _err "mieru 配置文件 JSON 格式错误"
-        return 1
-    fi
-    if ! _mieru_validate_candidate "$candidate"; then
-        rm -f "$candidate"
-        return 1
-    fi
-    if ! mv -f "$candidate" "$CFG/mieru.json"; then
-        rm -f "$candidate"
-        _err "提交 mieru 配置失败"
-        return 1
-    fi
-    _ok "mieru 配置已生成"
-    return 0
+    _ok "mieru 配置已生成 ($ok 实例${fail:+, $fail 失败})"
+    [[ $fail -eq 0 ]]
 }
 
 # 处理单个端口实例的 inbound 生成
@@ -12118,7 +12355,7 @@ _update_core_to_version() {
                 _err "新 Xray 不支持现有 FinalMask 配置"
                 validation_ok=false
             fi
-        elif [[ "$core" == "Mieru" && -s "$CFG/mieru.json" ]] && ! _mieru_validate_candidate "$CFG/mieru.json"; then
+        elif [[ "$core" == "Mieru" ]] && _mieru_any_live_config_invalid; then
             _err "新 mita 无法加载现有配置"
             validation_ok=false
         fi
@@ -12810,24 +13047,47 @@ update_mieru_core() {
     fi
 
     local need_restart=false service_running=false
-    if svc status vless-mieru 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-mieru 服务..."
-        if ! svc stop vless-mieru 2>/dev/null; then
-            _err "停止服务失败，为避免风险已终止更新"
-            return 1
+    local _k _s _cfg
+    while IFS= read -r _k; do
+        [[ -z "$_k" ]] && continue
+        _s=$(_mieru_instance_svc_name "$_k") || continue
+        if svc status "$_s" 2>/dev/null; then
+            service_running=true
+            need_restart=true
+            _info "停止 mieru 实例 $_k ($_s)..."
+            if ! svc stop "$_s" 2>/dev/null; then
+                _err "停止服务失败，为避免风险已终止更新"
+                return 1
+            fi
         fi
+    done < <(_mieru_list_instance_keys 2>/dev/null)
+    # legacy unit
+    if svc status vless-mieru 2>/dev/null; then
+        service_running=true; need_restart=true
+        svc stop vless-mieru 2>/dev/null || true
     fi
 
     if install_mieru "$channel" "true"; then
+        local _bad=0
+        while IFS= read -r _k; do
+            [[ -z "$_k" ]] && continue
+            _cfg=$(_mieru_instance_config_path "$_k") || continue
+            if [[ -s "$_cfg" ]] && ! _mieru_validate_candidate "$_cfg"; then
+                _bad=1; break
+            fi
+        done < <(_mieru_list_instance_keys 2>/dev/null)
         if [[ -s "$CFG/mieru.json" ]] && ! _mieru_validate_candidate "$CFG/mieru.json"; then
+            _bad=1
+        fi
+        if [[ "$_bad" == "1" ]]; then
             _err "新 mita 无法加载现有配置，正在回滚"
             if [[ -n "$backup_file" ]] && ! _rollback_core_binary "mita" "$backup_file"; then
                 _err "旧 mita 回滚失败，未尝试恢复服务"
                 return 1
             fi
-            [[ "$service_running" == "true" ]] && { svc start vless-mieru >/dev/null 2>&1 || _err "旧 mita 已恢复，但服务启动失败"; }
+            if [[ "$service_running" == "true" ]]; then
+                _mieru_foreach_svc start 2>/dev/null || true
+            fi
             return 1
         fi
         _ok "mita 内核已更新"
@@ -12837,13 +13097,13 @@ update_mieru_core() {
             _show_changelog_summary "enfein/mieru" "$new_version" 10
         fi
         if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-mieru 服务..."
-            if svc start vless-mieru 2>/dev/null; then
+            _info "重新启动 mieru 实例服务..."
+            if _mieru_foreach_svc start; then
                 _ok "服务已启动"
             else
                 _err "新 mita 启动失败，正在恢复旧核心"
                 if [[ -n "$backup_file" ]] && _rollback_core_binary "mita" "$backup_file"; then
-                    svc start vless-mieru >/dev/null 2>&1 || _err "旧 mita 已恢复，但服务启动失败"
+                    _mieru_foreach_svc start 2>/dev/null || true
                 fi
                 return 1
             fi
@@ -12858,10 +13118,10 @@ update_mieru_core() {
     fi
     if [[ "$service_running" == "true" ]]; then
         _warn "尝试恢复服务..."
-        if svc start vless-mieru 2>/dev/null; then
+        if _mieru_foreach_svc start; then
             _ok "服务已恢复"
         else
-            _err "服务恢复失败，请手动检查: svc start vless-mieru"
+            _err "服务恢复失败，请手动检查 mieru 实例单元"
         fi
     fi
     return 1
@@ -15915,7 +16175,21 @@ get_all_services() {
     local proto
     for proto in $xray_keys; do
         case "$proto" in
-            mieru) services+="vless-mieru:mita " ;;
+            mieru)
+                # per-instance units
+                local _mp _ms
+                while IFS= read -r _mp; do
+                    [[ -z "$_mp" ]] && continue
+                    _ms=$(echo "$_mp" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+                    [[ -n "$_ms" ]] && services+="vless-mieru-${_ms}:mita "
+                done < <(jq -r '
+                    def port_key:
+                        if (.port != null and (.port|tostring) != "" and (.port|tostring) != "null") then (.port|tostring)
+                        else ((.port_range // .portRange // "")|tostring) end;
+                    .xray.mieru // empty |
+                    if type == "array" then .[] | port_key else port_key end
+                ' "$DB_FILE" 2>/dev/null)
+                ;;
             ssh-tunnel) ;; # 系统 sshd，不由 vless-watchdog 拉起
             naive) services+="vless-naive:caddy " ;;
             snell) services+="vless-snell:snell-server " ;;
@@ -16111,6 +16385,139 @@ EOF
     fi
 }
 
+
+# Create/update one mieru instance unit (systemd or OpenRC) with isolated metrics.
+# metrics.pb is hardcoded at /var/lib/mita/metrics.pb in mita — isolate via
+# systemd BindPaths= or OpenRC unshare+bind onto per-instance state dir.
+create_mieru_instance_service() {
+    local key="$1"
+    local svc_name cfg_path uds_path state_dir slug
+    [[ -n "$key" ]] || return 1
+    slug=$(_mieru_instance_slug "$key") || return 1
+    svc_name=$(_mieru_instance_svc_name "$key") || return 1
+    cfg_path=$(_mieru_instance_config_path "$key") || return 1
+    uds_path=$(_mieru_instance_uds_path "$key") || return 1
+    state_dir=$(_mieru_instance_state_dir "$key") || return 1
+    _ensure_mita_runtime
+    _mieru_prepare_instance_dirs "$key"
+    # Register for OpenRC status fallback
+    SVC_PROC[$svc_name]="mita"
+
+    local env_line exec_cmd="/usr/local/bin/mita run"
+    # MITA_CONFIG_JSON_FILE + unique UDS; metrics isolated by bind of state_dir → /var/lib/mita
+    env_line="MITA_CONFIG_JSON_FILE=${cfg_path} MITA_UDS_PATH=${uds_path} MITA_INSECURE_UDS=1"
+
+    if [[ "$DISTRO" == "alpine" ]]; then
+        # OpenRC: wrap with unshare -m + bind-mount for private /var/lib/mita
+        local unshare_bin
+        unshare_bin=$(command -v unshare 2>/dev/null || echo /usr/bin/unshare)
+        cat >"/etc/init.d/${svc_name}" <<EOF
+#!/sbin/openrc-run
+name="Proxy Server (mieru ${slug})"
+command="${unshare_bin}"
+command_args="--mount --propagation private /bin/sh -c 'mkdir -p /var/lib/mita ${state_dir} ${uds_path%/*} && mount --bind ${state_dir} /var/lib/mita && export MITA_CONFIG_JSON_FILE=${cfg_path} MITA_UDS_PATH=${uds_path} MITA_INSECURE_UDS=1 && exec /usr/local/bin/mita run'"
+command_background="yes"
+pidfile="/run/${svc_name}.pid"
+
+depend() {
+    need net localmount
+    after firewall
+}
+
+start_pre() {
+    mkdir -p "${state_dir}" "${uds_path%/*}" /run/mita /var/run/mita
+    chmod 755 "${state_dir}" "${uds_path%/*}" /run/mita /var/run/mita 2>/dev/null || true
+}
+EOF
+        chmod +x "/etc/init.d/${svc_name}"
+    else
+        cat >"/etc/systemd/system/${svc_name}.service" <<EOF
+[Unit]
+Description=Proxy Server (mieru ${slug})
+After=network.target
+
+[Service]
+Type=simple
+Environment=MITA_CONFIG_JSON_FILE=${cfg_path}
+Environment=MITA_UDS_PATH=${uds_path}
+Environment=MITA_INSECURE_UDS=1
+ExecStartPre=/bin/mkdir -p ${state_dir} ${uds_path%/*}
+ExecStart=${exec_cmd}
+Restart=always
+RestartSec=3
+LimitNOFILE=51200
+RuntimeDirectory=mita/${slug}
+RuntimeDirectoryMode=0755
+BindPaths=${state_dir}:/var/lib/mita
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+# Create units for every mieru instance; retire legacy single vless-mieru.
+create_mieru_services() {
+    db_exists "xray" "mieru" || return 1
+    _mieru_retire_legacy_unit
+    local key
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        create_mieru_instance_service "$key" || return 1
+    done < <(_mieru_list_instance_keys)
+    # Remove orphan units whose slug no longer matches a DB instance
+    _mieru_prune_orphan_units
+}
+
+_mieru_prune_orphan_units() {
+    local live="" key slug
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        slug=$(_mieru_instance_slug "$key") || continue
+        live+=" vless-mieru-${slug} "
+    done < <(_mieru_list_instance_keys)
+    local f name
+    if [[ "${DISTRO:-}" == "alpine" ]]; then
+        for f in /etc/init.d/vless-mieru-*; do
+            [[ -e "$f" ]] || continue
+            name="${f##*/}"
+            [[ "$name" == "vless-mieru-*" ]] && continue
+            if [[ " $live " != *" $name "* ]]; then
+                svc stop "$name" 2>/dev/null || true
+                svc disable "$name" 2>/dev/null || true
+                rm -f "$f"
+            fi
+        done
+    else
+        for f in /etc/systemd/system/vless-mieru-*.service; do
+            [[ -e "$f" ]] || continue
+            name="${f##*/}"; name="${name%.service}"
+            if [[ " $live " != *" $name "* ]]; then
+                svc stop "$name" 2>/dev/null || true
+                svc disable "$name" 2>/dev/null || true
+                rm -f "$f"
+            fi
+        done
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+_mieru_foreach_svc() {
+    # $1=action (start|stop|restart|enable|disable|status); operates on all instance units
+    local action="$1" key svc rc=0
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        svc=$(_mieru_instance_svc_name "$key") || continue
+        if [[ "$action" == "status" ]]; then
+            svc status "$svc" 2>/dev/null || rc=1
+        else
+            svc "$action" "$svc" 2>/dev/null || rc=1
+        fi
+    done < <(_mieru_list_instance_keys)
+    return $rc
+}
+
 create_service() {
     local protocol="${1:-$(get_protocol)}"
     local kind="${PROTO_KIND[$protocol]:-}"
@@ -16161,9 +16568,8 @@ create_service() {
             ;;
         mieru)
             _need_cfg "mieru" "mieru" || return 1
-            _ensure_mita_runtime
-            exec_cmd="/usr/local/bin/mita run"
-            exec_name="mita"
+            create_mieru_services
+            return $?
             ;;
         shadowtls)
             _need_cfg "$protocol" "$protocol" || return 1
@@ -16257,20 +16663,9 @@ EOF
         local env=""
         # ShadowTLS CPU 100% 修复: 高版本内核 io_uring 问题
         [[ "$kind" == "shadowtls" ]] && env="MONOIO_FORCE_LEGACY_DRIVER=1"
-        [[ "$kind" == "mieru" ]] && env="MITA_CONFIG_JSON_FILE=$CFG/mieru.json"
         local boot_retry=0
         [[ "$kind" == "snell" ]] && boot_retry=1
         _write_openrc "$service_name" "Proxy Server ($protocol)" "$cmd" "$args" "$env" "$boot_retry"
-        if [[ "$kind" == "mieru" ]]; then
-            cat >>"/etc/init.d/${service_name}" <<'EOFMITA'
-
-start_pre() {
-    mkdir -p /run/mita /var/run/mita
-    chmod 755 /run/mita /var/run/mita 2>/dev/null || true
-}
-EOFMITA
-            chmod +x "/etc/init.d/${service_name}"
-        fi
 
         if [[ "$kind" == "shadowtls" ]]; then
             _write_openrc "${BACKEND_NAME[$protocol]}" "${BACKEND_DESC[$protocol]}" "${BACKEND_EXEC[$protocol]%% *}" "${BACKEND_EXEC[$protocol]#* }" ""
@@ -16289,10 +16684,6 @@ EOFMITA
             after="${BACKEND_NAME[$protocol]}.service"
         fi
         local extra=""
-        if [[ "$kind" == "mieru" ]]; then
-            env="MITA_CONFIG_JSON_FILE=$CFG/mieru.json"
-            extra=$'RuntimeDirectory=mita\nRuntimeDirectoryMode=0755'
-        fi
         _write_systemd "$service_name" "Proxy Server ($protocol)" "$exec_cmd" "$pre" "" "$env" "$requires" "$after" "$extra"
 
         if [[ "$kind" == "shadowtls" ]]; then
@@ -16452,7 +16843,19 @@ start_services() {
 
         if [[ "$ind_proto" == "mieru" ]]; then
             generate_mieru_config || { _err "mieru 配置生成失败"; failed_services+=("$service_name"); continue; }
-            create_service "mieru"
+            create_mieru_services || { _err "mieru 实例服务创建失败"; failed_services+=("mieru"); continue; }
+            local _mk _msvc
+            while IFS= read -r _mk; do
+                [[ -z "$_mk" ]] && continue
+                _msvc=$(_mieru_instance_svc_name "$_mk") || continue
+                svc enable "$_msvc" 2>/dev/null || true
+                if svc status "$_msvc" >/dev/null 2>&1; then
+                    svc restart "$_msvc" || { _err "mieru 实例 $_mk 重启失败"; failed_services+=("$_msvc"); }
+                else
+                    svc start "$_msvc" || { _err "mieru 实例 $_mk 启动失败"; failed_services+=("$_msvc"); }
+                fi
+            done < <(_mieru_list_instance_keys)
+            continue
         fi
 
         # ShadowTLS 组合协议需要先启动/重启后端服务
@@ -17988,16 +18391,14 @@ db_get_balancer_group() {
 db_delete_balancer_group() {
     local name="$1"
     [[ ! -f "$DB_FILE" ]] && return
-    local _refs _mieru_ob=""
+    local _refs
     _refs=$(db_list_instances_using_outbound "balancer:$name" 2>/dev/null || true)
-    _mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
-    if [[ -n "$_refs" || "$_mieru_ob" == "balancer:$name" ]]; then
+    if [[ -n "$_refs" ]]; then
         _warn "以下出口仍引用负载组 $name："
         echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
             [[ -z "$_p" ]] && continue
             echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
         done
-        [[ "$_mieru_ob" == "balancer:$name" ]] && echo -e "    • Mieru 服务 → $(_get_outbound_display_name "$_mieru_ob")"
         local _ans
         read -rp "  重置这些引用为继承全局并删除负载组? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
@@ -18008,7 +18409,6 @@ db_delete_balancer_group() {
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
-        [[ "$_mieru_ob" == "balancer:$name" ]] && db_clear_service_outbound_mieru || true
     fi
     _db_apply --arg name "$name" \
         '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
@@ -19805,9 +20205,27 @@ _regenerate_proxy_configs() {
 
     if [[ "$hint" == "all" || "$hint" == "mieru" ]]; then
         if db_exists "xray" "mieru"; then
-            _smart_apply_core "mieru" "$CFG/mieru.json" "vless-mieru" "generate_mieru_config" "always"
+            _smart_apply_mieru_instances
         fi
     fi
+}
+
+# Per-instance smart-apply: regenerate+restart only changed instances
+_MIERU_SMART_KEY=""
+_mieru_smart_gen_one() { generate_mieru_config "${_MIERU_SMART_KEY}"; }
+
+_smart_apply_mieru_instances() {
+    local key live svc
+    create_mieru_services 2>/dev/null || true
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        live=$(_mieru_instance_config_path "$key") || continue
+        svc=$(_mieru_instance_svc_name "$key") || continue
+        _MIERU_SMART_KEY="$key"
+        _smart_apply_core "mieru" "$live" "$svc" "_mieru_smart_gen_one" "always"
+    done < <(_mieru_list_instance_keys)
+    _MIERU_SMART_KEY=""
+    _mieru_prune_orphan_units 2>/dev/null || true
 }
 
 # WARP 管理菜单 (二选一模式)
@@ -20321,7 +20739,7 @@ _prompt_instance_outbound() {
     esac
 }
 
-# 实例出口管理菜单（Xray 共享核 per-port + 可选 Mieru 服务级一行）
+# 实例出口管理菜单（Xray + Mieru 每实例一行）
 manage_instance_outbound() {
     while true; do
         _header
@@ -20329,17 +20747,13 @@ manage_instance_outbound() {
         _line
         echo -e "  ${D}优先序: API > 用户 > 多IP > 实例 > 全局 > 默认${NC}"
         echo -e "  ${D}缺省/空 = 继承全局；不写入字面量 inherit${NC}"
-        echo -e "  ${D}Mieru: 服务级覆盖 > 全局分流 > 默认直连（非逐端口）${NC}"
+        echo -e "  ${D}Mieru: 每实例（port/portRange）独立出口，与 Xray 同行列出${NC}"
         _line
 
         local entries=()
         local idx=1
         local proto port ob
-        local has_mieru_row=0
-        local mieru_ob=""
         for proto in $XRAY_PROTOCOLS; do
-            # mieru 不走 per-port 行
-            [[ "$proto" == "mieru" ]] && continue
             db_exists "xray" "$proto" 2>/dev/null || continue
             while IFS= read -r port; do
                 [[ -z "$port" || "$port" == "null" ]] && continue
@@ -20353,16 +20767,8 @@ manage_instance_outbound() {
                 ((idx++))
             done < <(db_list_ports "xray" "$proto" 2>/dev/null)
         done
-        if db_exists "xray" "mieru" 2>/dev/null; then
-            mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
-            echo -e "  ${G}${idx}${NC}) Mieru（全部实例）  →  ${C}$(_get_outbound_display_name "$mieru_ob")${NC}"
-            echo -e "     ${D}Mieru 服务: 全部实例 → $(_get_outbound_display_name "$mieru_ob")${NC}"
-            entries+=("mieru|||${mieru_ob}")
-            has_mieru_row=1
-            ((idx++))
-        fi
         if [[ ${#entries[@]} -eq 0 ]]; then
-            echo -e "  ${D}暂无 Xray 入站实例 / Mieru 服务${NC}"
+            echo -e "  ${D}暂无 Xray / Mieru 入站实例${NC}"
             _pause
             return
         fi
@@ -20377,32 +20783,6 @@ manage_instance_outbound() {
         local ent="${entries[$((choice-1))]}"
         local kind="${ent%%|*}"
         local rest="${ent#*|}"
-        if [[ "$kind" == "mieru" ]]; then
-            cur_ob="${rest##*|}"
-            echo ""
-            echo -e "  当前出口: ${C}$(_get_outbound_display_name "$cur_ob")${NC}"
-            if ! _prompt_instance_outbound "mieru" "service" "$cur_ob"; then
-                _pause; continue
-            fi
-            local new_ob="$SELECTED_INSTANCE_OUTBOUND"
-            if [[ "$new_ob" == "$cur_ob" ]]; then
-                _ok "未变更"
-                _pause
-                continue
-            fi
-            if [[ -z "$new_ob" ]]; then
-                db_clear_service_outbound_mieru || { _err "清除失败"; _pause; continue; }
-                _ok "已恢复继承全局"
-            else
-                db_set_service_outbound_mieru "$new_ob" || { _err "设置失败"; _pause; continue; }
-                _ok "已设置: $(_get_outbound_display_name "$new_ob")"
-            fi
-            # 桥可能迁移：一次 all
-            _regenerate_proxy_configs all
-            _pause
-            continue
-        fi
-
         proto="${rest%%|*}"; rest="${rest#*|}"; port="${rest%%|*}"; local cur_ob="${rest#*|}"
 
         echo ""
@@ -20424,8 +20804,12 @@ manage_instance_outbound() {
             db_set_instance_outbound "xray" "$proto" "$port" "$new_ob" || { _err "设置失败"; _pause; continue; }
             _ok "已设置: $(_get_outbound_display_name "$new_ob")"
         fi
-        # 仅重生一次（实例出口仅影响 Xray）
-        _regenerate_proxy_configs xray
+        if [[ "$proto" == "mieru" ]]; then
+            # 桥可能迁移：all；smart_apply 仅重启变更实例
+            _regenerate_proxy_configs all
+        else
+            _regenerate_proxy_configs xray
+        fi
         _pause
     done
 }
@@ -20770,17 +21154,15 @@ db_add_chain_node() {
 }
 db_del_chain_node() {
     local name="$1"
-    # 实例/Mieru 服务出口引用守卫：阻止静默变 DIRECT；询问是否重置为继承
-    local _refs _mieru_ob=""
+    # 实例出口引用守卫（含 mieru per-instance）：阻止静默变 DIRECT；询问是否重置为继承
+    local _refs
     _refs=$(db_list_instances_using_outbound "chain:$name" 2>/dev/null || true)
-    _mieru_ob=$(db_get_service_outbound_mieru 2>/dev/null || true)
-    if [[ -n "$_refs" || "$_mieru_ob" == "chain:$name" ]]; then
+    if [[ -n "$_refs" ]]; then
         _warn "以下出口仍引用链式节点 $name："
         echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
             [[ -z "$_p" ]] && continue
             echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
         done
-        [[ "$_mieru_ob" == "chain:$name" ]] && echo -e "    • Mieru 服务 → $(_get_outbound_display_name "$_mieru_ob")"
         local _ans
         read -rp "  重置这些引用为继承全局并删除节点? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
@@ -20791,7 +21173,6 @@ db_del_chain_node() {
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
-        [[ "$_mieru_ob" == "chain:$name" ]] && db_clear_service_outbound_mieru || true
     fi
     _db_apply --arg name "$name" '
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
@@ -24638,7 +25019,12 @@ uninstall_specific_protocol() {
             if [[ "$selected_protocol" == "ssh-tunnel" ]]; then
                 cleanup_legacy_ssh_tunnel force
             else
-            svc stop "$service_name" 2>/dev/null
+            if [[ "$selected_protocol" == "mieru" ]]; then
+                _mieru_foreach_svc stop 2>/dev/null || true
+                _mieru_retire_legacy_unit 2>/dev/null || true
+            else
+                svc stop "$service_name" 2>/dev/null
+            fi
             unregister_protocol "$selected_protocol"
             rm -f "$CFG/${selected_protocol}.join"
             
@@ -24650,7 +25036,7 @@ uninstall_specific_protocol() {
                 snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
                 snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
                 ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
-                mieru) rm -f "$CFG/mieru.json" ;;
+                mieru) rm -rf "$CFG/mieru" "$CFG/mieru.json"; _mieru_prune_orphan_units 2>/dev/null || true; _mieru_retire_legacy_unit 2>/dev/null || true ;;
             esac
             
             # 删除服务文件
@@ -24674,9 +25060,11 @@ uninstall_specific_protocol() {
             fi
             fi
         else
-            # mieru 支持单端口移除并重建聚合配置
+            # mieru 支持单实例移除（不影响其他实例）
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             _limited_change_begin "mieru" || { _err "无法备份 mieru 现有配置"; _pause; return 1; }
+            local _rm_svc=""
+            _rm_svc=$(_mieru_instance_svc_name "$SELECTED_PORT" 2>/dev/null || true)
             if ! db_remove_port "xray" "$selected_protocol" "$SELECTED_PORT"; then
                 _limited_change_rollback
                 _err "删除 mieru 监听失败"
@@ -24687,28 +25075,23 @@ uninstall_specific_protocol() {
             local remaining_ports=$(db_list_ports "xray" "$selected_protocol")
             if [[ -z "$remaining_ports" ]]; then
                 echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                svc stop "$service_name" 2>/dev/null
+                _mieru_foreach_svc stop 2>/dev/null || true
+                [[ -n "$_rm_svc" ]] && svc stop "$_rm_svc" 2>/dev/null || true
                 db_del "xray" "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join" "$CFG/mieru.json"
-                if [[ "$DISTRO" == "alpine" ]]; then
-                    rc-update del "$service_name" default 2>/dev/null
-                    rm -f "/etc/init.d/$service_name"
-                else
-                    systemctl disable "$service_name" 2>/dev/null
-                    rm -f "/etc/systemd/system/${service_name}.service"
-                    systemctl daemon-reload
-                fi
+                rm -f "$CFG/${selected_protocol}.join"
+                rm -rf "$CFG/mieru" "$CFG/mieru.json"
+                _mieru_prune_orphan_units 2>/dev/null || true
+                _mieru_retire_legacy_unit 2>/dev/null || true
                 _limited_change_commit
             else
-                echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行，正在重建配置并重启服务...${NC}"
-                if generate_mieru_config; then
-                    if svc restart "$service_name" 2>/dev/null || svc start "$service_name" 2>/dev/null; then
-                        _limited_change_commit
-                        _ok "mieru 配置已更新"
-                    else
-                        _err "mieru 服务重启失败"
-                        _limited_change_rollback
-                    fi
+                echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行，正在重建配置...${NC}"
+                # Stop only the removed instance; regenerate others without restarting unchanged
+                [[ -n "$_rm_svc" ]] && { svc stop "$_rm_svc" 2>/dev/null || true; svc disable "$_rm_svc" 2>/dev/null || true; }
+                if generate_mieru_config && create_mieru_services; then
+                    _mieru_prune_orphan_units 2>/dev/null || true
+                    _regenerate_proxy_configs mieru
+                    _limited_change_commit
+                    _ok "mieru 配置已更新（仅变更实例）"
                 else
                     _err "mieru 配置生成失败"
                     _limited_change_rollback
@@ -25129,7 +25512,7 @@ do_install_server() {
                 snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
                 snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
                 ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
-                mieru) rm -f "$CFG/mieru.json" ;;
+                mieru) rm -rf "$CFG/mieru" "$CFG/mieru.json"; _mieru_prune_orphan_units 2>/dev/null || true; _mieru_retire_legacy_unit 2>/dev/null || true ;;
             esac
             
             # 删除服务文件
@@ -30786,7 +31169,11 @@ show_service_logs() {
             proc_name="caddy"
             ;;
         mieru)
+            # Prefer first instance unit for journal; fall back to legacy name
             service_name="vless-mieru"
+            local _fk
+            _fk=$(_mieru_list_instance_keys 2>/dev/null | head -1)
+            [[ -n "$_fk" ]] && service_name=$(_mieru_instance_svc_name "$_fk")
             proc_name="mita"
             ;;
     esac
@@ -31833,9 +32220,15 @@ _regenerate_config() {
     if is_standalone_protocol "$proto"; then
         if [[ "$proto" == "mieru" ]]; then
             generate_mieru_config || { _err "mieru 配置生成失败"; return 1; }
-            if svc status vless-mieru 2>/dev/null; then
-                svc restart vless-mieru 2>/dev/null || { _err "mieru 服务重启失败"; return 1; }
-            fi
+            create_mieru_services || true
+            local _k _s
+            while IFS= read -r _k; do
+                [[ -z "$_k" ]] && continue
+                _s=$(_mieru_instance_svc_name "$_k") || continue
+                if svc status "$_s" 2>/dev/null; then
+                    svc restart "$_s" 2>/dev/null || { _err "mieru 实例 $_k 重启失败"; return 1; }
+                fi
+            done < <(_mieru_list_instance_keys)
         fi
         return 0
     fi
