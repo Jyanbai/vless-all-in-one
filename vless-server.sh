@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.27 [服务端]
+#  多协议代理一键部署脚本 v3.5.28 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.27"
+readonly VERSION="3.5.28"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -714,13 +714,36 @@ db_seed_telegram_dc_matchers_if_absent() {
 }
 
 # 用法: db_ensure_routing_profiles_defaults
-# No-op migrate: ensure arrays/objects exist only when callers opt in; absent ≡ 3.5.27.
+# Ensure array + telegram matchers; seed built-ins once (finance_crypto, telegram_dc, ai_media).
+# Priority note for wizard/combined: finance_crypto & telegram_dc ABOVE ai_media.
+# DIRECT does not reorder. fallback always inherit.
 db_ensure_routing_profiles_defaults() {
     [[ ! -f "$DB_FILE" ]] && init_db
     _db_apply '
         if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
     '
     db_seed_telegram_dc_matchers_if_absent
+
+    # Seed order = priority for combined/wizard defaults
+    if ! db_routing_profile_exists "finance_crypto" 2>/dev/null; then
+        db_add_routing_profile "finance_crypto" "金融/加密" "$(jq -n '[
+            {id:"fc_crypto", type:"custom", domains:"geosite:category-cryptocurrency", outbound:"direct", ip_version:"prefer_ipv4"},
+            {id:"fc_bank", type:"custom", domains:"geosite:category-bank-cn,geosite:category-finance", outbound:"direct", ip_version:"prefer_ipv4"}
+        ]')" || true
+    fi
+    if ! db_routing_profile_exists "telegram_dc" 2>/dev/null; then
+        # type=telegram_dc → compile expands matchers; plus geosite:telegram fallback (NOT geoip:telegram)
+        db_add_routing_profile "telegram_dc" "Telegram DC" "$(jq -n '[
+            {id:"tg_dc", type:"telegram_dc", outbound:"direct", ip_version:"prefer_ipv4"},
+            {id:"tg_fallback", type:"custom", domains:"geosite:telegram", outbound:"direct", ip_version:"prefer_ipv4"}
+        ]')" || true
+    fi
+    if ! db_routing_profile_exists "ai_media" 2>/dev/null; then
+        db_add_routing_profile "ai_media" "AI/流媒体" "$(jq -n '[
+            {id:"ai_intl", type:"custom", domains:"geosite:category-ai-!cn,geosite:openai", outbound:"direct", ip_version:"prefer_ipv4"},
+            {id:"media", type:"custom", domains:"geosite:netflix,geosite:disney,geosite:youtube,geosite:spotify,geosite:tiktok", outbound:"direct", ip_version:"prefer_ipv4"}
+        ]')" || true
+    fi
 }
 
 # Mieru legacy .service_outbound.mieru — migration-only get/clear (v3.5.27).
@@ -4405,7 +4428,7 @@ gen_xray_user_routing_outbounds() {
 }
 
 # 解析实例出口为 Xray outboundTag 或 balancerTag（与用户路由一致）
-# 成功时设置: _INSTANCE_OB_KIND=outbound|balancer  _INSTANCE_OB_TAG=...
+# 成功时设置: _INSTANCE_OB_KIND=outbound|balancer|profile  _INSTANCE_OB_TAG=... (profile 时 tag=stable id)
 # 失败返回 1（调用方 fail-closed，禁止静默 DIRECT）
 _resolve_instance_outbound_target() {
     local routing="$1"
@@ -4458,6 +4481,211 @@ _resolve_instance_outbound_target() {
     return 0
 }
 
+# v3.5.28 product: profile 规则 outbound → Xray tag（与 gen_xray_routing_rules 对齐；缺目标 fail-closed）
+_resolve_profile_rule_outbound() {
+    local outbound="$1"
+    local ip_version="${2:-prefer_ipv4}"
+    _PROFILE_OB_KIND=""
+    _PROFILE_OB_TAG=""
+    case "$outbound" in
+        direct)
+            _PROFILE_OB_KIND=outbound
+            case "$ip_version" in
+                ipv4_only) _PROFILE_OB_TAG="direct-ipv4" ;;
+                ipv6_only) _PROFILE_OB_TAG="direct-ipv6" ;;
+                prefer_ipv6) _PROFILE_OB_TAG="direct-prefer-ipv6" ;;
+                as_is|asis) _PROFILE_OB_TAG="direct-asis" ;;
+                *) _PROFILE_OB_TAG="direct-prefer-ipv4" ;;
+            esac
+            ;;
+        warp)
+            local warp_st
+            warp_st=$(warp_status 2>/dev/null || true)
+            case "$warp_st" in
+                configured|connected|registered) ;;
+                *) _err "规则集出口需要 WARP 但未就绪"; return 1 ;;
+            esac
+            _PROFILE_OB_KIND=outbound
+            case "$ip_version" in
+                ipv4_only) _PROFILE_OB_TAG="warp-ipv4" ;;
+                ipv6_only) _PROFILE_OB_TAG="warp-ipv6" ;;
+                prefer_ipv6) _PROFILE_OB_TAG="warp-prefer-ipv6" ;;
+                *) _PROFILE_OB_TAG="warp-prefer-ipv4" ;;
+            esac
+            ;;
+        block|reject)
+            _PROFILE_OB_KIND=outbound
+            _PROFILE_OB_TAG="block"
+            ;;
+        chain:*)
+            local node_name="${outbound#chain:}"
+            if ! db_chain_node_exists "$node_name" 2>/dev/null; then
+                _err "规则集链式节点不存在: $outbound"
+                return 1
+            fi
+            _PROFILE_OB_KIND=outbound
+            case "$ip_version" in
+                ipv4_only) _PROFILE_OB_TAG="chain-${node_name}-ipv4" ;;
+                ipv6_only) _PROFILE_OB_TAG="chain-${node_name}-ipv6" ;;
+                prefer_ipv6) _PROFILE_OB_TAG="chain-${node_name}-prefer-ipv6" ;;
+                *) _PROFILE_OB_TAG="chain-${node_name}-prefer-ipv4" ;;
+            esac
+            ;;
+        balancer:*)
+            local group_name="${outbound#balancer:}"
+            if ! db_balancer_group_exists "$group_name" 2>/dev/null; then
+                _err "规则集负载组不存在: $outbound"
+                return 1
+            fi
+            _PROFILE_OB_KIND=balancer
+            _PROFILE_OB_TAG="balancer-${group_name}"
+            ;;
+        *)
+            _err "规则集无效出口: $outbound"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# telegram_dc_matchers → CSV of known endpoints (best-effort; Choice A)
+_telegram_dc_matcher_tokens_csv() {
+    local m
+    m=$(db_get_telegram_dc_matchers 2>/dev/null || echo '{}')
+    echo "$m" | jq -r '[.dc1,.dc2,.dc3,.dc4,.dc5 | arrays[]?] | unique | join(",")' 2>/dev/null
+}
+
+# 将 profile 单条规则展开为 domains CSV（telegram_dc → matchers；禁止 geoip:telegram）
+_profile_rule_domains_csv() {
+    local rule="$1"
+    local rule_type domains
+    rule_type=$(echo "$rule" | jq -r '.type // "custom"')
+    domains=$(echo "$rule" | jq -r '.domains // ""')
+    case "$rule_type" in
+        telegram_dc)
+            _telegram_dc_matcher_tokens_csv
+            ;;
+        *)
+            if [[ "$domains" == *geoip:telegram* ]]; then
+                _err "规则集禁止 geoip:telegram（请用 telegram_dc_matchers / type=telegram_dc）"
+                return 1
+            fi
+            printf '%s' "$domains"
+            ;;
+    esac
+}
+
+# 编译 profile → inboundTag 作用域 Xray rules（保序；不浮动 DIRECT；无 catch-all → inherit global）
+# $1=tags_json $2=profile_id → stdout JSON array
+_gen_xray_profile_inbound_rules() {
+    local tags_json="$1" profile_id="$2"
+    local rules_json rules_out="[]" rule domains outbound ip_version rule_type
+    rules_json=$(db_get_routing_profile_rules "$profile_id") || {
+        _err "分流规则集不存在: profile:$profile_id"
+        return 1
+    }
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        rule_type=$(echo "$rule" | jq -r '.type // "custom"')
+        outbound=$(echo "$rule" | jq -r '.outbound // empty')
+        ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
+        [[ -z "$outbound" ]] && continue
+        if ! _resolve_profile_rule_outbound "$outbound" "$ip_version"; then
+            return 1
+        fi
+        local tag_key="outboundTag"
+        [[ "$_PROFILE_OB_KIND" == "balancer" ]] && tag_key="balancerTag"
+        local ip_family_cidr=""
+        case "$ip_version" in
+            ipv4_only) ip_family_cidr="0.0.0.0/0" ;;
+            ipv6_only) ip_family_cidr="::/0" ;;
+        esac
+
+        if [[ "$rule_type" == "all" ]]; then
+            local rj
+            if [[ -n "$ip_family_cidr" ]]; then
+                rj=$(jq -n --argjson tags "$tags_json" --arg tag "$_PROFILE_OB_TAG" --arg key "$tag_key" --arg ip "$ip_family_cidr" \
+                    '{type:"field", inboundTag:$tags, network:"tcp,udp", ip:[$ip], ($key):$tag}')
+            else
+                rj=$(jq -n --argjson tags "$tags_json" --arg tag "$_PROFILE_OB_TAG" --arg key "$tag_key" \
+                    '{type:"field", inboundTag:$tags, network:"tcp,udp", ($key):$tag}')
+            fi
+            rules_out=$(echo "$rules_out" | jq --argjson r "$rj" '. + [$r]')
+            continue
+        fi
+
+        domains=$(_profile_rule_domains_csv "$rule") || return 1
+        [[ -z "$domains" ]] && continue
+
+        local -a _xd=() _xi=()
+        local _tok
+        _routing_split_tokens "$domains"
+        for _tok in "${_ROUTING_TOKENS[@]}"; do
+            if [[ "$_tok" == "geoip:telegram" ]]; then
+                _err "规则集禁止 geoip:telegram"
+                return 1
+            fi
+            _routing_classify_token "$_tok"
+            if [[ "$_ROUTING_KIND" == "ip" ]]; then
+                if [[ "$ip_version" == "ipv4_only" && "$_ROUTING_VALUE" == *:* && "$_ROUTING_VALUE" != geoip:* && "$_ROUTING_VALUE" != ext:* ]]; then
+                    continue
+                fi
+                if [[ "$ip_version" == "ipv6_only" && "$_ROUTING_VALUE" == *.* && "$_ROUTING_VALUE" != geoip:* && "$_ROUTING_VALUE" != ext:* ]]; then
+                    continue
+                fi
+                _xi+=("$_ROUTING_VALUE")
+            else
+                _xd+=("$_ROUTING_VALUE")
+            fi
+        done
+        if [[ ${#_xd[@]} -gt 0 ]]; then
+            local domain_array rj
+            domain_array=$(_routing_json_array "${_xd[@]}")
+            if [[ -n "$ip_family_cidr" ]]; then
+                rj=$(jq -n --argjson tags "$tags_json" --argjson domains "$domain_array" --arg tag "$_PROFILE_OB_TAG" --arg key "$tag_key" --arg ip "$ip_family_cidr" \
+                    '{type:"field", inboundTag:$tags, domain:$domains, ip:[$ip], ($key):$tag}')
+            else
+                rj=$(jq -n --argjson tags "$tags_json" --argjson domains "$domain_array" --arg tag "$_PROFILE_OB_TAG" --arg key "$tag_key" \
+                    '{type:"field", inboundTag:$tags, domain:$domains, ($key):$tag}')
+            fi
+            rules_out=$(echo "$rules_out" | jq --argjson r "$rj" '. + [$r]')
+        fi
+        if [[ ${#_xi[@]} -gt 0 && -z "$ip_family_cidr" ]]; then
+            local ip_array rj
+            ip_array=$(_routing_json_array "${_xi[@]}")
+            rj=$(jq -n --argjson tags "$tags_json" --argjson ips "$ip_array" --arg tag "$_PROFILE_OB_TAG" --arg key "$tag_key" \
+                '{type:"field", inboundTag:$tags, ip:$ips, ($key):$tag}')
+            rules_out=$(echo "$rules_out" | jq --argjson r "$rj" '. + [$r]')
+        fi
+    done < <(echo "$rules_json" | jq -c '.[]?')
+    echo "$rules_out"
+}
+
+# 从 profile 规则收集 outbound 需求
+_gen_xray_profile_outbound_needs() {
+    local profile_id="$1" rules_json rule outbound
+    rules_json=$(db_get_routing_profile_rules "$profile_id" 2>/dev/null) || return 0
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        outbound=$(echo "$rule" | jq -r '.outbound // empty')
+        case "$outbound" in
+            warp|chain:*|balancer:*) echo "$outbound" ;;
+        esac
+    done < <(echo "$rules_json" | jq -c '.[]?')
+}
+
+# 产品辅助: 列出规则中引用指定出口的 profile id（chain/balancer/WARP 守卫）
+_list_profiles_referencing_outbound() {
+    local target="$1"
+    [[ -z "$target" ]] && return 0
+    local profiles
+    profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
+    echo "$profiles" | jq -r --arg t "$target" '
+        .[] | select((.rules // []) | map(.outbound // "") | index($t) != null) | .id
+    ' 2>/dev/null
+}
+
+
 # 收集所有非空 instance_outbound 需求 (用于确保 outbound 存在)
 gen_xray_instance_outbound_needs() {
     local xray_protocols=$(get_xray_protocols)
@@ -4476,6 +4704,7 @@ gen_xray_instance_outbound_needs() {
             [[ -z "$ob" || "$ob" == "null" ]] && continue
             case "$ob" in
                 warp|chain:*|balancer:*) echo "$ob" ;;
+                profile:*) _gen_xray_profile_outbound_needs "${ob#profile:}" ;;
             esac
         done <<< "$ports"
     done | sort -u
@@ -4530,6 +4759,16 @@ gen_xray_instance_outbound_rules() {
                         tags_json=$(echo "$tags_json" | jq --arg t "$ip_tag" '. + [$t] | unique')
                     done < <(echo "$ip_rules" | jq -r '.[].inbound_ip // empty')
                 fi
+            fi
+
+            # v3.5.28: profile:<id> → inboundTag 作用域多规则（保序；无 catch-all → 继承全局）
+            if [[ "$_INSTANCE_OB_KIND" == "profile" ]]; then
+                local profile_rules
+                if ! profile_rules=$(_gen_xray_profile_inbound_rules "$tags_json" "$_INSTANCE_OB_TAG"); then
+                    return 1
+                fi
+                rules=$(echo "$rules" | jq --argjson r "$profile_rules" '. + $r')
+                continue
             fi
 
             local rule
@@ -5651,6 +5890,64 @@ _mieru_resolve_proxy_endpoint() {
 # 编译计划 JSON:
 # { mode:"legacy"|"multi", proxies:[], rules:[], bridges:[{name,port,tag,inbound}],
 #   allowLoopbackIP:bool, fallback_rules:[], legacy_name:"" }
+# v3.5.28: 展开 profile 规则为 routing_rules 同形数组（telegram_dc→matchers；禁止 geoip:telegram）
+# 缺目标 fail-closed。保序，不浮动 DIRECT。
+_mieru_expand_profile_rules() {
+    local profile_id="$1"
+    local rules_json out='[]' rule rule_type outbound domains ip_version rid expanded
+    rules_json=$(db_get_routing_profile_rules "$profile_id") || {
+        _err "Mieru 规则集不存在: profile:$profile_id"
+        return 1
+    }
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        rule_type=$(echo "$rule" | jq -r '.type // "custom"')
+        outbound=$(echo "$rule" | jq -r '.outbound // empty')
+        ip_version=$(echo "$rule" | jq -r '.ip_version // "prefer_ipv4"')
+        rid=$(echo "$rule" | jq -r '.id // empty')
+        [[ -z "$outbound" ]] && continue
+        case "$outbound" in
+            direct|block|reject) ;;
+            warp)
+                local warp_st
+                warp_st=$(warp_status 2>/dev/null || true)
+                case "$warp_st" in
+                    configured|connected|registered) ;;
+                    *) _err "Mieru 规则集需要 WARP 但未就绪（fail-closed）"; return 1 ;;
+                esac
+                ;;
+            chain:*)
+                if ! db_chain_node_exists "${outbound#chain:}" 2>/dev/null; then
+                    _err "Mieru 规则集链式节点不存在: $outbound（fail-closed）"
+                    return 1
+                fi
+                ;;
+            balancer:*)
+                if ! db_balancer_group_exists "${outbound#balancer:}" 2>/dev/null; then
+                    _err "Mieru 规则集负载组不存在: $outbound（fail-closed）"
+                    return 1
+                fi
+                ;;
+            *)
+                _err "Mieru 规则集无效出口: $outbound"
+                return 1
+                ;;
+        esac
+        domains=$(_profile_rule_domains_csv "$rule") || return 1
+        if [[ "$rule_type" == "telegram_dc" ]]; then
+            rule_type="custom"
+        fi
+        if [[ "$rule_type" != "all" && -z "$domains" ]]; then
+            continue
+        fi
+        expanded=$(jq -n --arg id "$rid" --arg type "$rule_type" --arg out "$outbound" \
+            --arg domains "$domains" --arg ipv "$ip_version" \
+            '{id:$id, type:$type, outbound:$out, domains:$domains, ip_version:$ipv}')
+        out=$(echo "$out" | jq --argjson r "$expanded" '. + [$r]')
+    done < <(echo "$rules_json" | jq -c '.[]?')
+    echo "$out"
+}
+
 _mieru_compile_service_override_plan() {
     # 显式 Mieru 实例出口 → 单一 egress plan；缺目标 fail-closed（不静默 DIRECT）
     # $1=routing vocab; $2=socks base port for this instance
@@ -5758,6 +6055,11 @@ _mieru_compile_service_override_plan() {
                 tag:("balancer-"+$g), kind:"balancer"
             }]')
             ;;
+        profile:*)
+            # 不在 override 走 catch-all；由 _mieru_compile_egress_plan 的 inherit 路径处理
+            _err "Mieru profile 请经 _mieru_compile_egress_plan 编译（禁止 service override catch-all）"
+            return 1
+            ;;
         *)
             _err "无效 Mieru 实例出口: $routing"
             return 1
@@ -5786,14 +6088,38 @@ _mieru_compile_egress_plan() {
         socks_base=$(_mieru_instance_socks_base "$inst_key")
         inst_ob=$(db_get_instance_outbound "xray" "mieru" "$inst_key" 2>/dev/null || true)
     fi
+    local force_multi=0
     if [[ -n "$inst_ob" ]]; then
-        _mieru_compile_service_override_plan "$inst_ob" "$socks_base"
-        return $?
+        case "$inst_ob" in
+            profile:*)
+                # v3.5.28: profile 仅 per-instance；规则在前，未匹配继承全局（非强制 DIRECT）
+                if [[ -z "$inst_key" ]]; then
+                    _err "Mieru profile 出口仅支持 per-instance（禁止 service-wide）"
+                    return 1
+                fi
+                local _pid="${inst_ob#profile:}"
+                if ! db_routing_profile_exists "$_pid" 2>/dev/null; then
+                    _err "Mieru 规则集不存在: $inst_ob（fail-closed）"
+                    return 1
+                fi
+                local _pref _glob
+                _pref=$(_mieru_expand_profile_rules "$_pid") || return 1
+                _glob=$(db_get_routing_rules 2>/dev/null || echo '[]')
+                rules=$(jq -n --argjson p "$_pref" --argjson g "$_glob" '$p + $g')
+                force_multi=1
+                ;;
+            *)
+                _mieru_compile_service_override_plan "$inst_ob" "$socks_base"
+                return $?
+                ;;
+        esac
     fi
 
     MIERU_CHAIN_SOCKS_PORT="$socks_base"
-    rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
-    if ! _mieru_needs_multi_egress; then
+    if [[ "$force_multi" != "1" ]]; then
+        rules=$(db_get_routing_rules 2>/dev/null || echo '[]')
+    fi
+    if [[ "$force_multi" != "1" ]] && ! _mieru_needs_multi_egress; then
         local legacy
         legacy=$(_infer_global_chain_node 2>/dev/null || true)
         if [[ -n "$_saved_base" ]]; then MIERU_CHAIN_SOCKS_PORT="$_saved_base"; else unset MIERU_CHAIN_SOCKS_PORT 2>/dev/null || true; fi
@@ -18396,6 +18722,44 @@ uninstall_warp_official() {
 uninstall_warp() {
     local warp_mode=$(db_get_warp_mode)
     _info "卸载 WARP..."
+
+    # v3.5.28: 实例出口 + 规则集 warp 引用 → 清为继承 / 删规则（从不自动 DIRECT）
+    local _refs _prefs
+    _refs=$(db_list_instances_using_outbound "warp" 2>/dev/null || true)
+    _prefs=$(_list_profiles_referencing_outbound "warp" 2>/dev/null || true)
+    if [[ -n "$_refs" || -n "$_prefs" ]]; then
+        [[ -n "$_refs" ]] && {
+            _warn "以下出口仍引用 WARP："
+            echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+                [[ -z "$_p" ]] && continue
+                echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
+            done
+        }
+        [[ -n "$_prefs" ]] && {
+            _warn "以下规则集仍引用 WARP："
+            echo "$_prefs" | while read -r _pid; do
+                [[ -z "$_pid" ]] && continue
+                echo -e "    • profile:${_pid}"
+            done
+        }
+        local _ans
+        read -rp "  重置实例引用为继承并清空规则集中 WARP 出口后继续卸载? [y/N]: " _ans
+        if [[ ! "$_ans" =~ ^[yY]$ ]]; then
+            _err "已取消卸载（保留 WARP 引用）"
+            return 1
+        fi
+        while IFS='|' read -r _c _p _port _v; do
+            [[ -z "$_p" || -z "$_port" ]] && continue
+            db_clear_instance_outbound "$_c" "$_p" "$_port" || true
+        done <<< "$_refs"
+        while read -r _pid; do
+            [[ -z "$_pid" ]] && continue
+            local _rules
+            _rules=$(db_get_routing_profile_rules "$_pid" 2>/dev/null || echo '[]')
+            _rules=$(echo "$_rules" | jq -c '[.[] | select(.outbound != "warp")]')
+            db_set_routing_profile_rules "$_pid" "$_rules" || true
+        done <<< "$_prefs"
+    fi
     
     if [[ "$warp_mode" == "official" ]]; then
         uninstall_warp_official
@@ -18626,16 +18990,26 @@ db_get_balancer_group() {
 db_delete_balancer_group() {
     local name="$1"
     [[ ! -f "$DB_FILE" ]] && return
-    local _refs
+    local _refs _prefs
     _refs=$(db_list_instances_using_outbound "balancer:$name" 2>/dev/null || true)
-    if [[ -n "$_refs" ]]; then
-        _warn "以下出口仍引用负载组 $name："
-        echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
-            [[ -z "$_p" ]] && continue
-            echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
-        done
+    _prefs=$(_list_profiles_referencing_outbound "balancer:$name" 2>/dev/null || true)
+    if [[ -n "$_refs" || -n "$_prefs" ]]; then
+        [[ -n "$_refs" ]] && {
+            _warn "以下出口仍引用负载组 $name："
+            echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+                [[ -z "$_p" ]] && continue
+                echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
+            done
+        }
+        [[ -n "$_prefs" ]] && {
+            _warn "以下规则集仍引用负载组 $name："
+            echo "$_prefs" | while read -r _pid; do
+                [[ -z "$_pid" ]] && continue
+                echo -e "    • profile:${_pid}"
+            done
+        }
         local _ans
-        read -rp "  重置这些引用为继承全局并删除负载组? [y/N]: " _ans
+        read -rp "  重置实例引用为继承、清空规则集中该出口并删除负载组? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
             _err "已取消删除（保留出口引用）"
             return 1
@@ -18644,10 +19018,18 @@ db_delete_balancer_group() {
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
+        while read -r _pid; do
+            [[ -z "$_pid" ]] && continue
+            local _rules
+            _rules=$(db_get_routing_profile_rules "$_pid" 2>/dev/null || echo '[]')
+            _rules=$(echo "$_rules" | jq -c --arg t "balancer:$name" '[.[] | select(.outbound != $t)]')
+            db_set_routing_profile_rules "$_pid" "$_rules" || true
+        done <<< "$_prefs"
     fi
     _db_apply --arg name "$name" \
         '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
 }
+
 
 # 数据库：检查负载均衡组是否存在
 db_balancer_group_exists() {
@@ -18822,6 +19204,18 @@ _select_outbound() {
         done < <(echo "$balancer_groups" | jq -r '.[] | [.name // "", .strategy // "", (.nodes | length)] | @tsv')
     fi
 
+    # v3.5.28 分流规则集 profile:<id>
+    db_ensure_routing_profiles_defaults 2>/dev/null || true
+    local _profiles
+    _profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
+    if [[ -n "$_profiles" && "$_profiles" != "[]" ]]; then
+        while IFS=$'\t' read -r pid pname; do
+            [[ -z "$pid" ]] && continue
+            outbounds+=("profile:${pid}")
+            display_names+=("${pname}"$'\t'"profile"$'\t'"规则集"$'\t'"${pid}")
+        done < <(echo "$_profiles" | jq -r '.[] | [.id // "", .name // .id] | @tsv')
+    fi
+
     # 检测延迟（跳过直连、WARP 和负载均衡组）
     local need_latency_check=false
     if [[ "$check_mode" == "check_latency" ]]; then
@@ -18842,7 +19236,7 @@ _select_outbound() {
     for i in "${!display_names[@]}"; do
         local info="${display_names[$i]}"
         local type=$(echo "$info" | cut -d$'\t' -f2)
-        if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" ]]; then
+        if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" || "$type" == "profile" ]]; then
             latency_results+=("-|$info|-")
         else
             if [[ "$check_mode" == "check_latency" ]]; then
@@ -18887,6 +19281,8 @@ _select_outbound() {
             if [[ "$type" == "balancer" ]]; then
                 # 负载均衡组排在 WARP 后面，排序值为 1
                 sort_data+=("1|$i|-|${name}|balancer|${server}|${port}")
+            elif [[ "$type" == "profile" ]]; then
+                sort_data+=("2|$i|-|${name}|profile|${server}|${port}")
             else
                 local latency="${result%%|*}"
                 local latency_num=99999
@@ -18912,6 +19308,8 @@ _select_outbound() {
         elif [[ "$type" == "balancer" ]]; then
             # server 字段存储的是策略，port 字段存储的是节点数量
             echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(负载均衡: ${server}, ${port})${NC}" >&2
+        elif [[ "$type" == "profile" ]]; then
+            echo -e "  ${G}${display_idx}${NC}) ${C}规则集${NC} ${name} ${D}(${port})${NC}" >&2
         elif [[ -n "$latency_badge" ]]; then
             echo -e "  ${G}${display_idx}${NC}) ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
         else
@@ -18950,6 +19348,15 @@ _get_outbound_display_name() {
         warp) echo "WARP" ;;
         chain:*) echo "链路→${outbound#chain:}" ;;
         balancer:*) echo "负载→${outbound#balancer:}" ;;
+        profile:*)
+            local _pid="${outbound#profile:}" _pname
+            _pname=$(db_get_routing_profile "$_pid" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+            if [[ -n "$_pname" ]]; then
+                echo "规则集→${_pname}"
+            else
+                echo "规则集→${_pid}"
+            fi
+            ;;
         *) echo "$outbound" ;;
     esac
 }
@@ -20955,7 +21362,7 @@ _prompt_instance_outbound() {
         echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
     fi
     echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
-    echo -e "  ${G}2${NC}) 指定出口 (直连/WARP/链式/负载)" >&2
+    echo -e "  ${G}2${NC}) 指定出口 (直连/WARP/链式/负载/规则集)" >&2
     echo -e "  ${G}0${NC}) 跳过" >&2
     _line >&2
     local choice
@@ -21049,6 +21456,285 @@ manage_instance_outbound() {
     done
 }
 
+#═══════════════════════════════════════════════════════════════════════════════
+# v3.5.28 分流规则集 (routing profiles) UI + 家宽向导 + 共享编辑 smart-apply
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 共享规则集变更后：校验所有引用实例；失败由调用方负责 snap 还原
+# 成功则 Xray 一次 + 仅变更 mieru 实例重载。markers: profile-apply validate restore
+_routing_profile_validate_and_apply() {
+    local pid="$1"
+    local refs has_xray=0 has_mieru=0
+    refs=$(db_list_instances_using_profile "$pid" 2>/dev/null || true)
+    while IFS='|' read -r _c _p _port _v; do
+        [[ -z "$_p" ]] && continue
+        if [[ "$_p" == "mieru" ]]; then
+            has_mieru=1
+            if ! _mieru_compile_egress_plan "$_port" >/dev/null; then
+                _err "规则集校验失败: mieru:${_port}（fail-closed）"
+                return 1
+            fi
+        else
+            has_xray=1
+            if ! _resolve_instance_outbound_target "profile:$pid"; then
+                _err "规则集校验失败: profile:$pid（fail-closed）"
+                return 1
+            fi
+            local tags
+            tags=$(jq -n --arg t "$(_instance_inbound_tag "$_p" "$_port")" '[$t]')
+            if ! _gen_xray_profile_inbound_rules "$tags" "$pid" >/dev/null; then
+                _err "规则集 Xray 编译失败: ${_p}:${_port}（fail-closed）"
+                return 1
+            fi
+        fi
+    done <<< "$refs"
+    if [[ "$has_xray" == "1" ]]; then
+        _regenerate_proxy_configs xray || return 1
+    fi
+    if [[ "$has_mieru" == "1" ]]; then
+        _regenerate_proxy_configs mieru || return 1
+    fi
+    return 0
+}
+
+# 家宽 + 直出备用：家宽链主 + 直连备用（fallback=inherit → 未匹配走全局直连）
+wizard_home_broadband_direct_backup() {
+    _header
+    echo -e "  ${W}家宽 + 直出备用${NC}"
+    _line
+    echo -e "  ${D}创建/选择规则集：金融/TG/AI 走家宽链路，未匹配继承全局（建议全局直连）${NC}"
+    echo -e "  ${D}规则优先级: 金融/加密 → Telegram DC → AI/流媒体（DIRECT 不重排）${NC}"
+    _line
+    db_ensure_routing_profiles_defaults || true
+
+    local home_ob
+    home_ob=$(_select_outbound "选择家宽主出口" "no_check") || { _err "已取消"; _pause; return 1; }
+    case "$home_ob" in
+        direct)
+            _warn "家宽主出口选了直连，将仅作占位；建议选链式/WARP"
+            ;;
+        profile:*)
+            _err "家宽主出口不能再套规则集"
+            _pause
+            return 1
+            ;;
+    esac
+
+    local pid="home_broadband"
+    local name="家宽+直出备用"
+    # 组合内置规则，出口改写为家宽；顺序 finance → tg → ai
+    local rules
+    rules=$(jq -n --arg out "$home_ob" '[
+        {id:"hb_fc_crypto", type:"custom", domains:"geosite:category-cryptocurrency", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"hb_fc_bank", type:"custom", domains:"geosite:category-bank-cn,geosite:category-finance", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"hb_tg_dc", type:"telegram_dc", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"hb_tg_fb", type:"custom", domains:"geosite:telegram", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"hb_ai", type:"custom", domains:"geosite:category-ai-!cn,geosite:openai", outbound:$out, ip_version:"prefer_ipv4"},
+        {id:"hb_media", type:"custom", domains:"geosite:netflix,geosite:disney,geosite:youtube,geosite:spotify,geosite:tiktok", outbound:$out, ip_version:"prefer_ipv4"}
+    ]')
+
+    if db_routing_profile_exists "$pid" 2>/dev/null; then
+        if ! db_update_routing_profile "$pid" "$name" "$rules"; then
+            _err "更新规则集失败"; _pause; return 1
+        fi
+        _ok "已更新规则集: $name ($pid)"
+    else
+        if ! db_add_routing_profile "$pid" "$name" "$rules"; then
+            _err "创建规则集失败"; _pause; return 1
+        fi
+        _ok "已创建规则集: $name ($pid)"
+    fi
+
+    echo ""
+    echo -e "  ${Y}提示:${NC} 全局分流建议保留直连作备用；实例出口选 ${C}规则集→${name}${NC}"
+    read -rp "  是否立即为某个实例绑定此规则集? [y/N]: " _ans
+    if [[ "$_ans" =~ ^[yY]$ ]]; then
+        manage_instance_outbound
+    fi
+    _pause
+}
+
+_show_routing_profile_users() {
+    local pid="$1" refs
+    refs=$(db_list_instances_using_profile "$pid" 2>/dev/null || true)
+    if [[ -z "$refs" ]]; then
+        echo -e "  ${D}无实例引用${NC}"
+        return
+    fi
+    echo -e "  ${Y}引用实例:${NC}"
+    echo "$refs" | while IFS='|' read -r _c _p _port _v; do
+        [[ -z "$_p" ]] && continue
+        echo -e "    • ${_p}:${_port}"
+    done
+}
+
+manage_routing_profiles() {
+    while true; do
+        _header
+        echo -e "  ${W}分流规则集${NC}"
+        _line
+        db_ensure_routing_profiles_defaults 2>/dev/null || true
+        local profiles idx=1 entries=()
+        profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
+        local count
+        count=$(echo "$profiles" | jq 'length' 2>/dev/null || echo 0)
+        if [[ "$count" -eq 0 ]]; then
+            echo -e "  ${D}暂无规则集${NC}"
+        else
+            while IFS=$'\t' read -r pid pname rc fb; do
+                [[ -z "$pid" ]] && continue
+                echo -e "  ${G}${idx}${NC}) ${C}${pname}${NC} ${D}(${pid}, ${rc}条, fallback=${fb})${NC}"
+                entries+=("$pid")
+                ((idx++))
+            done < <(echo "$profiles" | jq -r '.[] | [.id, .name, ((.rules//[])|length), (.fallback//"inherit")] | @tsv')
+        fi
+        _line
+        _item "a" "添加规则集"
+        _item "w" "家宽 + 直出备用向导"
+        _item "0" "返回"
+        _line
+        local choice
+        read -rp "  请选择: " choice
+        case "$choice" in
+            0|"") return ;;
+            a|A)
+                local nid nname
+                read -rp "  规则集 id (a-z0-9_-): " nid
+                read -rp "  显示名称: " nname
+                [[ -z "$nid" || -z "$nname" ]] && { _err "id/名称不能空"; _pause; continue; }
+                if db_add_routing_profile "$nid" "$nname" '[]'; then
+                    _ok "已添加: $nname"
+                else
+                    _err "添加失败"
+                fi
+                _pause
+                ;;
+            w|W) wizard_home_broadband_direct_backup ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#entries[@]} ]]; then
+                    _edit_routing_profile "${entries[$((choice-1))]}"
+                else
+                    _err "无效选择"; _pause
+                fi
+                ;;
+        esac
+    done
+}
+
+_edit_routing_profile() {
+    local pid="$1"
+    while true; do
+        local prof
+        prof=$(db_get_routing_profile "$pid") || { _err "不存在: $pid"; _pause; return; }
+        local pname prules
+        pname=$(echo "$prof" | jq -r '.name')
+        prules=$(echo "$prof" | jq -c '.rules // []')
+        _header
+        echo -e "  ${W}规则集:${NC} ${C}${pname}${NC} ${D}(${pid})${NC}"
+        echo -e "  ${D}fallback=inherit（未匹配继承全局，非强制直连）${NC}"
+        _line
+        echo "$prules" | jq -r '.[] | "  • \(.id // "-")  [\(.type)]  →  \(.outbound)  \(.domains // "")"' 2>/dev/null
+        _line
+        _show_routing_profile_users "$pid"
+        _line
+        _item "1" "重命名"
+        _item "2" "追加规则"
+        _item "3" "删除规则"
+        _item "4" "复制规则集"
+        _item "5" "删除规则集"
+        _item "0" "返回"
+        _line
+        local c snap
+        read -rp "  请选择: " c
+        case "$c" in
+            0|"") return ;;
+            1)
+                local nn
+                read -rp "  新名称: " nn
+                [[ -z "$nn" ]] && continue
+                if db_update_routing_profile "$pid" "$nn"; then
+                    _ok "已重命名"
+                else
+                    _err "重命名失败"
+                fi
+                _pause
+                ;;
+            2)
+                local rid rtype rdom rout rule_json
+                read -rp "  规则 id: " rid
+                echo -e "  类型: custom / telegram_dc / all"
+                read -rp "  类型 [custom]: " rtype
+                rtype=${rtype:-custom}
+                rout=$(_select_outbound "规则出口" "no_check") || continue
+                case "$rout" in profile:*) _err "规则出口不能嵌套规则集"; _pause; continue ;; esac
+                rdom=""
+                if [[ "$rtype" != "all" && "$rtype" != "telegram_dc" ]]; then
+                    read -rp "  域名/IP tokens (逗号分隔): " rdom
+                fi
+                rule_json=$(jq -n --arg id "$rid" --arg type "$rtype" --arg out "$rout" --arg domains "$rdom" \
+                    '{id:$id, type:$type, outbound:$out, domains:$domains, ip_version:"prefer_ipv4"}')
+                snap="${DB_FILE}.profile-apply.$$"
+                cp -p "$DB_FILE" "$snap" || { _err "无法快照"; _pause; continue; }
+                if ! db_add_routing_profile_rule "$pid" "$rule_json"; then
+                    rm -f "$snap"; _err "追加失败"; _pause; continue
+                fi
+                if ! _routing_profile_validate_and_apply "$pid"; then
+                    cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                    rm -f "$snap"
+                    _err "校验失败，已恢复快照（profile-apply restore）"
+                else
+                    rm -f "$snap"
+                    _ok "已追加规则（profile-apply validate）"
+                fi
+                _pause
+                ;;
+            3)
+                local rid
+                read -rp "  要删除的规则 id: " rid
+                [[ -z "$rid" ]] && continue
+                snap="${DB_FILE}.profile-apply.$$"
+                cp -p "$DB_FILE" "$snap" || { _err "无法快照"; _pause; continue; }
+                if ! db_delete_routing_profile_rule "$pid" "$rid"; then
+                    rm -f "$snap"; _err "删除失败"; _pause; continue
+                fi
+                if ! _routing_profile_validate_and_apply "$pid"; then
+                    cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                    rm -f "$snap"
+                    _err "校验失败，已恢复快照（profile-apply restore）"
+                else
+                    rm -f "$snap"
+                    _ok "已删除规则（profile-apply validate）"
+                fi
+                _pause
+                ;;
+            4)
+                local dst dname
+                read -rp "  新 id: " dst
+                read -rp "  新名称 (可空): " dname
+                if db_copy_routing_profile "$pid" "$dst" "$dname"; then
+                    _ok "已复制 → $dst"
+                else
+                    _err "复制失败"
+                fi
+                _pause
+                ;;
+            5)
+                read -rp "  确认删除 $pid ? [y/N]: " _ans
+                [[ "$_ans" =~ ^[yY]$ ]] || continue
+                if db_delete_routing_profile "$pid"; then
+                    _ok "已删除"
+                    _pause
+                    return
+                else
+                    _err "删除失败（可能仍被引用）"
+                    _pause
+                fi
+                ;;
+            *) _err "无效"; _pause ;;
+        esac
+    done
+}
+
 manage_routing() {
     while true; do
         _header
@@ -21064,6 +21750,8 @@ manage_routing() {
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
         _item "9" "实例出口管理"
+        _item "10" "分流规则集"
+        _item "11" "家宽 + 直出备用"
         _item "0" "返回"
         _line
         
@@ -21096,6 +21784,8 @@ manage_routing() {
                 read -rp "  按回车返回..." _
                 ;;
             9) manage_instance_outbound ;;
+            10) manage_routing_profiles ;;
+            11) wizard_home_broadband_direct_backup ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -21389,17 +22079,27 @@ db_add_chain_node() {
 }
 db_del_chain_node() {
     local name="$1"
-    # 实例出口引用守卫（含 mieru per-instance）：阻止静默变 DIRECT；询问是否重置为继承
-    local _refs
+    # 实例出口 + 规则集引用守卫：阻止静默变 DIRECT；询问是否重置为继承
+    local _refs _prefs
     _refs=$(db_list_instances_using_outbound "chain:$name" 2>/dev/null || true)
-    if [[ -n "$_refs" ]]; then
-        _warn "以下出口仍引用链式节点 $name："
-        echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
-            [[ -z "$_p" ]] && continue
-            echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
-        done
+    _prefs=$(_list_profiles_referencing_outbound "chain:$name" 2>/dev/null || true)
+    if [[ -n "$_refs" || -n "$_prefs" ]]; then
+        [[ -n "$_refs" ]] && {
+            _warn "以下出口仍引用链式节点 $name："
+            echo "$_refs" | while IFS='|' read -r _c _p _port _v; do
+                [[ -z "$_p" ]] && continue
+                echo -e "    • ${_p}:${_port} → $(_get_outbound_display_name "$_v")"
+            done
+        }
+        [[ -n "$_prefs" ]] && {
+            _warn "以下规则集仍引用链式节点 $name："
+            echo "$_prefs" | while read -r _pid; do
+                [[ -z "$_pid" ]] && continue
+                echo -e "    • profile:${_pid}"
+            done
+        }
         local _ans
-        read -rp "  重置这些引用为继承全局并删除节点? [y/N]: " _ans
+        read -rp "  重置实例引用为继承、清空规则集中该出口并删除节点? [y/N]: " _ans
         if [[ ! "$_ans" =~ ^[yY]$ ]]; then
             _err "已取消删除（保留出口引用）"
             return 1
@@ -21408,6 +22108,13 @@ db_del_chain_node() {
             [[ -z "$_p" || -z "$_port" ]] && continue
             db_clear_instance_outbound "$_c" "$_p" "$_port" || true
         done <<< "$_refs"
+        while read -r _pid; do
+            [[ -z "$_pid" ]] && continue
+            local _rules
+            _rules=$(db_get_routing_profile_rules "$_pid" 2>/dev/null || echo '[]')
+            _rules=$(echo "$_rules" | jq -c --arg t "chain:$name" '[.[] | select(.outbound != $t)]')
+            db_set_routing_profile_rules "$_pid" "$_rules" || true
+        done <<< "$_prefs"
     fi
     _db_apply --arg name "$name" '
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
@@ -21420,6 +22127,7 @@ db_del_chain_node() {
           end
     '
 }
+
 
 # 检查链式代理节点是否存在 (返回 0=存在, 1=不存在)
 db_chain_node_exists() {
