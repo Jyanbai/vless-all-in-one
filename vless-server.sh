@@ -483,7 +483,9 @@ db_list_instances_using_outbound() {
     ' "$DB_FILE" 2>/dev/null
 }
 
-# Mieru 服务级出口 (.service_outbound.mieru): 缺省/空=继承全局; 不落库 inherit
+# Mieru 服务级出口 (.service_outbound.mieru) — TEMPORARY for migration / unmigrated DBs.
+# FINAL model: per-instance .xray.mieru[].instance_outbound (see db_migrate_mieru_service_outbound_to_instances).
+# Migration removes .service_outbound.mieru; do not persist literal inherit. Kept until Implementer rewires callers.
 # 用法: db_get_service_outbound_mieru
 db_get_service_outbound_mieru() {
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -491,7 +493,7 @@ db_get_service_outbound_mieru() {
 }
 
 # 用法: db_set_service_outbound_mieru "direct|warp|chain:x|balancer:g"
-# 空/inherit/null → 清除
+# 空/inherit/null → 清除. FINAL model writes instance_outbound instead.
 db_set_service_outbound_mieru() {
     local value="${1:-}"
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -509,6 +511,7 @@ db_set_service_outbound_mieru() {
 }
 
 # 用法: db_clear_service_outbound_mieru
+# FINAL model: field removed by migration; clear remains no-op-safe for unmigrated DBs / delete guards.
 db_clear_service_outbound_mieru() {
     [[ ! -f "$DB_FILE" ]] && return 1
     _db_apply '
@@ -517,6 +520,85 @@ db_clear_service_outbound_mieru() {
             | if (.service_outbound | length) == 0 then del(.service_outbound) else . end
         else . end
     '
+}
+
+# v3.5.27: migrate released .service_outbound.mieru → per-instance instance_outbound on each .xray.mieru row.
+# Fail-closed with snap restore. Never writes literal inherit. Never touches users/passwords/other fields.
+# 用法: db_migrate_mieru_service_outbound_to_instances
+# 返回: 0 成功/无需; 1 失败（已恢复快照）
+db_migrate_mieru_service_outbound_to_instances() {
+    [[ ! -f "$DB_FILE" ]] && return 0
+
+    local snap svc ports port got still
+    snap="${DB_FILE}.mig-mieru-ob.$$"
+    if ! cp -p "$DB_FILE" "$snap"; then
+        _err "Mieru 出口迁移: 无法创建快照"
+        return 1
+    fi
+
+    svc=$(db_get_service_outbound_mieru 2>/dev/null || true)
+
+    if [[ -z "$svc" ]]; then
+        # Empty-ish key may still exist — clear it; do not write instance_outbound (inherit)
+        if jq -e '(.service_outbound // {}) | has("mieru")' "$DB_FILE" >/dev/null 2>&1; then
+            if ! db_clear_service_outbound_mieru; then
+                cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+                rm -f "$snap"
+                _err "Mieru 出口迁移: 清空空 service_outbound.mieru 失败（已恢复）"
+                return 1
+            fi
+        fi
+        rm -f "$snap"
+        return 0
+    fi
+
+    case "$svc" in
+        direct|warp|chain:*|balancer:*) ;;
+        *)
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "Mieru 出口迁移: 无效 service_outbound.mieru=$svc（已恢复）"
+            return 1
+            ;;
+    esac
+
+    # May be empty — still clear service field after snap
+    ports=$(db_list_ports xray mieru 2>/dev/null || true)
+
+    while IFS= read -r port; do
+        [[ -z "$port" ]] && continue
+        if ! db_set_instance_outbound xray mieru "$port" "$svc"; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "Mieru 出口迁移: 写入实例 $port=$svc 失败（已恢复）"
+            return 1
+        fi
+        got=$(db_get_instance_outbound xray mieru "$port" 2>/dev/null || true)
+        if [[ "$got" != "$svc" ]]; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "Mieru 出口迁移: 实例 $port 回读期望=$svc 实际=${got:-<empty>}（已恢复）"
+            return 1
+        fi
+    done <<< "$ports"
+
+    if ! db_clear_service_outbound_mieru; then
+        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+        rm -f "$snap"
+        _err "Mieru 出口迁移: 清除 service_outbound.mieru 失败（已恢复）"
+        return 1
+    fi
+
+    still=$(jq -r '.service_outbound.mieru // empty' "$DB_FILE" 2>/dev/null || true)
+    if [[ -n "$still" ]]; then
+        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+        rm -f "$snap"
+        _err "Mieru 出口迁移: 清除后 service_outbound.mieru 仍为 $still（已恢复）"
+        return 1
+    fi
+
+    rm -f "$snap"
+    return 0
 }
 
 # 删除协议
@@ -20749,9 +20831,6 @@ db_rename_chain_node() {
         | if .balancer_groups then
             .balancer_groups = [.balancer_groups[] | if .nodes then .nodes = [.nodes[] | if . == $old then $new else . end] else . end]
           else . end
-        | if ((.service_outbound.mieru // "") == ("chain:" + $old)) then
-            .service_outbound.mieru = ("chain:" + $new)
-          else . end
         | if .xray then
             .xray = (
               .xray | with_entries(
@@ -33624,6 +33703,11 @@ main_menu() {
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
+    # v3.5.27 mieru outbound migrate: .service_outbound.mieru → per-instance instance_outbound (fail-closed)
+    if ! db_migrate_mieru_service_outbound_to_instances; then
+        _err "Mieru 出口迁移失败（数据库已恢复）；拒绝继续以免破坏出口配置"
+        exit 1
+    fi
     ensure_singbox_runtime_consistency 2>/dev/null || true
 
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
