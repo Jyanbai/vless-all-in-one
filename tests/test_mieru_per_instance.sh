@@ -150,11 +150,11 @@ if echo "$srs" | grep -q '_iob_n'; then
 else
   fail "status missing _iob_n first-row counter"
 fi
-if echo "$srs" | grep -c '实例: ' | awk '{exit !($1>=1 && $1<=2)}'; then
-  # allow label string twice in if/else arms, but not on every append line
-  pass "status 实例: label limited"
+# Label string appears only in first-row arm(s), not on every += line
+if echo "$srs" | grep -F '_iob_label="  实例: "' >/dev/null && ! echo "$srs" | grep -E '_iob_lines\+="  实例:' >/dev/null; then
+  pass "status 实例: first-row-only assignment"
 else
-  fail "status 实例: label count unexpected"
+  fail "status 实例: still hardcoded on every row"
 fi
 # Append path uses _iob_label (not hardcoded 实例: on every +=)
 if echo "$srs" | grep -F '_iob_lines+="${_iob_label}${_iob_body}"' >/dev/null; then
