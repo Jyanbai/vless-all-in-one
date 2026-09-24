@@ -11206,15 +11206,21 @@ _verify_script_blob() {
 _fetch_script_tmp() {
     local connect_timeout="${1:-10}"
     local max_time="${2:-}"
-    local tmp_file
+    local tmp_file fetch_url
+    # Cache-bust raw CDN so version-check/install do not see stale bytes
+    fetch_url="${SCRIPT_RAW_URL}?t=$(date +%s)"
     tmp_file=$(mktemp 2>/dev/null) || return 1
     if [[ -n "$max_time" ]]; then
-        if ! curl -sL --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
+        if ! curl -sL --connect-timeout "$connect_timeout" --max-time "$max_time" \
+            -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+            -o "$tmp_file" "$fetch_url"; then
             rm -f "$tmp_file"
             return 1
         fi
     else
-        if ! curl -sL --connect-timeout "$connect_timeout" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
+        if ! curl -sL --connect-timeout "$connect_timeout" \
+            -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+            -o "$tmp_file" "$fetch_url"; then
             rm -f "$tmp_file"
             return 1
         fi
@@ -11276,7 +11282,7 @@ _get_latest_script_version_from_raw() {
     echo "$version"
 }
 
-# 获取脚本最新版本号（优先 release，失败则 tag，带缓存）
+# 获取脚本最新版本号（SCRIPT_SOURCE_* raw 为源；tag/release 仅作兜底；带缓存）
 _get_latest_script_version() {
     local use_cache="${1:-true}"
     local force="${2:-false}"
@@ -11297,12 +11303,13 @@ _get_latest_script_version() {
         fi
     fi
 
-    version=$(_get_latest_version "$SCRIPT_REPO" "false" "true" 2>/dev/null)
+    # 配置的 SCRIPT_SOURCE_* 优先于仓库 tag/release，避免陈旧标签掩盖源分支上的新 VERSION
+    version=$(_get_latest_script_version_from_raw)
     if [[ -z "$version" ]]; then
-        version=$(_get_latest_tag_version "$SCRIPT_REPO")
+        version=$(_get_latest_version "$SCRIPT_REPO" "false" "true" 2>/dev/null)
     fi
     if [[ -z "$version" ]]; then
-        version=$(_get_latest_script_version_from_raw)
+        version=$(_get_latest_tag_version "$SCRIPT_REPO")
     fi
     [[ -z "$version" ]] && return 1
 
@@ -35002,16 +35009,25 @@ do_update() {
     
     _init_version_cache
     local tmp_file="" remote_ver=""
-    remote_ver=$(_get_latest_script_version "true" "false")
-    if [[ -z "$remote_ver" ]]; then
-        _err "无法获取远程版本信息"
+    # 手动「脚本更新」忽略 1h 缓存；一次拉取同时用于版本检查与安装（同源字节）
+    tmp_file=$(_fetch_script_tmp 10)
+    if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
+        _err "无法获取远程版本信息（下载或 blob/语法校验失败）"
         return 1
     fi
+    remote_ver=$(_extract_script_version "$tmp_file")
+    if [[ -z "$remote_ver" || ! "$remote_ver" =~ ^[0-9A-Za-z._-]+$ ]]; then
+        rm -f "$tmp_file"
+        _err "下载脚本缺少有效版本标识，已拒绝更新"
+        return 1
+    fi
+    echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
     
     echo -e "  最新版本: ${C}v${remote_ver}${NC}"
     
     # 比较版本 - 只有远程版本更新时才提示更新
     if ! _version_gt "$remote_ver" "$VERSION"; then
+        rm -f "$tmp_file"
         _ok "已是最新版本"
         return 0
     fi
@@ -35019,26 +35035,11 @@ do_update() {
     _line
     read -rp "  发现新版本，是否更新? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[nN]$ ]]; then
+        rm -f "$tmp_file"
         return 0
     fi
     
     _info "更新中..."
-    tmp_file=$(_fetch_script_tmp 10)
-    if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
-        _err "下载失败，请检查网络连接"
-        return 1
-    fi
-    local downloaded_ver
-    downloaded_ver=$(_extract_script_version "$tmp_file")
-    if [[ -z "$downloaded_ver" || ! "$downloaded_ver" =~ ^[0-9A-Za-z._-]+$ ]]; then
-        rm -f "$tmp_file"
-        _err "下载脚本缺少有效版本标识，已拒绝更新"
-        return 1
-    fi
-    if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$remote_ver" ]]; then
-        remote_ver="$downloaded_ver"
-        echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
-    fi
     
     # 获取当前脚本路径
     local script_path=$(readlink -f "$0")
@@ -35051,7 +35052,7 @@ do_update() {
     # 备份当前脚本
     cp "$script_path" "${script_path}.bak" 2>/dev/null
     
-    # 替换当前运行的脚本
+    # 替换当前运行的脚本（沿用已通过 blob SHA + bash -n 的同一临时文件）
     if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
         # 如果当前脚本不是系统目录的脚本，也更新系统目录
         if [[ "$script_path" != "$system_script" && -f "$system_script" ]]; then
