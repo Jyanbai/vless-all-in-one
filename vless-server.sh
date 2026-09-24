@@ -409,7 +409,7 @@ db_update_port() {
     '
 }
 
-# 实例出口 (instance_outbound): 缺省/空=继承全局; direct|warp|chain:|balancer:
+# 实例出口 (instance_outbound): 缺省/空=继承全局; direct|warp|chain:|balancer:|profile:<id>
 # 不落库字面量 "inherit"（与用户 .routing 词汇对齐）
 # 用法: db_get_instance_outbound "xray" "vless" "443"
 db_get_instance_outbound() {
@@ -421,7 +421,7 @@ db_get_instance_outbound() {
     echo "$cfg" | jq -r '.instance_outbound // empty'
 }
 
-# 用法: db_set_instance_outbound "xray" "vless" "443" "direct|warp|chain:x|balancer:g"
+# 用法: db_set_instance_outbound "xray" "vless" "443" "direct|warp|chain:x|balancer:g|profile:<id>"
 # 空值 → 清除字段（继承）
 db_set_instance_outbound() {
     local core="$1" protocol="$2" port="$3" value="${4:-}"
@@ -432,6 +432,13 @@ db_set_instance_outbound() {
     fi
     case "$value" in
         direct|warp|chain:*|balancer:*) ;;
+        profile:*)
+            local _pid="${value#profile:}"
+            if [[ -z "$_pid" ]] || ! db_routing_profile_exists "$_pid" 2>/dev/null; then
+                _err "分流规则集不存在: $value"
+                return 1
+            fi
+            ;;
         *) _err "无效实例出口: $value"; return 1 ;;
     esac
     _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --arg v "$value" '
@@ -484,6 +491,236 @@ db_list_instances_using_outbound() {
             "xray|\($proto)|\(port_key)|\(.instance_outbound)"
         end
     ' "$DB_FILE" 2>/dev/null
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# v3.5.28 Routing profiles (.routing_profiles[]) + Telegram DC matchers
+# Missing keys ⇒ identical to 3.5.27 (no migrate). fallback fixed to inherit.
+# profile:<id> is instance_outbound vocab; compile is Implementer's job.
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Stable id: [a-z0-9][a-z0-9_-]{0,63}
+_db_routing_profile_id_ok() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]
+}
+
+# 用法: db_routing_profile_exists "home"
+db_routing_profile_exists() {
+    local id="$1"
+    [[ -z "$id" || ! -f "$DB_FILE" ]] && return 1
+    local n
+    n=$(jq --arg id "$id" '[.routing_profiles[]? | select(.id == $id)] | length' "$DB_FILE" 2>/dev/null) || return 1
+    [[ "$n" -gt 0 ]]
+}
+
+# 用法: db_list_routing_profiles  → JSON array
+db_list_routing_profiles() {
+    [[ ! -f "$DB_FILE" ]] && { echo '[]'; return 0; }
+    jq -c '.routing_profiles // []' "$DB_FILE" 2>/dev/null || echo '[]'
+}
+
+# 用法: db_get_routing_profile "home"  → JSON object or empty
+db_get_routing_profile() {
+    local id="$1"
+    [[ -z "$id" || ! -f "$DB_FILE" ]] && return 1
+    local out
+    out=$(jq -c --arg id "$id" '.routing_profiles[]? | select(.id == $id)' "$DB_FILE" 2>/dev/null) || return 1
+    [[ -n "$out" && "$out" != "null" ]] || return 1
+    echo "$out"
+}
+
+# 用法: db_add_routing_profile "home" "家宽" [rules_json]
+# rules_json default []; fallback always "inherit"; refuse duplicate id
+db_add_routing_profile() {
+    local id="$1" name="$2" rules_json="${3:-[]}"
+    [[ -z "$id" || -z "$name" ]] && { _err "db_add_routing_profile: id/name required"; return 1; }
+    _db_routing_profile_id_ok "$id" || { _err "非法规则集 id: $id"; return 1; }
+    if ! echo "$rules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        _err "db_add_routing_profile: rules 必须是 JSON 数组"
+        return 1
+    fi
+    [[ ! -f "$DB_FILE" ]] && init_db
+    if db_routing_profile_exists "$id"; then
+        _err "分流规则集已存在: $id"
+        return 1
+    fi
+    _db_apply --arg id "$id" --arg name "$name" --argjson rules "$rules_json" '
+        .routing_profiles = ((.routing_profiles // []) + [{
+            id: $id,
+            name: $name,
+            fallback: "inherit",
+            rules: $rules
+        }])
+    '
+}
+
+# 用法: db_update_routing_profile "home" "新名称" [rules_json]
+# Omitting rules_json keeps existing rules. id immutable. fallback forced inherit.
+db_update_routing_profile() {
+    local id="$1" name="$2" rules_json="${3-}"
+    [[ -z "$id" || -z "$name" ]] && { _err "db_update_routing_profile: id/name required"; return 1; }
+    db_routing_profile_exists "$id" || { _err "分流规则集不存在: $id"; return 1; }
+    if [[ -n "$rules_json" ]]; then
+        if ! echo "$rules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            _err "db_update_routing_profile: rules 必须是 JSON 数组"
+            return 1
+        fi
+        _db_apply --arg id "$id" --arg name "$name" --argjson rules "$rules_json" '
+            .routing_profiles = ((.routing_profiles // []) | map(
+                if .id == $id then .name = $name | .fallback = "inherit" | .rules = $rules else . end
+            ))
+        '
+    else
+        _db_apply --arg id "$id" --arg name "$name" '
+            .routing_profiles = ((.routing_profiles // []) | map(
+                if .id == $id then .name = $name | .fallback = "inherit" else . end
+            ))
+        '
+    fi
+}
+
+# 用法: db_delete_routing_profile "home"
+# Refuses if any instance_outbound == profile:<id>
+db_delete_routing_profile() {
+    local id="$1"
+    [[ -z "$id" ]] && return 1
+    db_routing_profile_exists "$id" || { _err "分流规则集不存在: $id"; return 1; }
+    local users
+    users=$(db_list_instances_using_profile "$id" 2>/dev/null || true)
+    if [[ -n "$users" ]]; then
+        _err "分流规则集使用中，无法删除: profile:$id"
+        return 1
+    fi
+    _db_apply --arg id "$id" '
+        .routing_profiles = ((.routing_profiles // []) | map(select(.id != $id)))
+    '
+}
+
+# 用法: db_copy_routing_profile "home" "home2" ["家宽副本"]
+db_copy_routing_profile() {
+    local src="$1" dst="$2" name="${3:-}"
+    [[ -z "$src" || -z "$dst" ]] && { _err "db_copy_routing_profile: src/dst required"; return 1; }
+    _db_routing_profile_id_ok "$dst" || { _err "非法规则集 id: $dst"; return 1; }
+    local src_json
+    src_json=$(db_get_routing_profile "$src") || { _err "分流规则集不存在: $src"; return 1; }
+    db_routing_profile_exists "$dst" && { _err "分流规则集已存在: $dst"; return 1; }
+    [[ -z "$name" ]] && name=$(echo "$src_json" | jq -r '.name // $src' --arg src "$src")
+    local rules
+    rules=$(echo "$src_json" | jq -c '.rules // []')
+    db_add_routing_profile "$dst" "$name" "$rules"
+}
+
+# 用法: db_list_instances_using_profile "home"
+# 输出: core|protocol|port|profile:<id>  (reuse outbound scanner)
+db_list_instances_using_profile() {
+    local id="$1"
+    [[ -z "$id" ]] && return 0
+    db_list_instances_using_outbound "profile:$id"
+}
+
+# 用法: db_get_routing_profile_rules "home" → JSON array
+db_get_routing_profile_rules() {
+    local id="$1"
+    local p
+    p=$(db_get_routing_profile "$id") || return 1
+    echo "$p" | jq -c '.rules // []'
+}
+
+# 用法: db_set_routing_profile_rules "home" '[{...}]'
+# Replaces whole ordered rules array; does NOT reorder by outbound=direct.
+db_set_routing_profile_rules() {
+    local id="$1" rules_json="$2"
+    [[ -z "$id" ]] && return 1
+    db_routing_profile_exists "$id" || { _err "分流规则集不存在: $id"; return 1; }
+    if ! echo "$rules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        _err "db_set_routing_profile_rules: rules 必须是 JSON 数组"
+        return 1
+    fi
+    _db_apply --arg id "$id" --argjson rules "$rules_json" '
+        .routing_profiles = ((.routing_profiles // []) | map(
+            if .id == $id then .rules = $rules | .fallback = "inherit" else . end
+        ))
+    '
+}
+
+# 用法: db_add_routing_profile_rule "home" '{"id":"r1","type":"telegram_dc",...}'
+# Appends (preserves order; DIRECT does not jump to front).
+db_add_routing_profile_rule() {
+    local id="$1" rule_json="$2"
+    [[ -z "$id" ]] && return 1
+    db_routing_profile_exists "$id" || { _err "分流规则集不存在: $id"; return 1; }
+    if ! echo "$rule_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        _err "db_add_routing_profile_rule: rule 必须是 JSON 对象"
+        return 1
+    fi
+    _db_apply --arg id "$id" --argjson rule "$rule_json" '
+        .routing_profiles = ((.routing_profiles // []) | map(
+            if .id == $id then .rules = ((.rules // []) + [$rule]) else . end
+        ))
+    '
+}
+
+# 用法: db_delete_routing_profile_rule "home" "rule_id"
+db_delete_routing_profile_rule() {
+    local id="$1" rule_id="$2"
+    [[ -z "$id" || -z "$rule_id" ]] && return 1
+    db_routing_profile_exists "$id" || { _err "分流规则集不存在: $id"; return 1; }
+    _db_apply --arg id "$id" --arg rid "$rule_id" '
+        .routing_profiles = ((.routing_profiles // []) | map(
+            if .id == $id then .rules = ((.rules // []) | map(select(.id != $rid))) else . end
+        ))
+    '
+}
+
+# 用法: db_get_telegram_dc_matchers → JSON object ({} if absent)
+db_get_telegram_dc_matchers() {
+    [[ ! -f "$DB_FILE" ]] && { echo '{}'; return 0; }
+    jq -c '.telegram_dc_matchers // {}' "$DB_FILE" 2>/dev/null || echo '{}'
+}
+
+# 用法: db_set_telegram_dc_matchers '<json>'
+db_set_telegram_dc_matchers() {
+    local json="$1"
+    if ! echo "$json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        _err "db_set_telegram_dc_matchers: 需要 JSON 对象"
+        return 1
+    fi
+    [[ ! -f "$DB_FILE" ]] && init_db
+    _db_apply --argjson m "$json" '.telegram_dc_matchers = $m'
+}
+
+# Best-effort known Telegram DC endpoints (NOT a full CIDR DB; IPs change).
+# Source: Telegram Desktop / TDLib publicly documented DC addresses (snapshot).
+# Choice A: versioned seed + Telegram fallback for misses (fallback owned by Implementer compile).
+# 用法: db_seed_telegram_dc_matchers_if_absent
+db_seed_telegram_dc_matchers_if_absent() {
+    [[ ! -f "$DB_FILE" ]] && init_db
+    local existing
+    existing=$(jq -r '.telegram_dc_matchers.source // empty' "$DB_FILE" 2>/dev/null || true)
+    [[ -n "$existing" ]] && return 0
+    local seed
+    seed=$(jq -n '{
+      source: "telegram-desktop/tdlib-published-dc-endpoints",
+      version: "2026-09-24.v1",
+      verified_at: "2026-09-24T00:00:00+08:00",
+      note: "Best-effort known-endpoint seed only; NOT a permanent Telegram CIDR database. Misses must use Telegram fallback (not guessed DC).",
+      dc1: ["149.154.175.50","149.154.175.53","2001:b28:f23d:f001::a","2001:b28:f23d:f001::b"],
+      dc2: ["149.154.167.50","149.154.167.51","2001:67c:4e8:f002::a","2001:67c:4e8:f002::b"],
+      dc3: ["149.154.175.100","149.154.175.104","2001:b28:f23d:f003::a","2001:b28:f23d:f003::b"],
+      dc4: ["149.154.167.91","149.154.167.92","2001:67c:4e8:f004::a","2001:67c:4e8:f004::b"],
+      dc5: ["91.108.56.100","91.108.56.116","2001:b28:f23f:f005::a","2001:b28:f23f:f005::b"]
+    }')
+    db_set_telegram_dc_matchers "$seed"
+}
+
+# 用法: db_ensure_routing_profiles_defaults
+# No-op migrate: ensure arrays/objects exist only when callers opt in; absent ≡ 3.5.27.
+db_ensure_routing_profiles_defaults() {
+    [[ ! -f "$DB_FILE" ]] && init_db
+    _db_apply '
+        if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
+    '
+    db_seed_telegram_dc_matchers_if_absent
 }
 
 # Mieru legacy .service_outbound.mieru — migration-only get/clear (v3.5.27).
@@ -4200,6 +4437,15 @@ _resolve_instance_outbound_target() {
             fi
             _INSTANCE_OB_KIND=balancer
             _INSTANCE_OB_TAG="balancer-${group_name}"
+            ;;
+        profile:*)
+            local _pid="${routing#profile:}"
+            if [[ -z "$_pid" ]] || ! db_routing_profile_exists "$_pid" 2>/dev/null; then
+                _err "分流规则集不存在: $routing"
+                return 1
+            fi
+            _INSTANCE_OB_KIND=profile
+            _INSTANCE_OB_TAG="$_pid"
             ;;
         ""|inherit|null)
             return 1
