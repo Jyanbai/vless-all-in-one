@@ -21409,6 +21409,22 @@ manage_instance_outbound() {
                 ((idx++))
             done < <(db_list_ports "xray" "$proto" 2>/dev/null)
         done
+        # Mieru is NOT in XRAY_PROTOCOLS — enumerate after Xray via existing DB helpers.
+        # db_list_ports returns one key per row (numeric port OR portRange string).
+        if db_exists "xray" "mieru" 2>/dev/null; then
+            proto="mieru"
+            while IFS= read -r port; do
+                [[ -z "$port" || "$port" == "null" ]] && continue
+                ob=$(db_get_instance_outbound "xray" "mieru" "$port" 2>/dev/null || true)
+                local ob_disp
+                ob_disp=$(_get_outbound_display_name "$ob")
+                local pname
+                pname=$(get_protocol_name "mieru" 2>/dev/null || echo "mieru")
+                echo -e "  ${G}${idx}${NC}) ${pname} :${port}  →  ${C}${ob_disp}${NC}"
+                entries+=("port|mieru|${port}|${ob}")
+                ((idx++))
+            done < <(db_list_ports "xray" "mieru" 2>/dev/null)
+        fi
         if [[ ${#entries[@]} -eq 0 ]]; then
             echo -e "  ${D}暂无 Xray / Mieru 入站实例${NC}"
             _pause
