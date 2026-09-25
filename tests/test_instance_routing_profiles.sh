@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Local semantic tests for per-instance routing profiles (v3.5.28/3.5.29 DA)
+# v3.5.30: profile UI retired — checks flipped to assert the removal (legacy compile kept).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/vless-server.sh"
@@ -27,7 +28,7 @@ for s in db_routing_profile_exists db_list_routing_profiles db_get_routing_profi
          db_get_routing_profile_rules db_set_routing_profile_rules \
          db_add_routing_profile_rule db_delete_routing_profile_rule \
          db_get_telegram_dc_matchers db_set_telegram_dc_matchers \
-         db_seed_telegram_dc_matchers_if_absent db_ensure_routing_profiles_defaults \
+         db_seed_telegram_dc_matchers_if_absent \
          db_routing_template_rules_finance_crypto db_routing_template_rules_telegram_dc \
          db_routing_template_rules_ai_media db_routing_template_rules \
          _db_routing_rule_outbound_ok _db_routing_rules_outbounds_ok \
@@ -35,13 +36,17 @@ for s in db_routing_profile_exists db_list_routing_profiles db_get_routing_profi
          db_migrate_routing_profiles_v3529 \
          _resolve_profile_rule_outbound _gen_xray_profile_inbound_rules \
          _gen_xray_profile_outbound_needs _mieru_expand_profile_rules \
-         _list_profiles_referencing_outbound _routing_profile_validate_and_apply \
-         manage_routing_profiles wizard_home_broadband_direct_backup \
-         _select_instance_outbound_policy; do
+         _list_profiles_referencing_outbound; do
   if grep -q "^${s}()" "$SCRIPT"; then pass "symbol $s"; else fail "missing $s"; fi
 done
+# v3.5.30: retired UI / defaults helpers must be gone
+for s in db_ensure_routing_profiles_defaults _routing_profile_validate_and_apply \
+         manage_routing_profiles wizard_home_broadband_direct_backup \
+         _select_instance_outbound_policy _edit_routing_profile _show_routing_profile_users; do
+  if grep -q "^${s}()" "$SCRIPT"; then fail "retired symbol still defined: $s"; else pass "retired $s"; fi
+done
 grep -q '分流规则集' "$SCRIPT" && pass "marker 分流规则集 (errors/dead OK)" || fail "marker missing"
-grep -q '家宽 + 直出备用\|家宽 + 直出备用向导' "$SCRIPT" && pass "wizard marker" || fail "wizard marker missing"
+grep -q '家宽 + 直出备用\|家宽 + 直出备用向导' "$SCRIPT" && fail "wizard marker still present" || pass "wizard marker removed"
 grep -q '旧规则集' "$SCRIPT" && pass "legacy marker" || fail "legacy marker missing"
 
 echo "=== D: profile:<id> vocab resolve fail-closed missing ==="
@@ -68,15 +73,18 @@ grep -A30 'profile:\*)' "$SCRIPT" | grep -q '_mieru_expand_profile_rules\|_mieru
 echo "=== H: DIRECT does not reorder ==="
 grep -q 'does NOT reorder by outbound=direct\|DIRECT does not\|不浮动 DIRECT\|不重排' "$SCRIPT" && pass "no DIRECT reorder" || fail "reorder note missing"
 
-echo "=== I: ensure does NOT auto-create finance/tg/ai profiles ==="
-block=$(awk '/^db_ensure_routing_profiles_defaults\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-if echo "$block" | grep -q 'db_add_routing_profile "finance_crypto"\|db_add_routing_profile "telegram_dc"\|db_add_routing_profile "ai_media"'; then
-  fail "ensure still seeds finance/tg/ai profiles"
+echo "=== I: v3.5.30 no defaults/auto-create path (ensure removed) ==="
+grep -q '^db_ensure_routing_profiles_defaults()' "$SCRIPT" && fail "ensure defaults fn still present" || pass "ensure defaults fn removed"
+if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'db_add_routing_profile "finance_crypto"\|db_add_routing_profile "telegram_dc"\|db_add_routing_profile "ai_media"'; then
+  fail "script still seeds finance/tg/ai profiles"
 else
-  pass "ensure does not seed finance/tg/ai"
+  pass "no finance/tg/ai auto-create"
 fi
-echo "$block" | grep -q 'db_seed_telegram_dc_matchers_if_absent' && pass "ensure seeds telegram matchers" || fail "ensure missing matchers seed"
-echo "$block" | grep -q 'routing_profiles' && pass "ensure array init" || fail "ensure no array init"
+# matchers seeder kept as dead helper only: no caller may run it at startup
+_seed_callers=$(grep -n 'db_seed_telegram_dc_matchers_if_absent' "$SCRIPT" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'db_seed_telegram_dc_matchers_if_absent()' || true)
+[[ -z "$_seed_callers" ]] && pass "no startup matchers seed caller" || fail "matchers seed still called: $_seed_callers"
+init_block=$(awk '/^init_db\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
+echo "$init_block" | grep -q 'routing_profiles' && fail "init_db still initialises routing_profiles" || pass "init_db has no routing_profiles init"
 
 echo "=== J: Telegram DC uses matchers not fake geoip:telegram ==="
 grep -q 'geoip:telegram' "$SCRIPT" && {
@@ -95,11 +103,12 @@ grep -A45 '^db_delete_balancer_group()' "$SCRIPT" | grep -q '_list_profiles_refe
 grep -A55 '^uninstall_warp()' "$SCRIPT" | grep -q '_list_profiles_referencing_outbound' && pass "warp guard profiles" || fail "warp guard"
 
 echo "=== M: shared-profile edit transactional markers ==="
-grep -q 'profile-apply' "$SCRIPT" && pass "profile-apply marker" || fail "no profile-apply"
-grep -q '_routing_profile_validate_and_apply' "$SCRIPT" && pass "validate_and_apply" || fail "no validate helper"
-grep -A35 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'Dry-run Xray' && pass "dry-compile xray unused" || fail "no xray dry-compile"
-grep -A40 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'Dry-run Mieru' && pass "dry-compile mieru unused" || fail "no mieru dry-compile"
-grep -A40 '^_routing_profile_validate_and_apply()' "$SCRIPT" | grep -q 'dry-compile' && pass "dry-compile marker" || fail "no dry-compile marker"
+# v3.5.30: shared-profile editing retired -> its transactional apply path must be gone
+grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'profile-apply' && fail "profile-apply path still present" || pass "profile-apply path removed"
+grep -q '_routing_profile_validate_and_apply' "$SCRIPT" && fail "validate_and_apply still referenced" || pass "validate_and_apply removed"
+grep -q 'Dry-run Xray' "$SCRIPT" && fail "profile edit Xray dry-run still present" || pass "no profile-edit Xray dry-run"
+grep -q 'Dry-run Mieru' "$SCRIPT" && fail "profile edit Mieru dry-run still present" || pass "no profile-edit Mieru dry-run"
+grep -q '^manage_routing_profiles()\|^_edit_routing_profile()' "$SCRIPT" && fail "profile editor still present" || pass "no profile editor (nothing to dry-compile)"
 
 echo "=== N: template ids + fallback=inherit ==="
 for id in ai_media finance_crypto telegram_dc; do
@@ -118,25 +127,30 @@ if grep -A80 '^_select_outbound()' "$SCRIPT" | grep -q 'outbounds+=("profile:'; 
 else
   pass "select_outbound REAL only (no profile)"
 fi
-grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && pass "instance policy selector symbol (kept)" || fail "no instance policy selector"
-# Fixed instance outbound menu: 1 inherit … 6 home 7 direct_backup 8 wizard
+grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && fail "instance policy selector still present" || pass "instance policy selector removed"
+# v3.5.30 fixed instance outbound menu: 1 inherit 2 direct 3 WARP 4 chain 5 balancer 0 back (6/7/8 gone)
 prompt_block=$(awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
 # UI must not show internal ids; code still assigns profile:home / profile:direct_backup
-echo "$prompt_block" | grep -qE '家宽' && pass "prompt offers 家宽" || fail "prompt no 家宽"
-echo "$prompt_block" | grep -qE '直出备用' && pass "prompt offers 直出备用" || fail "prompt no 直出备用"
-echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:home"' && pass "prompt binds profile:home internally" || fail "prompt missing home assign"
-echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"' && pass "prompt binds profile:direct_backup internally" || fail "prompt missing direct_backup assign"
+echo "$prompt_block" | grep -qE '家宽' && fail "prompt still offers 家宽" || pass "prompt no 家宽 option"
+echo "$prompt_block" | grep -qE '直出备用' && fail "prompt still offers 直出备用" || pass "prompt no 直出备用 option"
+echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:home"' && fail "prompt still binds profile:home" || pass "prompt never binds profile:home"
+echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"' && fail "prompt still binds profile:direct_backup" || pass "prompt never binds profile:direct_backup"
+_items=$(echo "$prompt_block" | sed -n 's/.*\${G}\([0-9]\)\${NC}).*/\1/p' | tr '\n' ' ')
+[[ "$_items" == "1 2 3 4 5 0 " ]] && pass "prompt items exactly 1-5,0" || fail "prompt items: $_items"
+for _o in 6 7 8; do
+  echo "$prompt_block" | grep -qE "^[[:space:]]*${_o}\)" && fail "prompt still handles option $_o" || pass "prompt option $_o gone"
+done
 if echo "$prompt_block" | grep -E 'echo .*\(profile:(home|direct_backup)\)' >/dev/null; then
   fail "prompt still shows profile: ids in UI echo"
 else
   pass "prompt UI hides profile: ids"
 fi
-echo "$prompt_block" | grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' && pass "prompt item 8 wizard" || fail "prompt no wizard"
+echo "$prompt_block" | grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' && fail "prompt still has item 8 wizard" || pass "prompt item 8 wizard removed"
 echo "$prompt_block" | grep -q '_prompt_pick_chain_outbound' && pass "prompt chain pick" || fail "prompt no chain"
 echo "$prompt_block" | grep -q '_prompt_pick_balancer_outbound' && pass "prompt balancer pick" || fail "prompt no balancer"
 echo "$prompt_block" | grep -q '旧规则集' && pass "prompt legacy path" || fail "prompt no legacy"
 
-echo "=== Q: menu 10 分流规则集 withdrawn; wizard on instance item 8 ==="
+echo "=== Q: menu 10 分流规则集 withdrawn; wizard/CRUD retired ==="
 mgr=$(awk '/^manage_routing\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
 if echo "$mgr" | grep -q '分流规则集'; then
   fail "menu still exposes 分流规则集"
@@ -159,9 +173,8 @@ else
   pass "menu 11 duplicate removed"
 fi
 # wizard reachable from instance outbound item 8 (not generic profiles CRUD)
-awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT" | grep -q 'wizard_home_broadband_direct_backup' && pass "wizard via instance menu 8" || fail "wizard not in instance menu"
-# generic CRUD menu must not be in product manage_routing path (dead-code leave OK)
-grep -q '^manage_routing_profiles()' "$SCRIPT" && pass "profiles fn kept (dead/unhooked OK)" || fail "profiles fn deleted unexpectedly"
+grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'wizard_home_broadband_direct_backup' && fail "wizard still referenced" || pass "wizard not reachable anywhere"
+grep -q '^manage_routing_profiles()' "$SCRIPT" && fail "profiles CRUD fn still defined" || pass "profiles CRUD fn deleted (v3.5.30)"
 
 echo "=== R: jq unit — profile rule inboundTag shape ==="
 rule=$(jq -n --argjson tags '["vless-443"]' --arg tag "direct-prefer-ipv4" \
@@ -218,17 +231,17 @@ echo "=== X: mieru profile merges global (pref + glob) ==="
 grep -n '\$p + \$g\|$p + $g' "$SCRIPT" | grep -q . && pass "mieru merge profile+global" || \
   grep -q "\$p + \$g" "$SCRIPT" && pass "mieru merge" || fail "no merge"
 
-echo "=== Y: wizard home+direct_backup; migrate keeps home_broadband legacy ==="
+echo "=== Y: wizard retired; migrate still handles legacy home_broadband ==="
 grep -q 'home_broadband' "$SCRIPT" && pass "home_broadband legacy (migrate)" || fail "no home_broadband"
-grep -A5 'pid="home"' "$SCRIPT" | grep -q '家宽' && pass "wizard creates home/家宽" ||   grep -n 'pid="home"' "$SCRIPT" | grep -q . && pass "wizard home id" || fail "wizard no home id"
-grep -q 'pid="direct_backup"' "$SCRIPT" && pass "wizard creates direct_backup" || fail "wizard no direct_backup"
-awk '/^wizard_home_broadband_direct_backup\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT" | grep -q 'db_routing_template_rules' && pass "wizard uses templates" || fail "wizard no templates"
-grep -A80 '^wizard_home_broadband_direct_backup()' "$SCRIPT" | grep -q 'db_migrate_routing_profiles_v3529' && pass "wizard calls migrate" || fail "wizard no migrate call"
-wiz=$(awk '/^wizard_home_broadband_direct_backup\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-echo "$wiz" | grep -q '步骤 1/5' && pass "wizard multi-step" || fail "wizard not multi-step"
-echo "$wiz" | grep -q 'pid="home"' && pass "wizard upserts home" || fail "wizard no home upsert"
-echo "$wiz" | grep -q 'pid="direct_backup"' && pass "wizard upserts direct_backup" || fail "wizard no backup upsert"
-echo "$wiz" | grep -q 'ai_direct\|db_routing_template_rules_ai_media "direct"' && pass "wizard AI direct_backup=DIRECT" || fail "wizard AI semantics"
+grep -q 'pid="home"' "$SCRIPT" && fail "script still creates home profile" || pass "no home profile creation"
+grep -q 'pid="direct_backup"' "$SCRIPT" && fail "script still creates direct_backup profile" || pass "no direct_backup profile creation"
+grep -q '^wizard_home_broadband_direct_backup()' "$SCRIPT" && fail "wizard fn still defined" || pass "wizard fn removed"
+grep -q '步骤 1/5' "$SCRIPT" && fail "wizard steps still present" || pass "wizard steps removed"
+_non_db_create=$(awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/{fn=$1} /db_add_routing_profile[ "]|db_copy_routing_profile[ "]/ && !/^[[:space:]]*#/ && fn !~ /^_?db_/ {print NR}' "$SCRIPT")
+[[ -z "$_non_db_create" ]] && pass "no UI path creates profiles" || fail "profile create callers at lines: $_non_db_create"
+grep -q 'ai_direct\|db_routing_template_rules_ai_media "direct"' "$SCRIPT" && fail "wizard AI direct_backup semantics still present" || pass "wizard AI semantics removed"
+db_mig_body=$(awk '/^db_migrate_routing_profiles_v3529\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
+echo "$db_mig_body" | grep -q '_has_legacy_routing_profile_state' && pass "migrate gated on legacy state" || fail "migrate not gated"
 grep -q 'db_migrate_routing_profiles_v3529' "$SCRIPT" && pass "migrate symbol wired in script" || fail "no migrate"
 
 echo "=== Z: v3.5.28/29 markers present (no forced VERSION bump) ==="
@@ -242,7 +255,7 @@ echo "=== AB: template telegram clean of geoip:telegram ==="
 block=$(awk '/^db_routing_template_rules_telegram_dc\(\)/,/^}$/' "$SCRIPT" | head -30)
 echo "$block" | grep -q 'geoip:telegram' && fail "template has geoip:telegram" || pass "template clean of geoip:telegram"
 
-echo "=== AC: offline DB smoke — ensure + migrate A/B/C/home ==="
+echo "=== AC: offline DB smoke — clean init (no routing_profiles) + migrate A/B/C/home ==="
 TMP=$(mktemp -d)
 CFG="$TMP"
 DB_FILE="$TMP/db.json"
@@ -264,7 +277,7 @@ HS
     BEGIN { want=0 }
     /^_db_port_key_jq=/ { print; next }
     /^(DB_LOCK_FD=|DB_LOCK_DIR_HELD=)/ { print; next }
-    /^(_db_lock_acquire|_db_lock_release|init_db|_db_apply|db_list_ports|db_get_port_config|db_get_instance_outbound|db_set_instance_outbound|db_clear_instance_outbound|db_list_instances_using_outbound|_db_routing_profile_id_ok|_db_routing_rule_outbound_ok|_db_routing_rules_outbounds_ok|db_routing_profile_exists|db_list_routing_profiles|db_get_routing_profile|db_add_routing_profile|db_update_routing_profile|db_delete_routing_profile|db_list_instances_using_profile|db_get_routing_profile_rules|db_set_routing_profile_rules|db_add_routing_profile_rule|db_get_telegram_dc_matchers|db_set_telegram_dc_matchers|db_seed_telegram_dc_matchers_if_absent|db_routing_template_rules_finance_crypto|db_routing_template_rules_telegram_dc|db_routing_template_rules_ai_media|db_routing_template_rules|_db_routing_profile_rules_exact_seed|db_ensure_routing_profiles_defaults|db_audit_routing_profiles_nested|db_repair_routing_profiles_nested|_db_migrate_drop_unused_exact_seed_profile|_db_rewrite_instance_outbound_value|db_migrate_routing_profiles_v3529)\(\)/ {
+    /^(_db_lock_acquire|_db_lock_release|init_db|_db_apply|db_list_ports|db_get_port_config|db_get_instance_outbound|db_set_instance_outbound|db_clear_instance_outbound|db_list_instances_using_outbound|_db_routing_profile_id_ok|_db_routing_rule_outbound_ok|_db_routing_rules_outbounds_ok|db_routing_profile_exists|db_list_routing_profiles|db_get_routing_profile|db_add_routing_profile|db_update_routing_profile|db_delete_routing_profile|db_list_instances_using_profile|db_get_routing_profile_rules|db_set_routing_profile_rules|db_add_routing_profile_rule|db_get_telegram_dc_matchers|db_set_telegram_dc_matchers|db_seed_telegram_dc_matchers_if_absent|db_routing_template_rules_finance_crypto|db_routing_template_rules_telegram_dc|db_routing_template_rules_ai_media|db_routing_template_rules|_db_routing_profile_rules_exact_seed|_has_legacy_routing_profile_state|db_audit_routing_profiles_nested|db_repair_routing_profiles_nested|_db_migrate_drop_unused_exact_seed_profile|_db_rewrite_instance_outbound_value|db_migrate_routing_profiles_v3529)\(\)/ {
       want=1
     }
     want { print }
@@ -282,17 +295,21 @@ HS
   cat <<'BODY'
 init_db
 
-# 1) ensure does NOT create the three profiles
-db_ensure_routing_profiles_defaults
+# 1) v3.5.30: clean init creates no routing_profiles / no matchers; clean migrate is a no-op
+jq -e 'has("routing_profiles")|not' "$DB_FILE" >/dev/null || { echo "INIT_CREATED_ROUTING_PROFILES" >&2; exit 9; }
+_h0=$(md5sum < "$DB_FILE")
+db_migrate_routing_profiles_v3529
+[[ "$(md5sum < "$DB_FILE")" == "$_h0" ]] || { echo "CLEAN_MIGRATE_WROTE" >&2; exit 9; }
+jq -e 'has("routing_profiles")|not' "$DB_FILE" >/dev/null || { echo "MIGRATE_CREATED_ROUTING_PROFILES" >&2; exit 9; }
 for id in finance_crypto telegram_dc ai_media; do
   if db_routing_profile_exists "$id"; then
     echo "ENSURE_CREATED $id" >&2
     exit 10
   fi
 done
-# matchers seeded
-src=$(jq -r '.telegram_dc_matchers.source // empty' "$DB_FILE")
-[[ -n "$src" ]] || { echo "NO_MATCHERS" >&2; exit 11; }
+# matchers NOT auto-seeded; reader tolerates missing key
+jq -e 'has("telegram_dc_matchers")|not' "$DB_FILE" >/dev/null || { echo "MATCHERS_AUTO_SEEDED" >&2; exit 11; }
+[[ "$(db_get_telegram_dc_matchers)" == "{}" ]] || { echo "MATCHERS_READER" >&2; exit 11; }
 
 # 2) rule reject profile:*
 db_add_routing_profile "home" "家宽" '[]'
@@ -358,7 +375,7 @@ mkdir -p "$CFG2"
 DB_FILE="$CFG2/db.json"
 DB_LOCK_FILE="$CFG2/.db.lock"
 init_db
-db_ensure_routing_profiles_defaults
+jq -e 'has("routing_profiles")|not' "$DB_FILE" >/dev/null || { echo "INIT2_CREATED_ROUTING_PROFILES" >&2; exit 25; }
 rules_hb='[{"id":"hb1","type":"custom","domains":"geosite:openai","outbound":"direct","ip_version":"prefer_ipv4"}]'
 db_add_routing_profile "home_broadband" "家宽+直出备用" "$rules_hb"
 _db_apply '
@@ -375,7 +392,7 @@ ob=$(jq -r '.xray.vless[0].instance_outbound' "$DB_FILE")
 echo SMOKE_OK
 BODY
 } > "${HARNESS}.run"
-if bash "${HARNESS}.run"; then pass "offline ensure+migrate smoke"; else fail "offline smoke"; fi
+if bash "${HARNESS}.run"; then pass "offline clean-init+migrate smoke"; else fail "offline smoke"; fi
 rm -rf "$TMP" "$HARNESS" "${HARNESS}.run" 2>/dev/null || true
 
 echo ""
