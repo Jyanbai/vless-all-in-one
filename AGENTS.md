@@ -10,7 +10,18 @@
   - `当前脚本版本：**v…**` in `README_CN.md`
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
+## v3.5.30 product notes (docs surface)
+- **Routing Profiles retired from normal UI.** Instance outbound prompt (Xray + Mieru, install-time + `9) 实例出口管理`) = `1` inherit / `2` direct / `3` WARP / `4` chain / `5` balancer / `0` back. Options 6/7/8, `wizard_home_broadband_direct_backup`, `_select_instance_outbound_policy`, `manage_routing_profiles`, `_edit_routing_profile`, `_show_routing_profile_users`, `_routing_profile_validate_and_apply` deleted. No special-casing of `profile:home` / `profile:direct_backup`. Do not advertise profiles / 家宽 / 直出备用 / ids / schema in READMEs.
+- **Legacy compat (internal only):** stored `profile:*` stays readable + runnable. Picker shows `旧规则集: <name>` (missing ⇒ `旧规则集: 已缺失`; never print id), default `k` = keep (no write, no restart). Switching off last ref clears only `instance_outbound`; profile object kept as orphan. Missing profile fails closed in `_resolve_instance_outbound_target` (`分流规则集不存在: profile:<id>`). Compilers kept fail-closed: `_gen_xray_profile_inbound_rules`, `_gen_xray_profile_outbound_needs`, `_mieru_expand_profile_rules`, `_resolve_profile_rule_outbound`, `_profile_rule_domains_csv`, `_list_profiles_referencing_outbound`.
+- **Write vocab:** `db_set_instance_outbound` accepts only empty / `direct` / `warp` / `chain:<n>` / `balancer:<n>` (non-empty name). `profile:*` rejected unless equal to stored value (returns 0, writes nothing). `db_add/update/delete/copy_routing_profile*` kept but unreachable from UI.
+- **Migration gate:** `_has_legacy_routing_profile_state` true only for non-empty `.routing_profiles`, any `instance_outbound` `profile:*` (Mieru included), `home_broadband`, or exact leftover `.routing_profiles == []`. `db_migrate_routing_profiles_v3529` returns 0 with no write / no snapshot when false. Never creates `routing_profiles: []`; drops the leftover `[]` only when nothing references `profile:*`. Seed drop requires exact seed id + name + rules and zero refs; user-created/edited/renamed profiles always kept. `db_ensure_routing_profiles_defaults` removed; `init_db` never creates `.routing_profiles`; readers use `// []`.
+- **Startup order:** `check_root` → `init_log` → `ensure_startup_db_dependencies` (jq only, distro pkg helpers, verify after; else exit `缺少数据库依赖 jq，自动安装失败。请安装 jq 后重新运行脚本。`) → `init_db` → migrations. Full `check_dependencies` no longer runs at menu start. Missing jq must never surface as a profile-migration failure.
+- **Invariants:** never add mieru to `XRAY_PROTOCOLS`; Mieru `portRange` = one row.
+- **Tests:** `tests/test_routing_profile_retirement.sh` (A–N), `tests/test_startup_db_dependencies.sh` (A–F, mocked package managers; never real apt/apk), `tests/test_routing_profile_data_v3530.sh`, plus regressions.
+- **VERSION sync:** `3.5.30` in `vless-server.sh` (header comment too) + both READMEs.
+
 ## v3.5.29 product notes (docs surface)
+- **Superseded by v3.5.30** for routing UI (profile picker / wizard / 家宽 / 直出备用 entries removed); kept below as history.
 - **WITHDRAWN (not normal product entry):** top-level `10) 分流规则集` / `manage_routing_profiles` CRUD. Do not document it as a user-facing menu.
 - **KEEP backend:** `.routing_profiles`, `profile:<id>` vocab, compilers, validation, migration, templates (DA helpers unchanged).
 - **NEW surface — only via `9) 实例出口管理` picker:** inherit / direct / WARP / chain / balancer / 家宽 / 直出备用 / 配置重建 wizard. Stable ASCII ids `home` / `direct_backup` (`instance_outbound` stores `profile:home` | `profile:direct_backup`; no nested `profile:*`). Chinese names are UI-only — never emphasize internal ids in user-facing docs.

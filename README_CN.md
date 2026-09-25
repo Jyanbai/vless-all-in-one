@@ -15,8 +15,13 @@ Linux 服务器一体化代理部署脚本。
 - 提供用户管理、路由、订阅与故障排查文档
 - **mieru**（v3.5.20）：TCP/UDP、`port`/`portRange`、流量模式默认关闭；官方 `mierus://` 分享链接
 - **v3.5.26：** 从产品面移除 **SSH Tunnel**（选择/安装/创建）；仅保留可选遗留清理（`cleanup_legacy_ssh_tunnel`）；永不 stop/disable 系统 sshd
-- **v3.5.29：** 「实例出口管理」列出 Mieru（含状态列表；Xray 循环后经 db 枚举；绝不把 mieru 加入 XRAY_PROTOCOLS）。分流 **模板**（仅 matchers）与实例出口选择分离；通过向导配置/重建，并在「实例出口管理」选择「家宽」或「直出备用」。无顶层通用出口选择 CRUD 菜单；不再自动把 finance_crypto/telegram_dc/ai_media 种成独立选择项（保留为模板）。自更新以配置的 `SCRIPT_SOURCE_REPO`/`REF`/`PATH` 为准（手动「脚本更新」忽略 1h 缓存；不以过期 tag/release 盖住源分支 VERSION）。
-- **v3.5.28：** 实例级分流选择基于 matcher 包 `ai_media` / `finance_crypto` / `telegram_dc`（matchers + Telegram 回退；禁止伪造 `geoip:telegram`）。**自 v3.5.29 起：** 上述包仅为模板（matchers），不再自动作为可选出口；顶层分流选择菜单已撤回 — 在「实例出口管理」选择「家宽」/「直出备用」，并通过向导配置/重建。
+- **v3.5.30：**
+  - 实例出口（「实例出口管理」、安装与管理、Xray 与 Mieru）简化为 继承 / 直连 / WARP / 链式 / 负载均衡
+  - 旧版本已有的分流规则仅作为兼容保留：原样保留、可继续使用或切换掉
+  - 修复缺少 `jq` 时全新安装启动失败（现在会先安装 `jq` 再读写数据库）
+  - 干净系统启动时不再初始化旧分流数据
+- **v3.5.29：** 「实例出口管理」列出 Mieru（含状态列表；绝不把 mieru 加入 XRAY_PROTOCOLS）。自更新以配置的 `SCRIPT_SOURCE_REPO`/`REF`/`PATH` 为准（手动「脚本更新」忽略 1h 缓存；不以过期 tag/release 盖住源分支 VERSION）。本版的分流选择改动 **已被 v3.5.30 取代**
+- **v3.5.28：** 实例级分流选择 — **已被 v3.5.30 取代**（仅作旧版兼容保留）
 - **v3.5.27：** Mieru **实例级**运行时与出口 — 每个 port/`portRange` = 一个 mita（独立 JSON/UDS/unit/metrics，状态目录 `/var/lib/vless-mieru/<slug>`）；库字段 `.xray.mieru[].instance_outbound`（缺省/空=继承；从不写入字面量 `inherit`）；最终模型 **无** `.service_outbound.mieru`（菜单启动时 fail-closed 迁移）；「实例出口管理」按端口列出 mieru（无「Mieru（全部实例）」）
 - **v3.5.21：** 添加链式节点时延迟/批量 regenerate（未使用仅写库；添加+路由 ≤1 次 regen）；自定义路由 token 解析器，支持混合 geosite/域名/IP（Xray + Sing-box）
 - **v3.5.22：** Mieru 回退路径复用同一套路由 token helpers（修复混合自定义规则导致 Xray 异常）
@@ -30,7 +35,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.29**
+当前脚本版本：**v3.5.30**
 
 ## 用于流量统计的自定义 Sing-box 构建
 

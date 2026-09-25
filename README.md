@@ -15,8 +15,13 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
 - **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create); opt-in legacy cleanup only (`cleanup_legacy_ssh_tunnel`); never stop/disable system sshd
-- **v3.5.29:** Mieru rows in 实例出口管理 (+ status list; list via db after Xray; never add mieru to XRAY_PROTOCOLS). Routing **templates** (matchers-only) remain separate from instance outbound choices; configure/rebuild with the wizard and choose 家宽 / 直出备用 through the instance outbound picker (实例出口管理). No generic top-level routing-choice CRUD menu; no auto-seeding finance_crypto/telegram_dc/ai_media as standalone choices (those stay templates). Self-updater SoT: configured `SCRIPT_SOURCE_REPO`/`REF`/`PATH` (manual 脚本更新 ignores 1h cache; not stale tag/release).
-- **v3.5.28:** Per-instance routing choices based on matcher packs `ai_media` / `finance_crypto` / `telegram_dc` (matchers + Telegram fallback; no fake `geoip:telegram`). **As of v3.5.29:** those packs are templates (matchers-only), not automatically presented as selectable choices; the top-level routing-choice menu was withdrawn — choose 家宽 / 直出备用 in the **instance outbound picker (实例出口管理)** and configure/rebuild with the wizard.
+- **v3.5.30:**
+  - Instance outbound (实例出口管理, install and manage, Xray and Mieru) is simplified to inherit / direct / WARP / chain / balancer
+  - Existing routing rules from older versions keep working as legacy compatibility only; they are kept as-is and can be left in place or switched off
+  - Fixed fresh installs failing at startup when `jq` is missing (`jq` is now installed before the database is touched)
+  - Clean systems no longer initialize old routing data at startup
+- **v3.5.29:** Mieru rows in 实例出口管理 (+ status list; never add mieru to XRAY_PROTOCOLS). Self-updater SoT: configured `SCRIPT_SOURCE_REPO`/`REF`/`PATH` (manual 脚本更新 ignores 1h cache; not stale tag/release). Routing-choice changes in this release are **superseded by v3.5.30**
+- **v3.5.28:** Per-instance routing choices — **superseded by v3.5.30** (kept only as legacy compatibility)
 - **v3.5.27:** Mieru **per-instance** runtime + outbound — each port/`portRange` = one mita (own JSON/UDS/unit/metrics under `/var/lib/vless-mieru/<slug>`); DB `.xray.mieru[].instance_outbound` (empty/missing=inherit; never store `inherit`); **no** `.service_outbound.mieru` in final model (fail-closed migrate on menu start); 实例出口管理 lists mieru like Xray (no「Mieru（全部实例）」)
 - **v3.5.21:** deferred/batched regen when adding chain nodes (unused = DB-only; add+route ≤1 regen); custom routing token parser for mixed geosite/domain/IP (Xray + Sing-box)
 - **v3.5.22:** Mieru fallback path uses the same routing token helpers (fixes mixed custom rules breaking Xray)
@@ -30,7 +35,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.29**
+Current script version: **v3.5.30**
 
 ## Sing-box custom build for traffic stats
 
