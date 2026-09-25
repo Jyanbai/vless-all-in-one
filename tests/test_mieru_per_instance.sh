@@ -10,11 +10,11 @@ fail() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 echo "=== A: bash -n ==="
 if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
-echo "=== B: VERSION pin (VERSION 3.5.29) ==="
+echo "=== B: VERSION pin (VERSION 3.5.30) ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
 C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
-[[ "$VER" == "3.5.29" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
+[[ "$VER" == "3.5.30" && "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: per-instance symbols ==="
 for s in _mieru_instance_slug _mieru_instance_config_path _mieru_instance_svc_name \
