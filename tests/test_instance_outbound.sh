@@ -87,7 +87,7 @@ else fail "inherit not handled in setter"; fi
 
 echo "=== K: xray -test if binary present ==="
 if command -v xray >/dev/null 2>&1; then
-  tmp=$(mktemp)
+  tmp=$(mktemp "${TMPDIR:-/tmp}/vless-instance-outbound.XXXXXX.json")
   cat > "$tmp" <<'JSON'
 {
   "log": {"loglevel": "warning"},
