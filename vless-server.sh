@@ -409,7 +409,7 @@ db_update_port() {
     '
 }
 
-# 实例出口 (instance_outbound): 缺省/空=继承全局; direct|warp|chain:|balancer:|profile:<id>
+# 实例出口 (instance_outbound): 缺省/空=继承全局; direct|warp|chain:|balancer:; profile:<id> 仅旧数据兼容
 # 不落库字面量 "inherit"（与用户 .routing 词汇对齐）
 # 用法: db_get_instance_outbound "xray" "vless" "443"
 db_get_instance_outbound() {
@@ -421,8 +421,10 @@ db_get_instance_outbound() {
     echo "$cfg" | jq -r '.instance_outbound // empty'
 }
 
-# 用法: db_set_instance_outbound "xray" "vless" "443" "direct|warp|chain:x|balancer:g|profile:<id>"
+# 用法: db_set_instance_outbound "xray" "vless" "443" "direct|warp|chain:<n>|balancer:<n>"
 # 空值 → 清除字段（继承）
+# v3.5.30: 新写入只接受 空/direct/warp/chain:<n>/balancer:<n>。
+# profile:* 为旧规则集（仅兼容读取/运行）：不接受新写入；若与当前已存值完全相同则视为保留（不写库，返回 0）。
 db_set_instance_outbound() {
     local core="$1" protocol="$2" port="$3" value="${4:-}"
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -431,15 +433,19 @@ db_set_instance_outbound() {
         return $?
     fi
     case "$value" in
-        direct|warp|chain:*|balancer:*) ;;
+        direct|warp) ;;
+        chain:?*|balancer:?*) ;;
         profile:*)
-            local _pid="${value#profile:}"
-            if [[ -z "$_pid" ]] || ! db_routing_profile_exists "$_pid" 2>/dev/null; then
-                _err "分流规则集不存在: $value"
-                return 1
+            local _cur
+            _cur=$(db_get_instance_outbound "$core" "$protocol" "$port" 2>/dev/null || true)
+            if [[ "$_cur" == "$value" ]]; then
+                # legacy keep: no write, no restart
+                return 0
             fi
+            _err "旧规则集不再支持新设置: $value（仅可保留已有配置；请选择 继承/直连/WARP/链式/负载均衡）"
+            return 1
             ;;
-        *) _err "无效实例出口: $value"; return 1 ;;
+        *) _err "无效实例出口: $value（允许: 空/direct/warp/chain:<名称>/balancer:<名称>）"; return 1 ;;
     esac
     _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --arg v "$value" '
         def port_key:
@@ -819,17 +825,27 @@ _db_routing_profile_rules_exact_seed() {
     [[ "$a" == "$b" ]]
 }
 
-# 用法: db_ensure_routing_profiles_defaults
-# Ensure .routing_profiles is an array + telegram matchers.
-# Does NOT auto-create profiles finance_crypto / telegram_dc / ai_media (templates only).
-# Priority note for wizard/combined: finance_crypto & telegram_dc ABOVE ai_media.
-# DIRECT does not reorder. fallback always inherit.
-db_ensure_routing_profiles_defaults() {
-    [[ ! -f "$DB_FILE" ]] && init_db
-    _db_apply '
-        if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
-    '
-    db_seed_telegram_dc_matchers_if_absent
+# v3.5.30: db_ensure_routing_profiles_defaults removed (no caller; routing profiles are
+# legacy-only). Never create .routing_profiles on init/defaults; readers use `// []`.
+
+# True (0) only when the DB carries legacy routing-profile state worth migrating:
+#   - .routing_profiles is a non-empty array (meaningful profiles), or
+#   - any instance_outbound (any core/protocol) is profile:*, or
+#   - legacy home_broadband (profile id or profile:home_broadband ref), or
+#   - exact v3.5.28/29 migration artifact: .routing_profiles == [] (empty array key).
+# False (1) on clean DB / DB without the key ⇒ migration must not write or snapshot.
+# 用法: _has_legacy_routing_profile_state
+_has_legacy_routing_profile_state() {
+    [[ -f "$DB_FILE" ]] || return 1
+    jq -e '
+        (.routing_profiles) as $rp
+        | ([.. | objects | .instance_outbound? // empty | strings | select(startswith("profile:"))]) as $refs
+        | (($rp | type) == "array" and ($rp | length) > 0)
+          or (($refs | length) > 0)
+          or ([$rp[]? | objects | select(.id == "home_broadband")] | length > 0)
+          or ($refs | index("profile:home_broadband") != null)
+          or ($rp == [])
+    ' "$DB_FILE" >/dev/null 2>&1
 }
 
 # Scan all profile rules for illegal nested outbound profile:*.
@@ -944,21 +960,13 @@ _db_rewrite_instance_outbound_value() {
 # 返回: 0 成功/无需; 1 失败（已恢复快照）
 db_migrate_routing_profiles_v3529() {
     [[ ! -f "$DB_FILE" ]] && return 0
+    # v3.5.30: true no-op without legacy state (no write, no snapshot, never create .routing_profiles)
+    _has_legacy_routing_profile_state || return 0
 
     local snap
     snap="${DB_FILE}.mig-rp-v3529.$$"
     if ! cp -p "$DB_FILE" "$snap"; then
         _err "分流规则集迁移: 无法创建快照"
-        return 1
-    fi
-
-    # Ensure array exists (no profile auto-create)
-    if ! _db_apply '
-        if (.routing_profiles | type) != "array" then .routing_profiles = [] else . end
-    '; then
-        cp -p "$snap" "$DB_FILE" 2>/dev/null || true
-        rm -f "$snap"
-        _err "分流规则集迁移: 初始化 routing_profiles 失败（已恢复）"
         return 1
     fi
 
@@ -1036,6 +1044,19 @@ db_migrate_routing_profiles_v3529() {
             cp -p "$snap" "$DB_FILE" 2>/dev/null || true
             rm -f "$snap"
             _err "分流规则集迁移: 嵌套规则仍存在（已恢复）"
+            return 1
+        fi
+    fi
+
+    # v3.5.30: drop empty .routing_profiles artifact only when nothing references profile:*
+    # (never deletes a profile object; orphan profiles are preserved)
+    if jq -e '(.routing_profiles == []) and
+              ([.. | objects | .instance_outbound? // empty | strings | select(startswith("profile:"))] | length == 0)' \
+         "$DB_FILE" >/dev/null 2>&1; then
+        if ! _db_apply 'del(.routing_profiles)'; then
+            cp -p "$snap" "$DB_FILE" 2>/dev/null || true
+            rm -f "$snap"
+            _err "分流规则集迁移: 清理空 routing_profiles 失败（已恢复）"
             return 1
         fi
     fi
