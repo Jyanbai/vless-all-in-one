@@ -811,11 +811,20 @@ db_routing_template_rules() {
     esac
 }
 
-# Canonical compare: profile rules == exact v3.5.28 seed (outbound=direct).
+# Canonical compare: profile name AND rules == exact v3.5.28 seed (outbound=direct).
+# A renamed seed counts as user-edited ⇒ kept.
 # 用法: _db_routing_profile_rules_exact_seed "finance_crypto"
 _db_routing_profile_rules_exact_seed() {
     local id="$1"
-    local cur seed
+    local cur seed seed_name cur_name
+    case "$id" in
+        finance_crypto) seed_name="金融/加密" ;;
+        telegram_dc)    seed_name="Telegram DC" ;;
+        ai_media)       seed_name="AI/流媒体" ;;
+        *) return 1 ;;
+    esac
+    cur_name=$(db_get_routing_profile "$id" 2>/dev/null | jq -r '.name // empty' 2>/dev/null) || return 1
+    [[ "$cur_name" == "$seed_name" ]] || return 1
     cur=$(db_get_routing_profile_rules "$id" 2>/dev/null) || return 1
     seed=$(db_routing_template_rules "$id" "direct" 2>/dev/null) || return 1
     # Normalize via jq -c (stable field order from templates/seed)

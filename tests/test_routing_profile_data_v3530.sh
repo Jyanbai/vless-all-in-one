@@ -100,5 +100,12 @@ echo "=== 10 static: no auto-create in product ==="
 if grep -n 'routing_profiles = \[\]' "$SCRIPT" | grep -v '^\s*[0-9]*:\s*#' | grep -q .; then fail "auto-create remains"; else pass "no '.routing_profiles = []'"; fi
 grep -q '^db_ensure_routing_profiles_defaults()' "$SCRIPT" && fail "defaults fn remains" || pass "defaults fn removed"
 
+echo "=== 11 seed drop: exact name+rules only ==="
+SEEDR=$(bash -c "source '$H'; db_routing_template_rules finance_crypto direct")
+reset_db "{\"xray\":{},\"routing_profiles\":[{\"id\":\"finance_crypto\",\"name\":\"金融/加密\",\"fallback\":\"inherit\",\"rules\":$SEEDR}]}"
+run db_migrate_routing_profiles_v3529 && jq -e 'has("routing_profiles")|not' "$WORK/cfg/db.json" >/dev/null && pass "exact unused seed dropped" || fail "exact seed not dropped"
+reset_db "{\"xray\":{},\"routing_profiles\":[{\"id\":\"finance_crypto\",\"name\":\"我的金融\",\"fallback\":\"inherit\",\"rules\":$SEEDR}]}"
+run db_migrate_routing_profiles_v3529 && jq -e '.routing_profiles[0].name=="我的金融"' "$WORK/cfg/db.json" >/dev/null && pass "renamed seed kept" || fail "renamed seed dropped"
+
 echo "---"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
