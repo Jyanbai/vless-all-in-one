@@ -8614,6 +8614,41 @@ check_dependencies() {
     return 0
 }
 
+# 启动最小依赖：仅 jq（init_db / 迁移 / 菜单读库均依赖 jq）
+# 复用与 check_dependencies 相同的发行版包管理器路径；安装后复验。
+_startup_install_pkg() {
+    local pkg="$1"
+    case "${DISTRO:-}" in
+        alpine) apk add --no-cache "$pkg" >/dev/null 2>&1 ;;
+        centos)
+            if command -v dnf >/dev/null 2>&1; then dnf install -y "$pkg" >/dev/null 2>&1
+            else yum install -y "$pkg" >/dev/null 2>&1; fi ;;
+        debian|ubuntu)
+            apt-get update >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1 ;;
+        *)
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get update >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1
+            elif command -v apk >/dev/null 2>&1; then apk add --no-cache "$pkg" >/dev/null 2>&1
+            elif command -v dnf >/dev/null 2>&1; then dnf install -y "$pkg" >/dev/null 2>&1
+            elif command -v yum >/dev/null 2>&1; then yum install -y "$pkg" >/dev/null 2>&1
+            else return 1; fi ;;
+    esac
+}
+
+ensure_startup_db_dependencies() {
+    command -v jq >/dev/null 2>&1 && return 0
+    _info "缺少数据库依赖 jq，正在自动安装..."
+    _startup_install_pkg jq || true
+    if command -v jq >/dev/null 2>&1 && jq -n '1' >/dev/null 2>&1; then
+        _ok "jq 已安装"
+        return 0
+    fi
+    _err "缺少数据库依赖 jq，自动安装失败。请安装 jq 后重新运行脚本。"
+    return 1
+}
+
 # 核心更新依赖检查（避免版本获取失败）
 _check_core_update_deps() {
     local missing=()
@@ -16393,6 +16428,20 @@ gen_mieru_server_config() {
             return 1
         fi
     fi
+    # 安装时可选实例出口（与 Xray 同 5 选项；portRange 为单行 key）
+    if [[ -t 0 && "${PENDING_INSTANCE_OUTBOUND:-}" != "__skip__" ]]; then
+        local _mob="${PENDING_INSTANCE_OUTBOUND-__unset__}"
+        if [[ "$_mob" == "__unset__" ]]; then
+            _mob=""
+            _prompt_instance_outbound "mieru" "$port" "" && _mob="$SELECTED_INSTANCE_OUTBOUND"
+        fi
+        if [[ -n "$_mob" ]] && ! db_set_instance_outbound "xray" "mieru" "$port" "$_mob"; then
+            _err "mieru 实例出口写入失败"
+            _limited_change_rollback
+            return 1
+        fi
+    fi
+    unset PENDING_INSTANCE_OUTBOUND 2>/dev/null || true
     echo "server" > "$CFG/role"
 }
 
@@ -19045,7 +19094,7 @@ uninstall_warp() {
             _warn "以下规则集仍引用 WARP："
             echo "$_prefs" | while read -r _pid; do
                 [[ -z "$_pid" ]] && continue
-                echo -e "    • profile:${_pid}"
+                echo -e "    • $(_get_outbound_display_name "profile:${_pid}")"
             done
         }
         local _ans
@@ -19318,7 +19367,7 @@ db_delete_balancer_group() {
             _warn "以下规则集仍引用负载组 $name："
             echo "$_prefs" | while read -r _pid; do
                 [[ -z "$_pid" ]] && continue
-                echo -e "    • profile:${_pid}"
+                echo -e "    • $(_get_outbound_display_name "profile:${_pid}")"
             done
         }
         local _ans
@@ -19518,7 +19567,7 @@ _select_outbound() {
     fi
 
     # v3.5.29: REAL outbound only (direct/warp/chain/balancer).
-    # profile:* belongs in _select_instance_outbound_policy (instance_outbound).
+    # profile:* is legacy instance_outbound only (read/keep; never offered by UI).
     # Rule editors must not nest profile:* (DB rejects; UI must not offer).
 
     # 检测延迟（跳过直连、WARP 和负载均衡组）
@@ -19640,65 +19689,6 @@ _select_outbound() {
     return 1
 }
 
-# 实例策略选择器：仅 profile:<id>（推荐 home / direct_backup）
-# 与 _select_outbound（真实出口）拆分；instance_outbound 产品路径用规则集策略
-_select_instance_outbound_policy() {
-    local prompt="${1:-选择实例策略}"
-    db_ensure_routing_profiles_defaults 2>/dev/null || true
-    local outbounds=() display_names=()
-    local _profiles pid pname
-    _profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
-
-    # Prefer interview-lock ids first, then any other profiles (advanced).
-    local prefer=("home" "direct_backup")
-    local seen=" "
-    for pid in "${prefer[@]}"; do
-        if db_routing_profile_exists "$pid" 2>/dev/null; then
-            pname=$(db_get_routing_profile "$pid" 2>/dev/null | jq -r '.name // .id' 2>/dev/null || echo "$pid")
-            outbounds+=("profile:${pid}")
-            display_names+=("${pname}"$'\t'"${pid}")
-            seen+=" ${pid} "
-        fi
-    done
-    if [[ -n "$_profiles" && "$_profiles" != "[]" ]]; then
-        while IFS=$'\t' read -r pid pname; do
-            [[ -z "$pid" ]] && continue
-            [[ "$seen" == *" ${pid} "* ]] && continue
-            outbounds+=("profile:${pid}")
-            display_names+=("${pname:-$pid}"$'\t'"${pid}")
-        done < <(echo "$_profiles" | jq -r '.[] | [.id // "", .name // .id] | @tsv')
-    fi
-
-    echo "" >&2
-    echo -e "  ${W}${prompt}${NC}" >&2
-    echo -e "  ${D}实例出口仅绑定规则集策略；真实出口在规则集内配置${NC}" >&2
-    _line >&2
-    if [[ ${#outbounds[@]} -eq 0 ]]; then
-        echo -e "  ${Y}暂无规则集${NC} — 请先运行「家宽 + 直出备用」向导" >&2
-        echo -e "  ${G}0${NC}) 返回" >&2
-        _line >&2
-        return 1
-    fi
-    local i
-    for i in "${!outbounds[@]}"; do
-        local info="${display_names[$i]}"
-        local name="${info%%$'\t'*}"
-        local id="${info#*$'\t'}"
-        echo -e "  ${G}$((i+1))${NC}) ${C}${name}${NC}" >&2
-    done
-    echo -e "  ${G}0${NC}) 返回" >&2
-    _line >&2
-    local choice
-    read -rp "  $prompt [1]: " choice
-    choice=${choice:-1}
-    [[ "$choice" == "0" ]] && return 1
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#outbounds[@]} ]]; then
-        echo "${outbounds[$((choice-1))]}"
-        return 0
-    fi
-    return 1
-}
-
 # 获取出口的显示名称
 _get_outbound_display_name() {
     local outbound="$1"
@@ -19708,23 +19698,14 @@ _get_outbound_display_name() {
         warp) echo "WARP" ;;
         chain:*) echo "链路→${outbound#chain:}" ;;
         balancer:*) echo "负载→${outbound#balancer:}" ;;
-        profile:home)
-            local _pname
-            _pname=$(db_get_routing_profile "home" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
-            echo "${_pname:-家宽}"
-            ;;
-        profile:direct_backup)
-            local _pname
-            _pname=$(db_get_routing_profile "direct_backup" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
-            echo "${_pname:-直出备用}"
-            ;;
         profile:*)
+            # 旧规则集（legacy 兼容，只读展示；不显示内部 id）
             local _pid="${outbound#profile:}" _pname
-            _pname=$(db_get_routing_profile "$_pid" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
-            if [[ -n "$_pname" ]]; then
-                echo "旧规则集: ${_pname}"
+            if db_routing_profile_exists "$_pid" 2>/dev/null; then
+                _pname=$(db_get_routing_profile "$_pid" 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+                echo "旧规则集: ${_pname:-未命名}"
             else
-                echo "旧规则集: ${_pid}"
+                echo "旧规则集: 已缺失"
             fi
             ;;
         *) echo "$outbound" ;;
@@ -21809,18 +21790,12 @@ _prompt_pick_balancer_outbound() {
 _prompt_instance_outbound() {
     local protocol="${1:-}" port="${2:-}" current="${3:-}"
     SELECTED_INSTANCE_OUTBOUND=""
-    if ! _routing_meaningfully_configured; then
+    local is_legacy=0
+    [[ "$current" == profile:* ]] && is_legacy=1
+    # 分流未配置且非旧规则集实例：保持继承全局，不打扰
+    if [[ "$is_legacy" -eq 0 ]] && ! _routing_meaningfully_configured; then
         return 0
     fi
-
-    local cur_pid="" is_legacy=0
-    case "$current" in
-        profile:home|profile:direct_backup) ;;
-        profile:*)
-            cur_pid="${current#profile:}"
-            is_legacy=1
-            ;;
-    esac
 
     while true; do
         echo "" >&2
@@ -21830,22 +21805,19 @@ _prompt_instance_outbound() {
             echo -e "  当前: ${C}$(_get_outbound_display_name "$current")${NC}" >&2
         fi
         if [[ "$is_legacy" -eq 1 ]]; then
-            echo -e "  ${Y}旧规则集只读保留${NC} ${D}(.routing_profiles 数据不销毁)${NC}" >&2
-            echo -e "  ${G}k${NC}) 保持旧规则集" >&2
+            echo -e "  ${G}k${NC}) 保持当前旧规则集" >&2
         fi
         echo -e "  ${G}1${NC}) 继承全局分流 ${D}(默认)${NC}" >&2
         echo -e "  ${G}2${NC}) 直连 (direct)" >&2
         echo -e "  ${G}3${NC}) WARP" >&2
         echo -e "  ${G}4${NC}) 链式代理" >&2
         echo -e "  ${G}5${NC}) 负载均衡" >&2
-        echo -e "  ${G}6${NC}) 家宽" >&2
-        echo -e "  ${G}7${NC}) 直出备用" >&2
-        echo -e "  ${G}8${NC}) 配置/重建家宽+直出备用 ${D}(向导)${NC}" >&2
         echo -e "  ${G}0${NC}) 返回" >&2
         _line >&2
-        local choice
-        read -rp "  请选择 [1]: " choice
-        choice=${choice:-1}
+        local choice _def=1
+        [[ "$is_legacy" -eq 1 ]] && _def=k
+        read -rp "  请选择 [${_def}]: " choice
+        choice=${choice:-$_def}
         case "$choice" in
             0)
                 return 1
@@ -21885,29 +21857,6 @@ _prompt_instance_outbound() {
                 selected=$(_prompt_pick_balancer_outbound) || continue
                 SELECTED_INSTANCE_OUTBOUND="$selected"
                 return 0
-                ;;
-            6)
-                db_ensure_routing_profiles_defaults 2>/dev/null || true
-                if ! db_routing_profile_exists "home" 2>/dev/null; then
-                    _warn "「家宽」尚未创建 — 请先选 8 运行向导" >&2
-                    continue
-                fi
-                SELECTED_INSTANCE_OUTBOUND="profile:home"
-                return 0
-                ;;
-            7)
-                db_ensure_routing_profiles_defaults 2>/dev/null || true
-                if ! db_routing_profile_exists "direct_backup" 2>/dev/null; then
-                    _warn "「直出备用」尚未创建 — 请先选 8 运行向导" >&2
-                    continue
-                fi
-                SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"
-                return 0
-                ;;
-            8)
-                wizard_home_broadband_direct_backup
-                # 向导只重建规则集；回到本菜单再选 6/7 绑定
-                continue
                 ;;
             *)
                 _err "无效选择" >&2
@@ -22004,384 +21953,6 @@ manage_instance_outbound() {
             _regenerate_proxy_configs xray
         fi
         _pause
-    done
-}
-
-#═══════════════════════════════════════════════════════════════════════════════
-# v3.5.28 分流规则集 (routing profiles) UI + 家宽向导 + 共享编辑 smart-apply
-#═══════════════════════════════════════════════════════════════════════════════
-
-# 共享规则集变更后：始终 dry-compile（即便无引用），再按引用实例 apply
-# 失败由调用方负责 snap 还原。markers: profile-apply validate restore dry-compile
-_routing_profile_validate_and_apply() {
-    local pid="$1"
-    local refs has_xray=0 has_mieru=0
-    local dry_tags dry_rules
-
-    if [[ -z "$pid" ]] || ! db_routing_profile_exists "$pid" 2>/dev/null; then
-        _err "规则集不存在: profile:${pid:-?}（fail-closed）"
-        return 1
-    fi
-
-    # Dry-run Xray compile even when unused — catch bad rule outbounds before attach
-    dry_tags=$(jq -n '["dry-profile-validate"]')
-    if ! dry_rules=$(_gen_xray_profile_inbound_rules "$dry_tags" "$pid"); then
-        _err "规则集 Xray dry-compile 失败: profile:$pid（fail-closed）"
-        return 1
-    fi
-    echo "$dry_rules" | jq empty >/dev/null 2>&1 || {
-        _err "规则集 Xray dry-compile JSON 无效: profile:$pid"
-        return 1
-    }
-
-    # Dry-run Mieru profile expand even when unused
-    if ! _mieru_expand_profile_rules "$pid" >/dev/null; then
-        _err "规则集 Mieru dry-compile 失败: profile:$pid（fail-closed）"
-        return 1
-    fi
-
-    refs=$(db_list_instances_using_profile "$pid" 2>/dev/null || true)
-    while IFS='|' read -r _c _p _port _v; do
-        [[ -z "$_p" ]] && continue
-        if [[ "$_p" == "mieru" ]]; then
-            has_mieru=1
-            if ! _mieru_compile_egress_plan "$_port" >/dev/null; then
-                _err "规则集校验失败: mieru:${_port}（fail-closed）"
-                return 1
-            fi
-        else
-            has_xray=1
-            if ! _resolve_instance_outbound_target "profile:$pid"; then
-                _err "规则集校验失败: profile:$pid（fail-closed）"
-                return 1
-            fi
-            local tags
-            tags=$(jq -n --arg t "$(_instance_inbound_tag "$_p" "$_port")" '[$t]')
-            if ! _gen_xray_profile_inbound_rules "$tags" "$pid" >/dev/null; then
-                _err "规则集 Xray 编译失败: ${_p}:${_port}（fail-closed）"
-                return 1
-            fi
-        fi
-    done <<< "$refs"
-    if [[ "$has_xray" == "1" ]]; then
-        _regenerate_proxy_configs xray || return 1
-    fi
-    if [[ "$has_mieru" == "1" ]]; then
-        _regenerate_proxy_configs mieru || return 1
-    fi
-    return 0
-}
-
-
-# 家宽 + 直出备用向导（v3.5.29）
-# 创建两个规则集：home(家宽) + direct_backup(直出备用)；id 稳定，中文名仅 UI。
-# 模板语义：finance+TG 同出口；AI = JP(家宽主出口) vs DIRECT；fallback=inherit。
-# 函数名保留 wizard_home_broadband_direct_backup（兼容测试/调用点）。
-wizard_home_broadband_direct_backup() {
-    _header
-    echo -e "  ${W}家宽 + 直出备用向导${NC}"
-    _line
-    echo -e "  ${D}创建/重建规则集 home(家宽) + direct_backup(直出备用)；未匹配 inherit 全局${NC}"
-    echo -e "  ${D}金融/TG → 两规则集相同；AI → 家宽=主出口 / 直出备用=DIRECT${NC}"
-    echo -e "  ${D}规则优先级: 金融/加密 → Telegram DC → AI/流媒体（DIRECT 不重排）${NC}"
-    _line
-
-    # Migrate legacy home_broadband→home + retire unused seed profiles (DA helper)
-    if ! db_migrate_routing_profiles_v3529; then
-        _err "分流规则集迁移失败"; _pause; return 1
-    fi
-    db_ensure_routing_profiles_defaults || true
-
-    # ---- 步骤 1: AI JP / 家宽主出口 ----
-    echo -e "  ${C}步骤 1/5${NC} 选择家宽主出口（AI→此出口；金融/TG 亦用此出口）"
-    local home_ob
-    home_ob=$(_select_outbound "选择家宽主出口 (JP/链式等真实出口)" "no_check") || { _err "已取消"; _pause; return 1; }
-    case "$home_ob" in
-        direct)
-            _warn "家宽主出口选了直连，将仅作占位；建议选链式/WARP"
-            ;;
-        profile:*)
-            _err "家宽主出口不能再套规则集（请选真实出口）"
-            _pause
-            return 1
-            ;;
-    esac
-
-    # ---- 步骤 2: finance TW（两规则集相同）----
-    echo ""
-    echo -e "  ${C}步骤 2/5${NC} 金融/加密 → ${C}$(_get_outbound_display_name "$home_ob")${NC}（家宽与直出备用相同）"
-    read -rp "  确认金融出口? [Y/n]: " _ans
-    if [[ "$_ans" =~ ^[nN]$ ]]; then
-        _err "已取消"; _pause; return 1
-    fi
-
-    # ---- 步骤 3: TG DC 映射 ----
-    echo ""
-    echo -e "  ${C}步骤 3/5${NC} Telegram DC 映射（matchers，非 geoip:telegram）"
-    db_seed_telegram_dc_matchers_if_absent || true
-    local _tg_m
-    _tg_m=$(db_get_telegram_dc_matchers 2>/dev/null || echo '{}')
-    local _tg_src _tg_n
-    _tg_src=$(echo "$_tg_m" | jq -r '.source // "seed"' 2>/dev/null || echo seed)
-    _tg_n=$(echo "$_tg_m" | jq -r '[keys[] | select(startswith("dc"))] | length' 2>/dev/null || echo 0)
-    echo -e "  ${D}source=${_tg_src}, DC 条目≈${_tg_n}${NC}"
-    read -rp "  继续使用当前 TG DC 映射? [Y/n]: " _ans
-    if [[ "$_ans" =~ ^[nN]$ ]]; then
-        _err "已取消"; _pause; return 1
-    fi
-
-    # ---- 步骤 4: TG fallback ----
-    echo ""
-    echo -e "  ${C}步骤 4/5${NC} TG 未知 DC 回落 ${C}geosite:telegram${NC} → $(_get_outbound_display_name "$home_ob")"
-    read -rp "  确认 TG 回落? [Y/n]: " _ans
-    if [[ "$_ans" =~ ^[nN]$ ]]; then
-        _err "已取消"; _pause; return 1
-    fi
-
-    # Build rules from DA templates (matchers only; not seeded as profiles)
-    local fc tg ai_jp ai_direct rules_home rules_backup
-    fc=$(db_routing_template_rules_finance_crypto "$home_ob") || { _err "金融模板失败"; _pause; return 1; }
-    tg=$(db_routing_template_rules_telegram_dc "$home_ob") || { _err "TG 模板失败"; _pause; return 1; }
-    ai_jp=$(db_routing_template_rules_ai_media "$home_ob") || { _err "AI 模板失败"; _pause; return 1; }
-    ai_direct=$(db_routing_template_rules_ai_media "direct") || { _err "AI DIRECT 模板失败"; _pause; return 1; }
-    # home: finance+TG+AI → home_ob (JP); direct_backup: finance+TG → home_ob (identical), AI → DIRECT
-    rules_home=$(jq -c -n --argjson a "$fc" --argjson b "$tg" --argjson c "$ai_jp" '$a + $b + $c') || {
-        _err "组合家宽规则失败"; _pause; return 1
-    }
-    rules_backup=$(jq -c -n --argjson a "$fc" --argjson b "$tg" --argjson c "$ai_direct" '$a + $b + $c') || {
-        _err "组合直出备用规则失败"; _pause; return 1
-    }
-
-    # ---- 步骤 5: preview + confirm ----
-    echo ""
-    echo -e "  ${C}步骤 5/5${NC} 预览（确认后原子写入两个规则集）"
-    _line
-    local n_home n_backup
-    n_home=$(echo "$rules_home" | jq 'length')
-    n_backup=$(echo "$rules_backup" | jq 'length')
-    echo -e "  ${W}home / 家宽${NC}  ${D}${n_home} 条${NC}  AI→$(_get_outbound_display_name "$home_ob")  金融/TG→同"
-    echo -e "  ${W}direct_backup / 直出备用${NC}  ${D}${n_backup} 条${NC}  AI→直连  金融/TG→$(_get_outbound_display_name "$home_ob")"
-    echo -e "  ${D}fallback=inherit（未匹配继承全局）${NC}"
-    _line
-    read -rp "  确认写入 home + direct_backup? [y/N]: " _ans
-    if [[ ! "$_ans" =~ ^[yY]$ ]]; then
-        _err "已取消"; _pause; return 1
-    fi
-
-    # Atomic-ish upsert: both profiles after single confirm (DA helpers; no backend rewrite)
-    local pid name rules
-    # 1) home / 家宽
-    pid="home"; name="家宽"; rules="$rules_home"
-    if db_routing_profile_exists "$pid" 2>/dev/null; then
-        if ! db_update_routing_profile "$pid" "$name" "$rules"; then
-            _err "更新失败: $name"; _pause; return 1
-        fi
-        _ok "已更新: $name"
-    else
-        if ! db_add_routing_profile "$pid" "$name" "$rules"; then
-            _err "创建失败: $name"; _pause; return 1
-        fi
-        _ok "已创建: $name"
-    fi
-    # 2) direct_backup / 直出备用
-    pid="direct_backup"; name="直出备用"; rules="$rules_backup"
-    if db_routing_profile_exists "$pid" 2>/dev/null; then
-        if ! db_update_routing_profile "$pid" "$name" "$rules"; then
-            _err "更新失败: $name"; _pause; return 1
-        fi
-        _ok "已更新: $name"
-    else
-        if ! db_add_routing_profile "$pid" "$name" "$rules"; then
-            _err "创建失败: $name"; _pause; return 1
-        fi
-        _ok "已创建: $name"
-    fi
-
-    echo ""
-    echo -e "  ${Y}提示:${NC} 实例出口选 ${C}6) 家宽${NC} 或 ${C}7) 直出备用${NC}"
-    echo -e "  ${D}重命名只改显示名；其它旧规则集数据保留只读${NC}"
-    _pause
-}
-
-_show_routing_profile_users() {
-    local pid="$1" refs
-    refs=$(db_list_instances_using_profile "$pid" 2>/dev/null || true)
-    if [[ -z "$refs" ]]; then
-        echo -e "  ${D}无实例引用${NC}"
-        return
-    fi
-    echo -e "  ${Y}引用实例:${NC}"
-    echo "$refs" | while IFS='|' read -r _c _p _port _v; do
-        [[ -z "$_p" ]] && continue
-        echo -e "    • ${_p}:${_port}"
-    done
-}
-
-# WITHDRAWN from product menus (v3.5.29): generic CRUD UI unhooked; keep body for DA/tests.
-manage_routing_profiles() {
-    while true; do
-        _header
-        echo -e "  ${W}分流规则集${NC}"
-        _line
-        db_ensure_routing_profiles_defaults 2>/dev/null || true
-        local profiles idx=1 entries=()
-        profiles=$(db_list_routing_profiles 2>/dev/null || echo '[]')
-        local count
-        count=$(echo "$profiles" | jq 'length' 2>/dev/null || echo 0)
-        if [[ "$count" -eq 0 ]]; then
-            echo -e "  ${D}暂无规则集${NC}"
-        else
-            while IFS=$'\t' read -r pid pname rc fb; do
-                [[ -z "$pid" ]] && continue
-                echo -e "  ${G}${idx}${NC}) ${C}${pname}${NC} ${D}(${pid}, ${rc}条, fallback=${fb})${NC}"
-                entries+=("$pid")
-                ((idx++))
-            done < <(echo "$profiles" | jq -r '.[] | [.id, .name, ((.rules//[])|length), (.fallback//"inherit")] | @tsv')
-        fi
-        _line
-        _item "a" "添加规则集"
-        _item "w" "家宽 + 直出备用向导"
-        _item "0" "返回"
-        _line
-        local choice
-        read -rp "  请选择: " choice
-        case "$choice" in
-            0|"") return ;;
-            a|A)
-                local nid nname
-                read -rp "  规则集 id (a-z0-9_-): " nid
-                read -rp "  显示名称: " nname
-                [[ -z "$nid" || -z "$nname" ]] && { _err "id/名称不能空"; _pause; continue; }
-                if db_add_routing_profile "$nid" "$nname" '[]'; then
-                    _ok "已添加: $nname"
-                else
-                    _err "添加失败"
-                fi
-                _pause
-                ;;
-            w|W) wizard_home_broadband_direct_backup ;;
-            *)
-                if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 && "$choice" -le ${#entries[@]} ]]; then
-                    _edit_routing_profile "${entries[$((choice-1))]}"
-                else
-                    _err "无效选择"; _pause
-                fi
-                ;;
-        esac
-    done
-}
-
-_edit_routing_profile() {
-    local pid="$1"
-    while true; do
-        local prof
-        prof=$(db_get_routing_profile "$pid") || { _err "不存在: $pid"; _pause; return; }
-        local pname prules
-        pname=$(echo "$prof" | jq -r '.name')
-        prules=$(echo "$prof" | jq -c '.rules // []')
-        _header
-        echo -e "  ${W}规则集:${NC} ${C}${pname}${NC} ${D}(${pid})${NC}"
-        echo -e "  ${D}fallback=inherit（未匹配继承全局，非强制直连）${NC}"
-        _line
-        echo "$prules" | jq -r '.[] | "  • \(.id // "-")  [\(.type)]  →  \(.outbound)  \(.domains // "")"' 2>/dev/null
-        _line
-        _show_routing_profile_users "$pid"
-        _line
-        _item "1" "重命名"
-        _item "2" "追加规则"
-        _item "3" "删除规则"
-        _item "4" "复制规则集"
-        _item "5" "删除规则集"
-        _item "0" "返回"
-        _line
-        local c snap
-        read -rp "  请选择: " c
-        case "$c" in
-            0|"") return ;;
-            1)
-                local nn
-                read -rp "  新名称: " nn
-                [[ -z "$nn" ]] && continue
-                if db_update_routing_profile "$pid" "$nn"; then
-                    _ok "已重命名"
-                else
-                    _err "重命名失败"
-                fi
-                _pause
-                ;;
-            2)
-                local rid rtype rdom rout rule_json
-                read -rp "  规则 id: " rid
-                echo -e "  类型: custom / telegram_dc / all"
-                read -rp "  类型 [custom]: " rtype
-                rtype=${rtype:-custom}
-                rout=$(_select_outbound "规则出口" "no_check") || continue
-                case "$rout" in profile:*) _err "规则出口不能嵌套规则集"; _pause; continue ;; esac
-                rdom=""
-                if [[ "$rtype" != "all" && "$rtype" != "telegram_dc" ]]; then
-                    read -rp "  域名/IP tokens (逗号分隔): " rdom
-                fi
-                rule_json=$(jq -n --arg id "$rid" --arg type "$rtype" --arg out "$rout" --arg domains "$rdom" \
-                    '{id:$id, type:$type, outbound:$out, domains:$domains, ip_version:"prefer_ipv4"}')
-                snap="${DB_FILE}.profile-apply.$$"
-                cp -p "$DB_FILE" "$snap" || { _err "无法快照"; _pause; continue; }
-                if ! db_add_routing_profile_rule "$pid" "$rule_json"; then
-                    rm -f "$snap"; _err "追加失败"; _pause; continue
-                fi
-                if ! _routing_profile_validate_and_apply "$pid"; then
-                    cp -p "$snap" "$DB_FILE" 2>/dev/null || true
-                    rm -f "$snap"
-                    _err "校验失败，已恢复快照（profile-apply restore）"
-                else
-                    rm -f "$snap"
-                    _ok "已追加规则（profile-apply validate）"
-                fi
-                _pause
-                ;;
-            3)
-                local rid
-                read -rp "  要删除的规则 id: " rid
-                [[ -z "$rid" ]] && continue
-                snap="${DB_FILE}.profile-apply.$$"
-                cp -p "$DB_FILE" "$snap" || { _err "无法快照"; _pause; continue; }
-                if ! db_delete_routing_profile_rule "$pid" "$rid"; then
-                    rm -f "$snap"; _err "删除失败"; _pause; continue
-                fi
-                if ! _routing_profile_validate_and_apply "$pid"; then
-                    cp -p "$snap" "$DB_FILE" 2>/dev/null || true
-                    rm -f "$snap"
-                    _err "校验失败，已恢复快照（profile-apply restore）"
-                else
-                    rm -f "$snap"
-                    _ok "已删除规则（profile-apply validate）"
-                fi
-                _pause
-                ;;
-            4)
-                local dst dname
-                read -rp "  新 id: " dst
-                read -rp "  新名称 (可空): " dname
-                if db_copy_routing_profile "$pid" "$dst" "$dname"; then
-                    _ok "已复制 → $dst"
-                else
-                    _err "复制失败"
-                fi
-                _pause
-                ;;
-            5)
-                read -rp "  确认删除 $pid ? [y/N]: " _ans
-                [[ "$_ans" =~ ^[yY]$ ]] || continue
-                if db_delete_routing_profile "$pid"; then
-                    _ok "已删除"
-                    _pause
-                    return
-                else
-                    _err "删除失败（可能仍被引用）"
-                    _pause
-                fi
-                ;;
-            *) _err "无效"; _pause ;;
-        esac
     done
 }
 
@@ -22741,7 +22312,7 @@ db_del_chain_node() {
             _warn "以下规则集仍引用链式节点 $name："
             echo "$_prefs" | while read -r _pid; do
                 [[ -z "$_pid" ]] && continue
-                echo -e "    • profile:${_pid}"
+                echo -e "    • $(_get_outbound_display_name "profile:${_pid}")"
             done
         }
         local _ans
@@ -35677,6 +35248,8 @@ do_update() {
 main_menu() {
     check_root
     init_log  # 初始化日志
+    # jq 必须先于 init_db / 迁移（全新系统可能未装 jq）；不在此跑完整 check_dependencies
+    ensure_startup_db_dependencies || exit 1
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
     # v3.5.27 mieru outbound migrate: .service_outbound.mieru → per-instance instance_outbound (fail-closed)
