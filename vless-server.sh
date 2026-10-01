@@ -31980,6 +31980,34 @@ uninstall_cloudflared() {
     _pause
 }
 
+_cloudflared_delete_tunnel_and_cleanup() {
+    local selected_name="$1" selected_id="$2" local_name="$3"
+    local delete_output
+    delete_output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$selected_name" 2>&1)
+    local delete_exit_code=$?
+
+    if [[ $delete_exit_code -eq 0 ]]; then
+        _ok "隧道 '$selected_name' 已删除"
+
+        # 如果是本地配置的隧道，清理本地文件
+        if [[ "$selected_name" == "$local_name" ]]; then
+            rm -f "$CLOUDFLARED_DIR/tunnel.info"
+            rm -f "$CLOUDFLARED_CONFIG"
+            rm -f "$CLOUDFLARED_DIR/$selected_id.json"
+            _info "本地配置文件已清理"
+        fi
+
+        echo ""
+        echo -e "  ${Y}提示: 相关的 DNS 记录可能需要手动在 Cloudflare 后台删除${NC}"
+    else
+        _err "删除失败"
+        echo ""
+        echo -e "  ${Y}错误信息:${NC}"
+        echo "$delete_output"
+    fi
+    return "$delete_exit_code"
+}
+
 # 删除隧道（保留 cloudflared）
 delete_tunnel() {
     _header
@@ -32085,29 +32113,7 @@ delete_tunnel() {
     
     # 删除隧道
     _info "删除隧道..."
-    local delete_output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$selected_name" 2>&1)
-    local delete_exit_code=$?
-    
-    # 调试：显示错误信息以便诊断
-    if [[ $delete_exit_code -eq 0 ]] || echo "$delete_output" | grep -qiE "deleted|success"; then
-        _ok "隧道 '$selected_name' 已删除"
-        
-        # 如果是本地配置的隧道，清理本地文件
-        if [[ "$selected_name" == "$local_name" ]]; then
-            rm -f "$CLOUDFLARED_DIR/tunnel.info"
-            rm -f "$CLOUDFLARED_CONFIG"
-            rm -f "$CLOUDFLARED_DIR/$selected_id.json"
-            _info "本地配置文件已清理"
-        fi
-        
-        echo ""
-        echo -e "  ${Y}提示: 相关的 DNS 记录可能需要手动在 Cloudflare 后台删除${NC}"
-    else
-        _err "删除失败"
-        echo ""
-        echo -e "  ${Y}错误信息:${NC}"
-        echo "$delete_output"
-    fi
+    _cloudflared_delete_tunnel_and_cleanup "$selected_name" "$selected_id" "$local_name"
     
     _pause
 }
