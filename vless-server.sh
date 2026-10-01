@@ -12642,7 +12642,8 @@ install_xray() {
     local channel="${1:-stable}"
     local force="${2:-false}"
     local version_override="${3:-}"
-    local xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
+    local xarch
+    xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
@@ -12829,7 +12830,8 @@ install_singbox() {
     local channel="${1:-stable}"
     local force="${2:-false}"
     local version_override="${3:-}"
-    local sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
+    local sarch
+    sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
@@ -15317,7 +15319,8 @@ _snell_alpine_diagnostics() { # _snell_alpine_diagnostics <binary>
 # 安装 Snell v4
 install_snell() {
     check_cmd snell-server && { _ok "Snell 已安装"; return 0; }
-    local sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
+    local sarch
+    sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
     local version="4.1.1" expected_sha="${SNELL_V4_SHA256:-}"
     [[ -n "$expected_sha" ]] || expected_sha=$(_snell_release_sha256 "$version" "$sarch")
     [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
@@ -15535,7 +15538,8 @@ install_snell_v6() {
 
 # 安装 AnyTLS
 install_anytls() {
-    local aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
+    local aarch
+    aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
@@ -15547,7 +15551,8 @@ install_anytls() {
 
 # 安装 ShadowTLS
 install_shadowtls() {
-    local aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
+    local aarch
+    aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
     _install_binary "shadow-tls" "ihciah/shadow-tls" \
         'https://github.com/ihciah/shadow-tls/releases/download/v$version/shadow-tls-${aarch}' \
         shadowtls
@@ -15565,7 +15570,8 @@ install_naive() {
         return 1
     fi
     
-    local narch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
+    local narch
+    narch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     
     # 安装依赖
     case "$DISTRO" in
@@ -31085,7 +31091,8 @@ create_tunnel_interactive() {
     # 同时检查 Cloudflare 远程是否有隧道（本地配置可能已丢失）
     if [[ -z "$existing_tunnel" ]]; then
         _info "检查 Cloudflare 账户中的隧道..."
-        local remote_tunnels=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null) || true
+        local remote_tunnels
+        remote_tunnels=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null) || true
         local tunnel_names=$(echo "$remote_tunnels" | grep -E "^[a-f0-9-]{36}" | awk '{print $2}' | head -5 || true)
         if [[ -n "$tunnel_names" ]]; then
             echo ""
