@@ -28472,6 +28472,7 @@ show_status() {
         local warp_count=0
         local block_count=0
         local unique_nodes=""
+        local -A seen=()
         
         while IFS= read -r outbound; do
             [[ -z "$outbound" ]] && continue
@@ -28479,7 +28480,8 @@ show_status() {
                 ((chain_count++))
                 local node_name="${outbound#chain:}"
                 # 收集唯一节点名
-                if [[ ! "$unique_nodes" =~ "$node_name" ]]; then
+                if [[ -z "${seen[$node_name]+x}" ]]; then
+                    seen["$node_name"]=1
                     [[ -n "$unique_nodes" ]] && unique_nodes+=","
                     unique_nodes+="$node_name"
                 fi
@@ -28494,7 +28496,7 @@ show_status() {
         local display_info=""
         if [[ $chain_count -gt 0 ]]; then
             # 统计唯一节点数
-            local node_count=$(echo "$unique_nodes" | tr ',' '\n' | wc -l)
+            local node_count=${#seen[@]}
             if [[ $node_count -eq 1 ]]; then
                 display_info="→${unique_nodes}"
             else
