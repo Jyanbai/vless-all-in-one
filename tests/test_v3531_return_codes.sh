@@ -124,6 +124,12 @@ echo "=== D: exact node names and unchanged status text ==="
 printf '%s\n' '{"xray":{"vless":[{"port":443}]},"routing_rules":[{"outbound":"chain:hk2"},{"outbound":"chain:hk"},{"outbound":"chain:hk2"}]}' > "$WORK/cfg/db.json"
 out=$(run show_status 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *'  分流: 3条规则→2个节点'* ]] && pass "hk2 + hk + hk2 count as 2 nodes" || fail "node count rc=$rc out=$out"
+normal_status_rc=$rc
+printf '%s\n' '{"xray":{"vless":[{"port":443}]},"routing_rules":[{"outbound":"chain:"},{"outbound":"chain:hk"}]}' > "$WORK/cfg/db.json"
+out=$(run show_status 2>&1); rc=$?
+[[ "$out" != *'bad array subscript'* ]] && pass "empty chain name does not cause bad array subscript" || fail "empty chain name error: $out"
+[[ $rc -eq $normal_status_rc ]] && pass "empty chain name keeps normal status rc" || fail "empty chain name rc=$rc normal=$normal_status_rc out=$out"
+grep -Fxq '  分流: 2条规则→hk' <<< "$out" && pass "empty chain name is excluded from node display" || fail "empty chain display: $out"
 printf '%s\n' '{"xray":{"vless":[{"port":443}]},"routing_rules":[{"outbound":"chain:hk"},{"outbound":"chain:hk"},{"outbound":"warp"},{"outbound":"block"}]}' > "$WORK/cfg/db.json"
 out=$(run show_status 2>&1)
 [[ "$out" == *'  分流: 4条规则→hk,WARP,屏蔽'* ]] && pass "single node and WARP/block format preserved" || fail "single node display: $out"
