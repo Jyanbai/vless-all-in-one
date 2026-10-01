@@ -41,8 +41,8 @@ else
 fi
 
 echo "=== D: outbound validated separately ==="
-if echo "$block" | grep -q 'stored_ob=\$(printf'; then pass "reads stored_ob"; else fail "no stored_ob"; fi
-if echo "$block" | grep -q 'expected_ob=\$(printf'; then pass "reads expected_ob"; else fail "no expected_ob"; fi
+if grep -q 'stored_ob=\$(printf' <<<"$block"; then pass "reads stored_ob"; else fail "no stored_ob"; fi
+if grep -q 'expected_ob=\$(printf' <<<"$block"; then pass "reads expected_ob"; else fail "no expected_ob"; fi
 if echo "$block" | grep -q 'FinalMask 实例出口校验失败'; then pass "outbound verify errors"; else fail "no outbound verify errors"; fi
 
 echo "=== E: no literal inherit ==="
