@@ -3578,7 +3578,7 @@ get_all_traffic_stats() {
 
     # 使用临时文件存储，避免大变量导致内存问题
     local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
+    trap "rm -f '$tmp_stats'; trap - RETURN" RETURN
     : > "$tmp_stats"
 
     # === Xray 流量统计 ===
