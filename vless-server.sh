@@ -28479,6 +28479,7 @@ show_status() {
             if [[ "$outbound" == chain:* ]]; then
                 ((chain_count++))
                 local node_name="${outbound#chain:}"
+                [[ -n "$node_name" ]] || continue
                 # 收集唯一节点名
                 if [[ -z "${seen[$node_name]+x}" ]]; then
                     seen["$node_name"]=1
