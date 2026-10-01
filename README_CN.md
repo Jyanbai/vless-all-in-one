@@ -15,6 +15,7 @@ Linux 服务器一体化代理部署脚本。
 - 提供用户管理、路由、订阅与故障排查文档
 - **mieru**（v3.5.20）：TCP/UDP、`port`/`portRange`、流量模式默认关闭；官方 `mierus://` 分享链接
 - **v3.5.26：** 从产品面移除 **SSH Tunnel**（选择/安装/创建）；仅保留可选遗留清理（`cleanup_legacy_ssh_tunnel`）；永不 stop/disable 系统 sshd
+- **v3.5.31：** 修复安装与隧道删除的错误处理、节点计数，清理无用代码，并将回归测试纳入 CI。
 - **v3.5.30：**
   - 实例出口（「实例出口管理」、安装与管理、Xray 与 Mieru）简化为 继承 / 直连 / WARP / 链式 / 负载均衡
   - 旧版本已有的分流规则仅作为兼容保留：原样保留、可继续使用或切换掉
@@ -35,7 +36,7 @@ Linux 服务器一体化代理部署脚本。
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-当前脚本版本：**v3.5.30**
+当前脚本版本：**v3.5.31**
 
 ## 用于流量统计的自定义 Sing-box 构建
 
