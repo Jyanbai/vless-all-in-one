@@ -15536,19 +15536,6 @@ install_snell_v6() {
     _ok "Snell v6 v${version} 已安装"
 }
 
-# 安装 AnyTLS
-install_anytls() {
-    local aarch
-    aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
-    # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
-    if [[ "$DISTRO" == "alpine" ]]; then
-        apk add --no-cache gcompat libc6-compat &>/dev/null
-    fi
-    _install_binary "anytls-server" "anytls/anytls-go" \
-        'https://github.com/anytls/anytls-go/releases/download/v$version/anytls_${version}_linux_${aarch}.zip' \
-        anytls
-}
-
 # 安装 ShadowTLS
 install_shadowtls() {
     local aarch
@@ -26850,9 +26837,6 @@ do_install_server() {
         ss2022-shadowtls)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
-            ;;
-        anytls)
-            install_anytls || { _err "AnyTLS 安装失败"; _pause; return 1; }
             ;;
         naive)
             install_naive || { _err "NaïveProxy 安装失败"; _pause; return 1; }
