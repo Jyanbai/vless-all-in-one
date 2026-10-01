@@ -14,9 +14,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Bash syntax (blocking)
-        run: bash -n vless-server.sh
+        run: bash -n vless-server.sh && bash -n nft.sh
 
       - name: Version consistency (blocking)
         run: |
@@ -47,16 +49,75 @@ jobs:
           fi
           echo "VERSION_SYNC=PASS"
 
-      - name: ShellCheck (informational, non-blocking)
+      - name: ShellCheck changed functions (informational, non-blocking)
         continue-on-error: true
+        env:
+          BASE_REV: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          # Historical fat script: record findings but never fail the job.
+          if [[ -z "$BASE_REV" || "$BASE_REV" =~ ^0+$ ]]; then
+            BASE_REV=$(git merge-base HEAD origin/main)
+          fi
+          export BASE_REV
+          # Extract only functions containing added/modified lines; never lint the fat script.
+          python3 - <<'PY' > changed-functions.sh
+          import os, re, subprocess
+          diff = subprocess.check_output(
+              ['git', 'diff', '--unified=0', os.environ['BASE_REV'], 'HEAD', '--', 'vless-server.sh'],
+              text=True)
+          changed = set()
+          for start, count in re.findall(r'^@@ .* \+(\d+)(?:,(\d+))? @@', diff, re.M):
+              start, count = int(start), int(count or 1)
+              changed.update(range(start, start + max(1, count)))
+          lines = open('vless-server.sh', encoding='utf-8').readlines()
+          start = None
+          for number, line in enumerate(lines, 1):
+              if re.match(r'^[A-Za-z_][A-Za-z0-9_]*\(\) *\{', line):
+                  start = number
+              if start is not None and line.rstrip('\r\n') == '}':
+                  if any(n in changed for n in range(start, number + 1)):
+                      print(''.join(lines[start - 1:number]), end='')
+                  start = None
+          PY
+          [[ -s changed-functions.sh ]] || exit 0
           set +e
-          shellcheck -f gcc vless-server.sh | tee shellcheck-report.txt
+          shellcheck -s bash -f gcc changed-functions.sh | tee shellcheck-report.txt
           rc=${PIPESTATUS[0]}
           set -e
           echo "SHELLCHECK_EXIT=${rc} (non-blocking)"
           exit 0
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+
+      - name: Run offline shell tests (blocking)
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+          mkdir -p "$WORK/bin"
+          export VLESS_TEST_BLOCKED_CALLS="$WORK/blocked-calls"
+          for cmd in apt apt-get apk dnf yum systemctl curl wget; do
+            cat > "$WORK/bin/$cmd" <<'STUB'
+          #!/usr/bin/env bash
+          printf '%s\n' "${0##*/} $*" >> "$VLESS_TEST_BLOCKED_CALLS"
+          exit 1
+          STUB
+            chmod +x "$WORK/bin/$cmd"
+          done
+          export PATH="$WORK/bin:$PATH"
+          for t in tests/*.sh; do
+            bash "$t" || exit 1
+          done
+          if [[ -s "$VLESS_TEST_BLOCKED_CALLS" ]]; then
+            cat "$VLESS_TEST_BLOCKED_CALLS"
+            exit 1
+          fi
