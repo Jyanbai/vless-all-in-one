@@ -89,12 +89,14 @@ fi
 
 echo "=== J: smart_apply per-instance ==="
 if grep -q '_smart_apply_mieru_instances' "$SCRIPT"; then pass "smart_apply_mieru_instances wired"; else fail "missing smart apply loop"; fi
-if awk '/^_regenerate_proxy_configs\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT" | grep -q '_smart_apply_mieru_instances'; then
+ctx=$(awk '/^_regenerate_proxy_configs\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
+if grep -q '_smart_apply_mieru_instances' <<<"$ctx"; then
   pass "regen hint mieru → per-instance"
 else
   fail "regen still single-file apply"
 fi
-if awk '/^_regenerate_proxy_configs\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT" | grep -q 'CFG/mieru.json.*vless-mieru'; then
+ctx=$(awk '/^_regenerate_proxy_configs\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
+if grep -q 'CFG/mieru.json.*vless-mieru' <<<"$ctx"; then
   fail "regen still uses legacy single mieru.json"
 else
   pass "no legacy single-file smart_apply"
@@ -102,7 +104,8 @@ fi
 
 echo "=== K: portRange = one process (no per-port spawn inside range) ==="
 # generate loops db_list_ports keys; slug from full key including range
-if grep -A5 '_mieru_instance_slug' "$SCRIPT" | grep -q 'sed'; then pass "slug from full key"; else fail "slug helper"; fi
+ctx=$(grep -A5 '_mieru_instance_slug' "$SCRIPT")
+if grep -q 'sed' <<<"$ctx"; then pass "slug from full key"; else fail "slug helper"; fi
 # Must NOT expand portRange into individual ports for service creation
 if grep -n 'create_mieru_instance_service\|generate_mieru_config' "$SCRIPT" | head -5 >/dev/null; then
   # ensure no loop that splits ranges like {start..end} for mita spawn
@@ -130,7 +133,8 @@ else
 fi
 
 echo "=== O: inherit via empty instance_outbound (db_set inherit→clear) ==="
-if grep -A12 '^db_set_instance_outbound()' "$SCRIPT" | grep -q 'inherit'; then pass "inherit→clear"; else fail "inherit not cleared"; fi
+ctx=$(grep -A12 '^db_set_instance_outbound()' "$SCRIPT")
+if grep -q 'inherit' <<<"$ctx"; then pass "inherit→clear"; else fail "inherit not cleared"; fi
 
 echo "=== P: show_routing_status lists Mieru after Xray (multiline _iob_lines) ==="
 srs=$(awk '/^show_routing_status\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
@@ -163,7 +167,8 @@ else
   fail "status append still hardcodes 实例: each row"
 fi
 # Guard: mieru still absent from XRAY_PROTOCOLS definition
-if grep -m1 '^XRAY_PROTOCOLS=' "$SCRIPT" | grep -qw mieru; then
+ctx=$(grep -m1 '^XRAY_PROTOCOLS=' "$SCRIPT")
+if grep -qw mieru <<<"$ctx"; then
   fail "mieru wrongly added to XRAY_PROTOCOLS"
 else
   pass "XRAY_PROTOCOLS untouched (no mieru)"

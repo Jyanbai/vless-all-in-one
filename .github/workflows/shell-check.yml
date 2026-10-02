@@ -2,6 +2,8 @@ name: shell-check
 
 on:
   push:
+    branches-ignore:
+      - test/hardening
   pull_request:
 
 permissions:
@@ -105,7 +107,7 @@ jobs:
           trap 'rm -rf "$WORK"' EXIT
           mkdir -p "$WORK/bin"
           export VLESS_TEST_BLOCKED_CALLS="$WORK/blocked-calls"
-          for cmd in apt apt-get apk dnf yum systemctl curl wget; do
+          for cmd in apt apt-get apk dnf yum systemctl curl wget sing-box xray ping; do
             cat > "$WORK/bin/$cmd" <<'STUB'
           #!/usr/bin/env bash
           printf '%s\n' "${0##*/} $*" >> "$VLESS_TEST_BLOCKED_CALLS"

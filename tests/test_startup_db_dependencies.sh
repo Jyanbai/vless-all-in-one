@@ -104,13 +104,29 @@ seq=$(VLESS_TEST_CFG="$CFGD" bash -c "source '$H'
   && pass "E runtime call order" || fail "E runtime order: $seq"
 
 echo "=== F: full check_dependencies not called at menu start ==="
-echo "$body" | grep -v '^ *#' | grep -q 'check_dependencies' && fail "F main_menu pre-loop calls check_dependencies" || pass "F static: not in main_menu startup"
+ctx=$(grep -v '^ *#' <<<"$body")
+grep -q 'check_dependencies' <<<"$ctx" && fail "F main_menu pre-loop calls check_dependencies" || pass "F static: not in main_menu startup"
 mk_bin ok; with_jq; rm -rf "$CFGD"; mkdir -p "$CFGD"
-out=$(printf '0\n' | VLESS_TEST_CFG="$CFGD" bash -c "source '$H'; DISTRO=debian
+# main_menu renders both cores through _get_core_version_with_status and
+# _get_core_version. These stubs use only shell builtins, never host binaries.
+for core in xray sing-box; do
+  printf '#!%s\n' "$BASH" > "$BIN/$core"
+  cat >> "$BIN/$core" <<'CORE'
+case "${0##*/}" in
+  xray) printf '%s\n' 'Xray 1.2.3' ;;
+  sing-box) printf '%s\n' 'sing-box version 1.2.3' ;;
+esac
+exit 0
+CORE
+  chmod +x "$BIN/$core"
+done
+# Test stubs must precede the inherited CI interception directory.
+out=$(printf '0\n' | PATH="$BIN:$PATH" VLESS_TEST_CFG="$CFGD" bash -c "source '$H'; DISTRO=debian
   check_root(){ :; }
   check_dependencies(){ echo CHECK_DEPS_CALLED; }; configure_dns64(){ echo DNS64_CALLED; }
   _auto_update_system_script(){ :; }; repair_scheduled_jobs(){ :; }; _init_version_cache(){ :; }
   _update_all_versions_async(){ :; }; _check_script_update_async(){ :; }; _sync_tunnel_config(){ :; }
+  _check_version_updates_async(){ :; }
   detect_legacy_ssh_tunnel(){ return 1; }; ensure_singbox_runtime_consistency(){ :; }
   _header(){ :; }; clear(){ :; }; systemctl(){ :; }
   main_menu" 2>&1); rc=$?

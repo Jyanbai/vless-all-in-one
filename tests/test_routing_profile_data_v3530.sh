@@ -97,7 +97,8 @@ run db_get_routing_profile home >/dev/null 2>&1 && fail "get on missing" || pass
 jq -e 'has("routing_profiles")|not' "$WORK/cfg/db.json" >/dev/null && pass "readers no write" || fail "readers wrote"
 
 echo "=== 10 static: no auto-create in product ==="
-if grep -n 'routing_profiles = \[\]' "$SCRIPT" | grep -v '^\s*[0-9]*:\s*#' | grep -q .; then fail "auto-create remains"; else pass "no '.routing_profiles = []'"; fi
+ctx=$(grep -n 'routing_profiles = \[\]' "$SCRIPT" | grep -v '^\s*[0-9]*:\s*#')
+if grep -q . <<<"$ctx"; then fail "auto-create remains"; else pass "no '.routing_profiles = []'"; fi
 grep -q '^db_ensure_routing_profiles_defaults()' "$SCRIPT" && fail "defaults fn remains" || pass "defaults fn removed"
 
 echo "=== 11 seed drop: exact name+rules only ==="

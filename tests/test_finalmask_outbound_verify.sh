@@ -16,52 +16,55 @@ if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
 echo "=== B: register_protocol fail-closed ==="
 block=$(fm_fn)
-if echo "$block" | grep -q 'if ! register_protocol "vless-finalmask"'; then
+if grep -q 'if ! register_protocol "vless-finalmask"' <<<"$block"; then
   pass "register_protocol checked"
 else
   fail "register_protocol not fail-closed gated"
 fi
-if echo "$block" | grep -A3 'if ! register_protocol "vless-finalmask"' | grep -q '_limited_change_rollback'; then
+ctx=$(grep -A3 'if ! register_protocol "vless-finalmask"' <<<"$block")
+if grep -q '_limited_change_rollback' <<<"$ctx"; then
   pass "register fail → rollback"
 else
   fail "register fail missing rollback"
 fi
 
 echo "=== C: protocol fields via del(.instance_outbound) ==="
-if echo "$block" | grep -q 'del(.instance_outbound) == (\$expected | del(.instance_outbound))'; then
+if grep -q 'del(.instance_outbound) == (\$expected | del(.instance_outbound))' <<<"$block"; then
   pass "protocol compare strips instance_outbound both sides"
 else
   fail "missing stripped protocol equality"
 fi
 # must NOT use bare . == $expected for stored vs new after register
-if echo "$block" | grep -qE "\. == \\\$expected|'\. == \$expected'"; then
+if grep -qE "\. == \\\$expected|'\. == \$expected'" <<<"$block"; then
   fail "still has blind full-object equality"
 else
   pass "no blind stored==new equality"
 fi
 
 echo "=== D: outbound validated separately ==="
-if echo "$block" | grep -q 'stored_ob=\$(printf'; then pass "reads stored_ob"; else fail "no stored_ob"; fi
-if echo "$block" | grep -q 'expected_ob=\$(printf'; then pass "reads expected_ob"; else fail "no expected_ob"; fi
-if echo "$block" | grep -q 'FinalMask 实例出口校验失败'; then pass "outbound verify errors"; else fail "no outbound verify errors"; fi
+if grep -q 'stored_ob=\$(printf' <<<"$block"; then pass "reads stored_ob"; else fail "no stored_ob"; fi
+if grep -q 'expected_ob=\$(printf' <<<"$block"; then pass "reads expected_ob"; else fail "no expected_ob"; fi
+if grep -q 'FinalMask 实例出口校验失败' <<<"$block"; then pass "outbound verify errors"; else fail "no outbound verify errors"; fi
 
 echo "=== E: no literal inherit ==="
-if echo "$block" | grep -A8 'case "\$stored_ob"' | grep -q 'inherit'; then
+ctx=$(grep -A8 'case "\$stored_ob"' <<<"$block")
+if grep -q 'inherit' <<<"$ctx"; then
   pass "literal inherit rejected"
 else
   fail "inherit case missing"
 fi
-if echo "$block" | grep -q '禁止字面量 inherit'; then pass "inherit error text"; else fail "no inherit error"; fi
+if grep -q '禁止字面量 inherit' <<<"$block"; then pass "inherit error text"; else fail "no inherit error"; fi
 
 echo "=== F: outbound vocab allowlist ==="
-if echo "$block" | grep -A15 'case "\$stored_ob"' | grep -qE 'direct\|warp\|chain:\*\|balancer:\*'; then
+ctx=$(grep -A15 'case "\$stored_ob"' <<<"$block")
+if grep -qE 'direct\|warp\|chain:\*\|balancer:\*' <<<"$ctx"; then
   pass "vocab allowlist"
 else
   fail "vocab allowlist missing"
 fi
 
 echo "=== G: expected outbound must match when set ==="
-if echo "$block" | grep -q 'expected_ob" && "\$stored_ob" != "\$expected_ob"'; then
+if grep -q 'expected_ob" && "\$stored_ob" != "\$expected_ob"' <<<"$block"; then
   pass "expected vs stored outbound check"
 else
   fail "missing expected_ob mismatch check"
@@ -71,7 +74,8 @@ echo "=== H: rollback transactional on verify failures ==="
 n=$(echo "$block" | grep -c '_limited_change_rollback' || true)
 [[ "$n" -ge 4 ]] && pass "rollback sites >=4 (got $n)" || fail "too few rollbacks ($n)"
 # empty stored also rolls back
-if echo "$block" | grep -B2 'FinalMask 数据库写入校验失败' | grep -q 'stored_config'; then
+ctx=$(grep -B2 'FinalMask 数据库写入校验失败' <<<"$block")
+if grep -q 'stored_config' <<<"$ctx"; then
   pass "empty stored triggers verify fail path"
 else
   pass "verify fail path present"
@@ -84,7 +88,8 @@ if grep -q 'Mieru（全部实例）' "$SCRIPT"; then
 else
   pass "no Mieru（全部实例） UI"
 fi
-if awk '/^_verify_finalmask_db_write\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT" | grep -q 'db_get_service_outbound_mieru\|service_outbound\.mieru'; then
+ctx=$(awk '/^_verify_finalmask_db_write\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
+if grep -q 'db_get_service_outbound_mieru\|service_outbound\.mieru' <<<"$ctx"; then
   fail "FinalMask verify touches service_outbound.mieru"
 else
   pass "FinalMask verify free of service_outbound.mieru"

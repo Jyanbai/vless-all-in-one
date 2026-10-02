@@ -102,10 +102,14 @@ for f in username port mode authorized_keys_path bind_addr target; do
 done
 
 echo "=== K: write kills on register/db_* ==="
-grep -A12 '^register_protocol()' "$SCRIPT" | grep -q 'ssh-tunnel' && pass "register_protocol refuses ssh-tunnel" || fail "register missing refuse"
-grep -A8 '^db_add()' "$SCRIPT" | grep -q 'ssh-tunnel' && pass "db_add refuses ssh-tunnel" || fail "db_add missing refuse"
-grep -A8 '^db_update_port()' "$SCRIPT" | grep -q 'ssh-tunnel' && pass "db_update_port refuses ssh-tunnel" || fail "db_update_port missing refuse"
-grep -A8 '^db_add_port()' "$SCRIPT" | grep -q 'ssh-tunnel' && pass "db_add_port refuses ssh-tunnel" || fail "db_add_port missing refuse"
+ctx=$(grep -A12 '^register_protocol()' "$SCRIPT")
+grep -q 'ssh-tunnel' <<<"$ctx" && pass "register_protocol refuses ssh-tunnel" || fail "register missing refuse"
+ctx=$(grep -A8 '^db_add()' "$SCRIPT")
+grep -q 'ssh-tunnel' <<<"$ctx" && pass "db_add refuses ssh-tunnel" || fail "db_add missing refuse"
+ctx=$(grep -A8 '^db_update_port()' "$SCRIPT")
+grep -q 'ssh-tunnel' <<<"$ctx" && pass "db_update_port refuses ssh-tunnel" || fail "db_update_port missing refuse"
+ctx=$(grep -A8 '^db_add_port()' "$SCRIPT")
+grep -q 'ssh-tunnel' <<<"$ctx" && pass "db_add_port refuses ssh-tunnel" || fail "db_add_port missing refuse"
 
 echo "=== L: create_service refuses ssh-tunnel ==="
 CS=$(extract_fn create_service)
@@ -118,7 +122,8 @@ echo "=== N: opt-in confirm present; force only for confirmed callers ==="
 echo "$CLEAN" | grep -q '确认清理遗留 SSH Tunnel' && pass "interactive confirm present" || fail "missing confirm prompt"
 echo "$CLEAN" | grep -q 'mode" != "force"' && pass "force mode gated" || fail "force mode missing"
 # main_menu one-shot prompt
-grep -A20 '_SSH_TUNNEL_LEGACY_PROMPTED' "$SCRIPT" | grep -q 'cleanup_legacy_ssh_tunnel force' && pass "menu opt-in wires cleanup" || fail "menu prompt missing"
+ctx=$(grep -A20 '_SSH_TUNNEL_LEGACY_PROMPTED' "$SCRIPT")
+grep -q 'cleanup_legacy_ssh_tunnel force' <<<"$ctx" && pass "menu opt-in wires cleanup" || fail "menu prompt missing"
 
 echo "=== 8: sshd -t/-T fail-closed before reload after drop-in rm ==="
 DROP=$(extract_fn _ssh_tunnel_remove_managed_dropin_failclosed)
@@ -141,7 +146,8 @@ else
 fi
 echo "$REST" | grep -q '备份仍保留' && pass "restore-fail retains bak path" || fail "no bak retain on restore fail"
 # failure paths: claim restored only after successful restore helper
-echo "$DROP" | grep -A3 '_ssh_tunnel_restore_dropin_from_bak' | grep -q '已恢复托管 drop-in' && pass "claims restored only after helper success" || fail "restored claim not gated"
+ctx=$(grep -A3 '_ssh_tunnel_restore_dropin_from_bak' <<<"$DROP")
+grep -q '已恢复托管 drop-in' <<<"$ctx" && pass "claims restored only after helper success" || fail "restored claim not gated"
 echo "$DROP" | grep -q '恢复 drop-in 失败；备份仍保留' && pass "hard-fail path retains bak" || fail "missing restore-fail message"
 # forbid unchecked restore pattern in drop fn
 if echo "$DROP" | grep -qE 'cp -f "\$bak" "\$live".*\|\| true'; then

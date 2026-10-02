@@ -50,32 +50,48 @@ grep -q '家宽 + 直出备用\|家宽 + 直出备用向导' "$SCRIPT" && fail "
 grep -q '旧规则集' "$SCRIPT" && pass "legacy marker" || fail "legacy marker missing"
 
 echo "=== D: profile:<id> vocab resolve fail-closed missing ==="
-awk '/^_resolve_instance_outbound_target\(\)/,/^gen_xray_instance_outbound_needs|^# v3.5.28 product/' "$SCRIPT" | grep -q 'db_routing_profile_exists'   && pass "resolve checks exists" || fail "resolve missing exists"
-grep -A30 '^db_set_instance_outbound()' "$SCRIPT" | grep -q 'profile:\*' && pass "setter accepts profile" || fail "setter no profile"
+ctx=$(awk '/^_resolve_instance_outbound_target\(\)/,/^gen_xray_instance_outbound_needs|^# v3.5.28 product/' "$SCRIPT")
+grep -q 'db_routing_profile_exists'   <<<"$ctx" && pass "resolve checks exists" || fail "resolve missing exists"
+ctx=$(grep -A30 '^db_set_instance_outbound()' "$SCRIPT")
+grep -q 'profile:\*' <<<"$ctx" && pass "setter accepts profile" || fail "setter no profile"
 
 echo "=== E: unmatched inherits global (not direct) ==="
 grep -q '无 catch-all\|inherit global\|继承全局' "$SCRIPT" && pass "inherit markers" || fail "no inherit markers"
-if grep -A15 '_INSTANCE_OB_KIND" == "profile"' "$SCRIPT" | grep -q '_gen_xray_profile_inbound_rules'; then
+ctx=$(grep -A15 '_INSTANCE_OB_KIND" == "profile"' "$SCRIPT")
+if grep -q '_gen_xray_profile_inbound_rules' <<<"$ctx"; then
   pass "profile uses multi-rule compile"
 else
   fail "profile emit wrong"
 fi
 
 echo "=== F: Xray inboundTag scope on profile rules ==="
-grep -A5 '_gen_xray_profile_inbound_rules' "$SCRIPT" | grep -q 'inboundTag' || \
-  grep -n 'inboundTag:\$tags' "$SCRIPT" | grep -q . && pass "inboundTag in profile compile" || fail "no inboundTag"
+ctx=$(grep -A5 '_gen_xray_profile_inbound_rules' "$SCRIPT")
+if grep -q 'inboundTag' <<<"$ctx"; then
+  pass "inboundTag in profile compile"
+elif grep -q 'inboundTag:\$tags' "$SCRIPT"; then
+  pass "inboundTag in profile compile"
+else
+  fail "no inboundTag"
+fi
 
 echo "=== G: Mieru per-instance profile (no service-wide) ==="
 grep -q '禁止 service-wide\|仅支持 per-instance\|仅限 per-instance' "$SCRIPT" && pass "no service-wide marker" || fail "missing per-instance guard"
-grep -A30 'profile:\*)' "$SCRIPT" | grep -q '_mieru_expand_profile_rules\|_mieru_compile_egress_plan' && pass "mieru profile path" || \
-  grep -q '_mieru_expand_profile_rules' "$SCRIPT" && pass "mieru expand present" || fail "mieru profile missing"
+ctx=$(grep -A30 'profile:\*)' "$SCRIPT")
+if grep -q '_mieru_expand_profile_rules\|_mieru_compile_egress_plan' <<<"$ctx"; then
+  pass "mieru profile path"
+elif grep -q '_mieru_expand_profile_rules' "$SCRIPT"; then
+  pass "mieru expand present"
+else
+  fail "mieru profile missing"
+fi
 
 echo "=== H: DIRECT does not reorder ==="
 grep -q 'does NOT reorder by outbound=direct\|DIRECT does not\|不浮动 DIRECT\|不重排' "$SCRIPT" && pass "no DIRECT reorder" || fail "reorder note missing"
 
 echo "=== I: v3.5.30 no defaults/auto-create path (ensure removed) ==="
 grep -q '^db_ensure_routing_profiles_defaults()' "$SCRIPT" && fail "ensure defaults fn still present" || pass "ensure defaults fn removed"
-if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'db_add_routing_profile "finance_crypto"\|db_add_routing_profile "telegram_dc"\|db_add_routing_profile "ai_media"'; then
+ctx=$(grep -v '^[[:space:]]*#' "$SCRIPT")
+if grep -q 'db_add_routing_profile "finance_crypto"\|db_add_routing_profile "telegram_dc"\|db_add_routing_profile "ai_media"' <<<"$ctx"; then
   fail "script still seeds finance/tg/ai profiles"
 else
   pass "no finance/tg/ai auto-create"
@@ -87,24 +103,40 @@ init_block=$(awk '/^init_db\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
 echo "$init_block" | grep -q 'routing_profiles' && fail "init_db still initialises routing_profiles" || pass "init_db has no routing_profiles init"
 
 echo "=== J: Telegram DC uses matchers not fake geoip:telegram ==="
-grep -q 'geoip:telegram' "$SCRIPT" && {
-  grep -q '规则集禁止 geoip:telegram' "$SCRIPT" && pass "profile forbids geoip:telegram" || fail "no forbid"
-} || pass "no geoip:telegram at all"
+if grep -q 'geoip:telegram' "$SCRIPT"; then
+  if grep -q '规则集禁止 geoip:telegram' "$SCRIPT"; then
+    pass "profile forbids geoip:telegram"
+  else
+    fail "no forbid"
+  fi
+else
+  pass "no geoip:telegram at all"
+fi
 grep -q 'telegram_dc_matchers\|type":"telegram_dc"\|type=telegram_dc\|telegram_dc' "$SCRIPT" && pass "uses telegram_dc type/matchers" || fail "no tg dc"
 
 echo "=== K: unknown→TG fallback in template ==="
-grep -A20 '^db_routing_template_rules_telegram_dc()' "$SCRIPT" | grep -q 'geosite:telegram' && pass "geosite:telegram fallback in template" || \
-  grep -q 'tg_fallback\|geosite:telegram' "$SCRIPT" && pass "tg fallback present" || fail "no tg fallback"
+ctx=$(grep -A20 '^db_routing_template_rules_telegram_dc()' "$SCRIPT")
+if grep -q 'geosite:telegram' <<<"$ctx"; then
+  pass "geosite:telegram fallback in template"
+elif grep -q 'tg_fallback\|geosite:telegram' "$SCRIPT"; then
+  pass "tg fallback present"
+else
+  fail "no tg fallback"
+fi
 
 echo "=== L: chain/balancer/WARP guards see profiles ==="
 grep -q '_list_profiles_referencing_outbound' "$SCRIPT" && pass "profile outbound scanner" || fail "no scanner"
-grep -A45 '^db_del_chain_node()' "$SCRIPT" | grep -q '_list_profiles_referencing_outbound' && pass "chain guard profiles" || fail "chain guard"
-grep -A45 '^db_delete_balancer_group()' "$SCRIPT" | grep -q '_list_profiles_referencing_outbound' && pass "balancer guard profiles" || fail "balancer guard"
-grep -A55 '^uninstall_warp()' "$SCRIPT" | grep -q '_list_profiles_referencing_outbound' && pass "warp guard profiles" || fail "warp guard"
+ctx=$(grep -A45 '^db_del_chain_node()' "$SCRIPT")
+grep -q '_list_profiles_referencing_outbound' <<<"$ctx" && pass "chain guard profiles" || fail "chain guard"
+ctx=$(grep -A45 '^db_delete_balancer_group()' "$SCRIPT")
+grep -q '_list_profiles_referencing_outbound' <<<"$ctx" && pass "balancer guard profiles" || fail "balancer guard"
+ctx=$(grep -A55 '^uninstall_warp()' "$SCRIPT")
+grep -q '_list_profiles_referencing_outbound' <<<"$ctx" && pass "warp guard profiles" || fail "warp guard"
 
 echo "=== M: shared-profile edit transactional markers ==="
 # v3.5.30: shared-profile editing retired -> its transactional apply path must be gone
-grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'profile-apply' && fail "profile-apply path still present" || pass "profile-apply path removed"
+ctx=$(grep -v '^[[:space:]]*#' "$SCRIPT")
+grep -q 'profile-apply' <<<"$ctx" && fail "profile-apply path still present" || pass "profile-apply path removed"
 grep -q '_routing_profile_validate_and_apply' "$SCRIPT" && fail "validate_and_apply still referenced" || pass "validate_and_apply removed"
 grep -q 'Dry-run Xray' "$SCRIPT" && fail "profile edit Xray dry-run still present" || pass "no profile-edit Xray dry-run"
 grep -q 'Dry-run Mieru' "$SCRIPT" && fail "profile edit Mieru dry-run still present" || pass "no profile-edit Mieru dry-run"
@@ -117,12 +149,15 @@ done
 grep -q 'fallback: "inherit"\|fallback:"inherit"\|fallback = "inherit"' "$SCRIPT" && pass "fallback inherit" || fail "no fallback inherit"
 
 echo "=== O: display name profile ==="
-grep -A40 '^_get_outbound_display_name()' "$SCRIPT" | grep -q 'profile:\*' && pass "display profile" || fail "display missing profile"
-grep -A40 '^_get_outbound_display_name()' "$SCRIPT" | grep -q '旧规则集' && pass "legacy display 旧规则集" || fail "no legacy display"
+ctx=$(grep -A40 '^_get_outbound_display_name()' "$SCRIPT")
+grep -q 'profile:\*' <<<"$ctx" && pass "display profile" || fail "display missing profile"
+ctx=$(grep -A40 '^_get_outbound_display_name()' "$SCRIPT")
+grep -q '旧规则集' <<<"$ctx" && pass "legacy display 旧规则集" || fail "no legacy display"
 
 echo "=== P: selectors split (REAL vs INSTANCE fixed menu) ==="
 # REAL outbound selector must NOT offer profile:*
-if grep -A80 '^_select_outbound()' "$SCRIPT" | grep -q 'outbounds+=("profile:'; then
+ctx=$(grep -A80 '^_select_outbound()' "$SCRIPT")
+if grep -q 'outbounds+=("profile:' <<<"$ctx"; then
   fail "select_outbound still offers profile"
 else
   pass "select_outbound REAL only (no profile)"
@@ -167,13 +202,15 @@ if echo "$mgr" | grep -q 'manage_routing_profiles'; then
 else
   pass "manage_routing_profiles unhooked from manage_routing"
 fi
-if grep -A50 '^manage_routing()' "$SCRIPT" | grep -q '_item "11"'; then
+ctx=$(grep -A50 '^manage_routing()' "$SCRIPT")
+if grep -q '_item "11"' <<<"$ctx"; then
   fail "menu 11 duplicate still present"
 else
   pass "menu 11 duplicate removed"
 fi
 # wizard reachable from instance outbound item 8 (not generic profiles CRUD)
-grep -v '^[[:space:]]*#' "$SCRIPT" | grep -q 'wizard_home_broadband_direct_backup' && fail "wizard still referenced" || pass "wizard not reachable anywhere"
+ctx=$(grep -v '^[[:space:]]*#' "$SCRIPT")
+grep -q 'wizard_home_broadband_direct_backup' <<<"$ctx" && fail "wizard still referenced" || pass "wizard not reachable anywhere"
 grep -q '^manage_routing_profiles()' "$SCRIPT" && fail "profiles CRUD fn still defined" || pass "profiles CRUD fn deleted (v3.5.30)"
 
 echo "=== R: jq unit — profile rule inboundTag shape ==="
@@ -211,25 +248,40 @@ if bash "$_H"; then pass "templates return JSON arrays"; else fail "templates JS
 rm -rf "$_TMP"
 
 echo "=== T: telegram matchers schema keys ==="
-grep -A30 '^db_seed_telegram_dc_matchers_if_absent()' "$SCRIPT" | grep -q 'dc1:' && pass "dc1 seed" || fail "dc1"
-grep -A30 '^db_seed_telegram_dc_matchers_if_absent()' "$SCRIPT" | grep -q 'note:' && pass "note field" || fail "note"
+ctx=$(grep -A30 '^db_seed_telegram_dc_matchers_if_absent()' "$SCRIPT")
+grep -q 'dc1:' <<<"$ctx" && pass "dc1 seed" || fail "dc1"
+ctx=$(grep -A30 '^db_seed_telegram_dc_matchers_if_absent()' "$SCRIPT")
+grep -q 'note:' <<<"$ctx" && pass "note field" || fail "note"
 
 echo "=== U: needs collects profile outbounds ==="
-grep -A25 '^gen_xray_instance_outbound_needs()' "$SCRIPT" | grep -q 'profile:\*' && pass "needs profile" || fail "needs no profile"
+ctx=$(grep -A25 '^gen_xray_instance_outbound_needs()' "$SCRIPT")
+grep -q 'profile:\*' <<<"$ctx" && pass "needs profile" || fail "needs no profile"
 
 echo "=== V: rule helpers reject profile:* (symbol + code) ==="
-grep -A25 '^_db_routing_rule_outbound_ok()' "$SCRIPT" | grep -q 'profile:\*' && pass "rule outbound rejects profile" || fail "no reject"
-grep -A20 '^db_add_routing_profile_rule()' "$SCRIPT" | grep -q '_db_routing_rule_outbound_ok' && pass "add_rule validates" || fail "add_rule no validate"
-grep -A20 '^db_set_routing_profile_rules()' "$SCRIPT" | grep -q '_db_routing_rules_outbounds_ok' && pass "set_rules validates" || fail "set_rules no validate"
-grep -A25 '^db_add_routing_profile()' "$SCRIPT" | grep -q '_db_routing_rules_outbounds_ok' && pass "add_profile validates" || fail "add_profile no validate"
-grep -A30 '^db_update_routing_profile()' "$SCRIPT" | grep -q '_db_routing_rules_outbounds_ok' && pass "update_profile validates" || fail "update_profile no validate"
+ctx=$(grep -A25 '^_db_routing_rule_outbound_ok()' "$SCRIPT")
+grep -q 'profile:\*' <<<"$ctx" && pass "rule outbound rejects profile" || fail "no reject"
+ctx=$(grep -A20 '^db_add_routing_profile_rule()' "$SCRIPT")
+grep -q '_db_routing_rule_outbound_ok' <<<"$ctx" && pass "add_rule validates" || fail "add_rule no validate"
+ctx=$(grep -A20 '^db_set_routing_profile_rules()' "$SCRIPT")
+grep -q '_db_routing_rules_outbounds_ok' <<<"$ctx" && pass "set_rules validates" || fail "set_rules no validate"
+ctx=$(grep -A25 '^db_add_routing_profile()' "$SCRIPT")
+grep -q '_db_routing_rules_outbounds_ok' <<<"$ctx" && pass "add_profile validates" || fail "add_profile no validate"
+ctx=$(grep -A30 '^db_update_routing_profile()' "$SCRIPT")
+grep -q '_db_routing_rules_outbounds_ok' <<<"$ctx" && pass "update_profile validates" || fail "update_profile no validate"
 
 echo "=== W: fail-closed missing profile in resolve ==="
-grep -n '分流规则集不存在' "$SCRIPT" | grep -q . && pass "fail-closed msg" || fail "no fail-closed msg"
+ctx=$(grep -n '分流规则集不存在' "$SCRIPT")
+grep -q . <<<"$ctx" && pass "fail-closed msg" || fail "no fail-closed msg"
 
 echo "=== X: mieru profile merges global (pref + glob) ==="
-grep -n '\$p + \$g\|$p + $g' "$SCRIPT" | grep -q . && pass "mieru merge profile+global" || \
-  grep -q "\$p + \$g" "$SCRIPT" && pass "mieru merge" || fail "no merge"
+ctx=$(grep -n '\$p + \$g\|$p + $g' "$SCRIPT")
+if grep -q . <<<"$ctx"; then
+  pass "mieru merge profile+global"
+elif grep -q "\$p + \$g" "$SCRIPT"; then
+  pass "mieru merge"
+else
+  fail "no merge"
+fi
 
 echo "=== Y: wizard retired; migrate still handles legacy home_broadband ==="
 grep -q 'home_broadband' "$SCRIPT" && pass "home_broadband legacy (migrate)" || fail "no home_broadband"
