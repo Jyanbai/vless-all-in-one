@@ -96,6 +96,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Reject early-exit test pipelines (blocking)
+        run: |
+          set -euo pipefail
+          if grep -nE '\|[[:space:]]*(grep[[:space:]]+-[a-zA-Z]*[qm]|head)\b' tests/*.sh; then
+            exit 1
+          else
+            rc=$?
+            if [[ "$rc" -ne 1 ]]; then
+              echo "Pipeline lint failed: grep rc=$rc"
+              exit "$rc"
+            fi
+          fi
+
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
 

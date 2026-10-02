@@ -54,13 +54,15 @@ echo "=== A: manage prompt (Xray) offers exactly 1-5 + 0 ==="
 reset_db "$PLAIN"
 out=$(printf '0\n' | run '_prompt_instance_outbound vless 443 ""' 2>&1)
 [[ "$(echo "$out" | opts)" == "1 2 3 4 5 0 " ]] && pass "A xray options 1-5,0" || fail "A xray options: $(echo "$out" | opts)"
-echo "$out" | strip | grep -qE '家宽|直出备用|规则集|profile' && fail "A legacy/profile items leaked" || pass "A no 家宽/直出备用/规则集 items"
+stripped_out=$(strip <<<"$out")
+grep -qE '家宽|直出备用|规则集|profile' <<<"$stripped_out" && fail "A legacy/profile items leaked" || pass "A no 家宽/直出备用/规则集 items"
 
 echo "=== B: manage prompt (Mieru) offers exactly 1-5 + 0 ==="
 out=$(printf '0\n' | run '_prompt_instance_outbound mieru 20000-20010 ""' 2>&1)
 [[ "$(echo "$out" | opts)" == "1 2 3 4 5 0 " ]] && pass "B mieru options 1-5,0" || fail "B mieru options: $(echo "$out" | opts)"
 out=$(printf '1\n0\n0\n' | run 'manage_instance_outbound' 2>&1)
-echo "$out" | strip | grep -q 'Mieru.*20000-20010\|mieru.*20000-20010' && pass "B mieru row in manage menu" || fail "B mieru row missing"
+stripped_out=$(strip <<<"$out")
+grep -q 'Mieru.*20000-20010\|mieru.*20000-20010' <<<"$stripped_out" && pass "B mieru row in manage menu" || fail "B mieru row missing"
 
 echo "=== C: install-time Xray prompt (register_protocol, tty) ==="
 if [[ $HAVE_SCRIPT_PTY == 1 ]]; then
@@ -114,12 +116,12 @@ run 'db_set_instance_outbound xray mieru 4405 profile:home' 2>/dev/null && pass 
 echo "=== H: legacy profile:home (家宽) shows 旧规则集: 家宽 without id ==="
 reset_db "$LEGACY"
 out=$(printf '1\nk\n0\n' | run 'manage_instance_outbound' 2>&1 | strip)
-echo "$out" | grep -q '旧规则集: 家宽' && pass "H shows 旧规则集: 家宽" || fail "H no 旧规则集: 家宽"
-echo "$out" | grep -qE 'profile:|\bhome\b' && fail "H internal id leaked" || pass "H no internal id"
+grep -q '旧规则集: 家宽' <<<"$out" && pass "H shows 旧规则集: 家宽" || fail "H no 旧规则集: 家宽"
+grep -qE 'profile:|\bhome\b' <<<"$out" && fail "H internal id leaked" || pass "H no internal id"
 if [[ $HAVE_SCRIPT_PTY == 1 ]]; then
   pout=$(run_pty '_prompt_instance_outbound vless 443 profile:home; echo "SEL=[$SELECTED_INSTANCE_OUTBOUND]"' '\n' 2>&1 | strip)
-  echo "$pout" | grep -q '请选择 \[k\]' && pass "H default choice is k" || fail "H default not k"
-  echo "$pout" | grep -q 'SEL=\[profile:home\]' && pass "H <enter> keeps stored value" || fail "H enter did not keep"
+  grep -q '请选择 \[k\]' <<<"$pout" && pass "H default choice is k" || fail "H default not k"
+  grep -q 'SEL=\[profile:home\]' <<<"$pout" && pass "H <enter> keeps stored value" || fail "H enter did not keep"
 else
   fail "H needs script(1) for pty"
 fi
@@ -151,10 +153,10 @@ dbq '.xray.mieru[0].instance_outbound=="direct" and (.routing_profiles|length)==
 echo "=== K: missing profile -> 已缺失, compilers fail closed ==="
 reset_db "$(echo "$LEGACY" | jq -c '.routing_profiles=[] | .xray.vless[0].instance_outbound="profile:ghost" | .xray.mieru[0].instance_outbound="profile:ghost"')"
 out=$(printf '1\nk\n0\n' | run 'manage_instance_outbound' 2>&1 | strip)
-echo "$out" | grep -q '旧规则集: 已缺失' && pass "K shows 旧规则集: 已缺失" || fail "K no 已缺失"
-echo "$out" | grep -q 'ghost' && fail "K id leaked" || pass "K no id in UI"
+grep -q '旧规则集: 已缺失' <<<"$out" && pass "K shows 旧规则集: 已缺失" || fail "K no 已缺失"
+grep -q 'ghost' <<<"$out" && fail "K id leaked" || pass "K no id in UI"
 err=$(run 'gen_xray_instance_outbound_rules' 2>&1 >/dev/null); rc=$?
-[[ $rc -ne 0 ]] && echo "$err" | grep -q '分流规则集不存在: profile:ghost' && pass "K xray fail-closed msg" || fail "K xray rc=$rc err=$err"
+[[ $rc -ne 0 ]] && grep -q '分流规则集不存在: profile:ghost' <<<"$err" && pass "K xray fail-closed msg" || fail "K xray rc=$rc err=$err"
 run '_mieru_compile_egress_plan 4405' >/dev/null 2>&1 && fail "K mieru compiled on missing profile" || pass "K mieru fail-closed"
 
 echo "=== L: clean DB: init_db + migrations -> no routing_profiles, idempotent, no snapshot ==="
@@ -174,7 +176,7 @@ dbq '.routing_profiles[0].id=="home" and .routing_profiles[0].name=="家宽" and
 xr=$(run 'gen_xray_instance_outbound_rules' 2>/dev/null)
 echo "$xr" | jq -e 'any(.[]; (.inboundTag|index("vless-443")!=null) and ((.domain//[])|index("geosite:netflix")!=null))' >/dev/null && pass "M xray profile rules compiled" || fail "M xray rules: $xr"
 mp=$(run '_mieru_compile_egress_plan 4405' 2>/dev/null)
-echo "$mp" | jq -e 'type=="object" and (tostring|contains("netflix"))' >/dev/null && pass "M mieru profile plan compiled" || fail "M mieru plan: $(echo "$mp" | head -c 300)"
+echo "$mp" | jq -e 'type=="object" and (tostring|contains("netflix"))' >/dev/null && pass "M mieru profile plan compiled" || fail "M mieru plan: $(head -c 300 <<<"$mp")"
 
 echo "=== N: mieru not in XRAY_PROTOCOLS; profile-free generation works ==="
 xp=$(run 'echo " $XRAY_PROTOCOLS "' 2>/dev/null)

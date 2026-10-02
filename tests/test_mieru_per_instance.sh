@@ -12,8 +12,10 @@ if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
 echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
-C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
+R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md")
+R=$(head -1 <<<"$R")
+C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md")
+C=$(head -1 <<<"$C")
 [[ "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: per-instance symbols ==="
@@ -22,7 +24,9 @@ for s in _mieru_instance_slug _mieru_instance_config_path _mieru_instance_svc_na
          create_mieru_services _smart_apply_mieru_instances generate_mieru_config \
          _mieru_compile_egress_plan db_get_instance_outbound db_list_ports \
          db_migrate_mieru_service_outbound_to_instances manage_instance_outbound; do
-  if grep -qE "^${s}\(\)|_${s}\(\)" "$SCRIPT" || grep -q "^${s}()" "$SCRIPT"; then
+  if grep -qE "^${s}\(\)|_${s}\(\)" "$SCRIPT"; then
+    pass "symbol $s"
+  elif grep -q "^${s}()" "$SCRIPT"; then
     pass "symbol $s"
   else
     fail "missing $s"
@@ -31,14 +35,14 @@ done
 
 echo "=== D: UI lists mieru via db_list_ports; no 全部实例 ==="
 ui=$(awk '/^manage_instance_outbound\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
-if echo "$ui" | grep -q 'Mieru（全部实例）'; then fail "still has Mieru（全部实例）"; else pass "no Mieru（全部实例）"; fi
-if echo "$ui" | grep -q '\[\[ "\$proto" == "mieru" \]\] && continue'; then
+if grep -q 'Mieru（全部实例）' <<<"$ui"; then fail "still has Mieru（全部实例）"; else pass "no Mieru（全部实例）"; fi
+if grep -q '\[\[ "\$proto" == "mieru" \]\] && continue' <<<"$ui"; then
   fail "mieru still skipped in loop"
 else
   pass "mieru included in per-port/portRange loop"
 fi
-if echo "$ui" | grep -q 'db_list_ports "xray" "\$proto"'; then pass "db_list_ports in UI loop"; else fail "no db_list_ports in UI"; fi
-if echo "$ui" | grep -q 'db_get_service_outbound_mieru\|db_set_service_outbound_mieru'; then
+if grep -q 'db_list_ports "xray" "\$proto"' <<<"$ui"; then pass "db_list_ports in UI loop"; else fail "no db_list_ports in UI"; fi
+if grep -q 'db_get_service_outbound_mieru\|db_set_service_outbound_mieru' <<<"$ui"; then
   fail "UI still uses service_outbound APIs"
 else
   pass "UI uses instance_outbound only"
@@ -47,9 +51,10 @@ fi
 echo "=== E: compile reads instance_outbound; not service in final path ==="
 # First 40 lines of compile must mention db_get_instance_outbound and NOT db_get_service_outbound_mieru
 head_block=$(awk '/^_mieru_compile_egress_plan\(\)/{f=1} f{print; if(++n>=45) exit}' "$SCRIPT")
-if echo "$head_block" | grep -q 'db_get_instance_outbound'; then pass "compile reads instance_outbound"; else fail "compile missing instance_outbound"; fi
+if grep -q 'db_get_instance_outbound' <<<"$head_block"; then pass "compile reads instance_outbound"; else fail "compile missing instance_outbound"; fi
 # Ignore comment lines that mention the forbidden symbol by name
-if echo "$head_block" | grep -v '^[[:space:]]*#' | grep -qE 'db_get_service_outbound_mieru[[:space:]]*($|\|)|\$\(db_get_service_outbound_mieru'; then
+compile_body=$(sed '/^[[:space:]]*#/d' <<<"$head_block")
+if grep -qE 'db_get_service_outbound_mieru[[:space:]]*($|\|)|\$\(db_get_service_outbound_mieru' <<<"$compile_body"; then
   fail "compile still calls db_get_service_outbound_mieru"
 else
   pass "compile final path has no service_outbound read"
@@ -80,7 +85,7 @@ for needle in '需要 WARP 但未就绪（fail-closed）' '链式节点不存在
 done
 
 echo "=== I: same-value no-op in UI ==="
-if echo "$ui" | grep -q 'new_ob" == "\$cur_ob"'; then pass "same-value short-circuit"; else fail "no same-value check"; fi
+if grep -q 'new_ob" == "\$cur_ob"' <<<"$ui"; then pass "same-value short-circuit"; else fail "no same-value check"; fi
 if echo "$ui" | awk '/未变更/{p=1} p&&/continue/{ok=1} p&&/_regenerate_proxy_configs/{if(!ok){bad=1}} END{exit bad||!ok}'; then
   pass "same-value continues before regen"
 else
@@ -107,7 +112,7 @@ echo "=== K: portRange = one process (no per-port spawn inside range) ==="
 ctx=$(grep -A5 '_mieru_instance_slug' "$SCRIPT")
 if grep -q 'sed' <<<"$ctx"; then pass "slug from full key"; else fail "slug helper"; fi
 # Must NOT expand portRange into individual ports for service creation
-if grep -n 'create_mieru_instance_service\|generate_mieru_config' "$SCRIPT" | head -5 >/dev/null; then
+if grep -m5 -n 'create_mieru_instance_service\|generate_mieru_config' "$SCRIPT" >/dev/null; then
   # ensure no loop that splits ranges like {start..end} for mita spawn
   if grep -E 'for .* in \{\$[a-z_]+-\$[a-z_]+\}\|seq .*port_range' "$SCRIPT" | grep -i mieru; then
     fail "possible per-port spawn inside range"
@@ -126,7 +131,7 @@ echo "=== M: migration symbol present (DA) ==="
 grep -q '^db_migrate_mieru_service_outbound_to_instances()' "$SCRIPT" && pass "migrate symbol" || fail "migrate missing"
 
 echo "=== N: no manual svc restart in manage_instance_outbound ==="
-if echo "$ui" | grep -qE 'svc (restart|stop|start) '; then
+if grep -qE 'svc (restart|stop|start) ' <<<"$ui"; then
   fail "manual svc in manage_instance_outbound"
 else
   pass "no manual svc in UI (uses regenerate)"
@@ -138,18 +143,18 @@ if grep -q 'inherit' <<<"$ctx"; then pass "inherit→clear"; else fail "inherit 
 
 echo "=== P: show_routing_status lists Mieru after Xray (multiline _iob_lines) ==="
 srs=$(awk '/^show_routing_status\(\)/{f=1} f{print} /^\}$/{if(f&&++c==1) exit}' "$SCRIPT")
-if echo "$srs" | grep -q 'db_exists "xray" "mieru"'; then pass "status db_exists mieru"; else fail "status missing db_exists mieru"; fi
-if echo "$srs" | grep -q 'db_list_ports "xray" "mieru"'; then pass "status db_list_ports mieru"; else fail "status missing db_list_ports mieru"; fi
+if grep -q 'db_exists "xray" "mieru"' <<<"$srs"; then pass "status db_exists mieru"; else fail "status missing db_exists mieru"; fi
+if grep -q 'db_list_ports "xray" "mieru"' <<<"$srs"; then pass "status db_list_ports mieru"; else fail "status missing db_list_ports mieru"; fi
 # Multiline: append uses $'\n', not jammed $(printf ...)
 if echo "$srs" | grep -F "_iob_lines+=" | grep -F "$'\n'" >/dev/null; then
   pass "status multiline _iob_lines"
-elif echo "$srs" | grep -q '_iob_lines+=$(printf'; then
+elif grep -q '_iob_lines+=$(printf' <<<"$srs"; then
   fail "status still jams via $(printf)"
 else
   fail "status missing multiline _iob_lines"
 fi
 # Format: first row label "实例:", later rows indent-only (no repeated 实例:)
-if echo "$srs" | grep -q '_iob_n'; then
+if grep -q '_iob_n' <<<"$srs"; then
   pass "status first-row-only label counter"
 else
   fail "status missing _iob_n first-row counter"

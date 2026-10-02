@@ -12,8 +12,10 @@ if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
 echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
-C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
+R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md")
+R=$(head -1 <<<"$R")
+C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md")
+C=$(head -1 <<<"$C")
 [[ "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: symbols present ==="
@@ -45,7 +47,7 @@ grep -q 'fail-closed' "$SCRIPT" && pass "fail-closed present" || fail "no fail-c
 grep -q '用户 > 实例 > 全局' "$SCRIPT" && pass "priority comment" || fail "priority comment missing"
 
 echo "=== G: multi-IP comment near emit ==="
-grep -q 'MULTI-IP\|多IP' "$SCRIPT" | head -1
+grep -q 'MULTI-IP\|多IP' "$SCRIPT"
 ctx=$(grep -n 'MULTI-IP\|多IP显式\|ip-in-' "$SCRIPT")
 if grep -qi 'instance\|实例' <<<"$ctx"; then pass "multi-IP documented near instance"
 else

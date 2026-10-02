@@ -57,8 +57,8 @@ out=$(ens debian); rc=$?
 [[ $rc -eq 0 ]] && pass "B rc0" || fail "B rc=$rc out=$out"
 grep -qx 'apt-get update' "$CALLS" && grep -qx 'apt-get install -y jq' "$CALLS" && pass "B apt-get update + install -y jq" || fail "B calls: $(tr '\n' ';' < "$CALLS")"
 grep -qE '^(apk|yum|dnf) ' "$CALLS" && fail "B other PMs touched" || pass "B only apt-get used"
-[[ -x "$BIN/jq" ]] && echo "$out" | grep -q 'jq 已安装' && pass "B verified after install" || fail "B not verified"
-echo "$out" | grep -q "$MSG" && fail "B failure msg on success" || pass "B no failure msg"
+[[ -x "$BIN/jq" ]] && grep -q 'jq 已安装' <<<"$out" && pass "B verified after install" || fail "B not verified"
+grep -q "$MSG" <<<"$out" && fail "B failure msg on success" || pass "B no failure msg"
 
 echo "=== C: apk / dnf / yum / unknown-distro paths ==="
 mk_bin ok; out=$(ens alpine); rc=$?
@@ -73,9 +73,9 @@ mk_bin ok; only apk; out=$(ens unknown); rc=$?
 echo "=== D: install fails -> exact message, non-zero, no migration error ==="
 mk_bin fail; out=$(ens debian); rc=$?
 [[ $rc -ne 0 ]] && pass "D ensure rc!=0" || fail "D ensure rc0"
-echo "$out" | grep -qF "$MSG" && pass "D exact error message" || fail "D msg: $out"
+grep -qF "$MSG" <<<"$out" && pass "D exact error message" || fail "D msg: $out"
 mk_bin noop; out=$(ens debian); rc=$?
-[[ $rc -ne 0 ]] && echo "$out" | grep -qF "$MSG" && pass "D installer rc0 but no jq -> still fails (verify-after)" || fail "D noop rc=$rc"
+[[ $rc -ne 0 ]] && grep -qF "$MSG" <<<"$out" && pass "D installer rc0 but no jq -> still fails (verify-after)" || fail "D noop rc=$rc"
 # Full main_menu with failing installer: must exit non-zero before init_db/migrations
 mk_bin fail; rm -rf "$CFGD"; mkdir -p "$CFGD"
 out=$(VLESS_TEST_CFG="$CFGD" bash -c "source '$H'; DISTRO=debian
@@ -83,14 +83,18 @@ out=$(VLESS_TEST_CFG="$CFGD" bash -c "source '$H'; DISTRO=debian
   init_db(){ echo INIT_DB_CALLED; }
   PATH='$BIN'; hash -r; main_menu" </dev/null 2>&1); rc=$?
 [[ $rc -ne 0 ]] && pass "D main_menu exits non-zero" || fail "D main_menu rc0"
-echo "$out" | grep -qF "$MSG" && pass "D main_menu prints exact message" || fail "D main_menu msg: $out"
-echo "$out" | grep -q '分流规则集迁移失败' && fail "D migration error text shown" || pass "D no 分流规则集迁移失败"
-echo "$out" | grep -q 'INIT_DB_CALLED' && fail "D init_db ran without jq" || pass "D init_db not reached"
+grep -qF "$MSG" <<<"$out" && pass "D main_menu prints exact message" || fail "D main_menu msg: $out"
+grep -q '分流规则集迁移失败' <<<"$out" && fail "D migration error text shown" || pass "D no 分流规则集迁移失败"
+grep -q 'INIT_DB_CALLED' <<<"$out" && fail "D init_db ran without jq" || pass "D init_db not reached"
 [[ ! -e "$CFGD/db.json" ]] && pass "D no db.json written" || fail "D db.json created"
 
 echo "=== E: order check_root -> init_log -> ensure -> init_db -> migrations ==="
 body=$(awk '/^main_menu\(\)/{f=1} f{print} f && /^    while true/{exit}' "$SCRIPT")
-ln() { echo "$body" | grep -n "$1" | grep -v '^[0-9]*: *#' | head -1 | cut -d: -f1; }
+ln() {
+  local matches
+  matches=$(grep -n "$1" <<<"$body" | grep -v '^[0-9]*: *#') || return $?
+  head -1 <<<"$matches" | cut -d: -f1
+}
 a=$(ln '^ *check_root'); b=$(ln '^ *init_log'); c=$(ln 'ensure_startup_db_dependencies'); d=$(ln '^ *init_db'); e=$(ln 'db_migrate_mieru_service_outbound_to_instances'); f=$(ln 'db_migrate_routing_profiles_v3529')
 [[ -n "$a$b$c$d$e$f" && $a -lt $b && $b -lt $c && $c -lt $d && $d -lt $e && $e -lt $f ]] && pass "E static order in main_menu" || fail "E static order a=$a b=$b c=$c d=$d e=$e f=$f"
 mk_bin ok; with_jq; rm -rf "$CFGD"; mkdir -p "$CFGD"
@@ -130,7 +134,7 @@ out=$(printf '0\n' | PATH="$BIN:$PATH" VLESS_TEST_CFG="$CFGD" bash -c "source '$
   detect_legacy_ssh_tunnel(){ return 1; }; ensure_singbox_runtime_consistency(){ :; }
   _header(){ :; }; clear(){ :; }; systemctl(){ :; }
   main_menu" 2>&1); rc=$?
-echo "$out" | grep -q 'CHECK_DEPS_CALLED\|DNS64_CALLED' && fail "F check_dependencies ran at menu start" || pass "F runtime: check_dependencies not called"
+grep -q 'CHECK_DEPS_CALLED\|DNS64_CALLED' <<<"$out" && fail "F check_dependencies ran at menu start" || pass "F runtime: check_dependencies not called"
 [[ $rc -eq 0 ]] && pass "F menu opened and exited on 0" || fail "F menu rc=$rc: $(echo "$out" | tail -3)"
 jq -e 'has("routing_profiles")|not' "$CFGD/db.json" >/dev/null 2>&1 && pass "F startup DB valid, no routing_profiles" || fail "F startup DB invalid/has routing_profiles"
 grep -q '分流规则集迁移失败' <<<"$out" && fail "F migration failure at startup" || pass "F no migration failure text"

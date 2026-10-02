@@ -13,8 +13,10 @@ if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
 echo "=== B: VERSION sync (accept current script VERSION; no bump required in DA) ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
-C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
+R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md")
+R=$(head -1 <<<"$R")
+C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md")
+C=$(head -1 <<<"$C")
 if [[ -n "$VER" && "$VER" == "$R" && "$VER" == "$C" ]]; then
   pass "VERSION=$VER synced"
 else
@@ -100,7 +102,7 @@ fi
 _seed_callers=$(grep -n 'db_seed_telegram_dc_matchers_if_absent' "$SCRIPT" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'db_seed_telegram_dc_matchers_if_absent()' || true)
 [[ -z "$_seed_callers" ]] && pass "no startup matchers seed caller" || fail "matchers seed still called: $_seed_callers"
 init_block=$(awk '/^init_db\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-echo "$init_block" | grep -q 'routing_profiles' && fail "init_db still initialises routing_profiles" || pass "init_db has no routing_profiles init"
+grep -q 'routing_profiles' <<<"$init_block" && fail "init_db still initialises routing_profiles" || pass "init_db has no routing_profiles init"
 
 echo "=== J: Telegram DC uses matchers not fake geoip:telegram ==="
 if grep -q 'geoip:telegram' "$SCRIPT"; then
@@ -166,38 +168,38 @@ grep -q '^_select_instance_outbound_policy()' "$SCRIPT" && fail "instance policy
 # v3.5.30 fixed instance outbound menu: 1 inherit 2 direct 3 WARP 4 chain 5 balancer 0 back (6/7/8 gone)
 prompt_block=$(awk '/^_prompt_instance_outbound\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
 # UI must not show internal ids; code still assigns profile:home / profile:direct_backup
-echo "$prompt_block" | grep -qE '家宽' && fail "prompt still offers 家宽" || pass "prompt no 家宽 option"
-echo "$prompt_block" | grep -qE '直出备用' && fail "prompt still offers 直出备用" || pass "prompt no 直出备用 option"
-echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:home"' && fail "prompt still binds profile:home" || pass "prompt never binds profile:home"
-echo "$prompt_block" | grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"' && fail "prompt still binds profile:direct_backup" || pass "prompt never binds profile:direct_backup"
+grep -qE '家宽' <<<"$prompt_block" && fail "prompt still offers 家宽" || pass "prompt no 家宽 option"
+grep -qE '直出备用' <<<"$prompt_block" && fail "prompt still offers 直出备用" || pass "prompt no 直出备用 option"
+grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:home"' <<<"$prompt_block" && fail "prompt still binds profile:home" || pass "prompt never binds profile:home"
+grep -q 'SELECTED_INSTANCE_OUTBOUND="profile:direct_backup"' <<<"$prompt_block" && fail "prompt still binds profile:direct_backup" || pass "prompt never binds profile:direct_backup"
 _items=$(echo "$prompt_block" | sed -n 's/.*\${G}\([0-9]\)\${NC}).*/\1/p' | tr '\n' ' ')
 [[ "$_items" == "1 2 3 4 5 0 " ]] && pass "prompt items exactly 1-5,0" || fail "prompt items: $_items"
 for _o in 6 7 8; do
-  echo "$prompt_block" | grep -qE "^[[:space:]]*${_o}\)" && fail "prompt still handles option $_o" || pass "prompt option $_o gone"
+  grep -qE "^[[:space:]]*${_o}\)" <<<"$prompt_block" && fail "prompt still handles option $_o" || pass "prompt option $_o gone"
 done
 if echo "$prompt_block" | grep -E 'echo .*\(profile:(home|direct_backup)\)' >/dev/null; then
   fail "prompt still shows profile: ids in UI echo"
 else
   pass "prompt UI hides profile: ids"
 fi
-echo "$prompt_block" | grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' && fail "prompt still has item 8 wizard" || pass "prompt item 8 wizard removed"
-echo "$prompt_block" | grep -q '_prompt_pick_chain_outbound' && pass "prompt chain pick" || fail "prompt no chain"
-echo "$prompt_block" | grep -q '_prompt_pick_balancer_outbound' && pass "prompt balancer pick" || fail "prompt no balancer"
-echo "$prompt_block" | grep -q '旧规则集' && pass "prompt legacy path" || fail "prompt no legacy"
+grep -q '配置/重建家宽\|wizard_home_broadband_direct_backup' <<<"$prompt_block" && fail "prompt still has item 8 wizard" || pass "prompt item 8 wizard removed"
+grep -q '_prompt_pick_chain_outbound' <<<"$prompt_block" && pass "prompt chain pick" || fail "prompt no chain"
+grep -q '_prompt_pick_balancer_outbound' <<<"$prompt_block" && pass "prompt balancer pick" || fail "prompt no balancer"
+grep -q '旧规则集' <<<"$prompt_block" && pass "prompt legacy path" || fail "prompt no legacy"
 
 echo "=== Q: menu 10 分流规则集 withdrawn; wizard/CRUD retired ==="
 mgr=$(awk '/^manage_routing\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-if echo "$mgr" | grep -q '分流规则集'; then
+if grep -q '分流规则集' <<<"$mgr"; then
   fail "menu still exposes 分流规则集"
 else
   pass "no top-level 分流规则集 in manage_routing"
 fi
-if echo "$mgr" | grep -q '_item "10"'; then
+if grep -q '_item "10"' <<<"$mgr"; then
   fail "manage_routing still has item 10"
 else
   pass "manage_routing has no item 10"
 fi
-if echo "$mgr" | grep -q 'manage_routing_profiles'; then
+if grep -q 'manage_routing_profiles' <<<"$mgr"; then
   fail "manage_routing still calls manage_routing_profiles"
 else
   pass "manage_routing_profiles unhooked from manage_routing"
@@ -293,7 +295,7 @@ _non_db_create=$(awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/{fn=$1} /db_add_routing_p
 [[ -z "$_non_db_create" ]] && pass "no UI path creates profiles" || fail "profile create callers at lines: $_non_db_create"
 grep -q 'ai_direct\|db_routing_template_rules_ai_media "direct"' "$SCRIPT" && fail "wizard AI direct_backup semantics still present" || pass "wizard AI semantics removed"
 db_mig_body=$(awk '/^db_migrate_routing_profiles_v3529\(\)/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")
-echo "$db_mig_body" | grep -q '_has_legacy_routing_profile_state' && pass "migrate gated on legacy state" || fail "migrate not gated"
+grep -q '_has_legacy_routing_profile_state' <<<"$db_mig_body" && pass "migrate gated on legacy state" || fail "migrate not gated"
 grep -q 'db_migrate_routing_profiles_v3529' "$SCRIPT" && pass "migrate symbol wired in script" || fail "no migrate"
 
 echo "=== Z: v3.5.28/29 markers present (no forced VERSION bump) ==="
@@ -304,8 +306,9 @@ echo "=== AA: instance rules priority comment intact ==="
 grep -q '用户 > 实例 > 全局' "$SCRIPT" && pass "priority comment" || fail "priority missing"
 
 echo "=== AB: template telegram clean of geoip:telegram ==="
-block=$(awk '/^db_routing_template_rules_telegram_dc\(\)/,/^}$/' "$SCRIPT" | head -30)
-echo "$block" | grep -q 'geoip:telegram' && fail "template has geoip:telegram" || pass "template clean of geoip:telegram"
+block=$(awk '/^db_routing_template_rules_telegram_dc\(\)/,/^}$/' "$SCRIPT")
+block=$(head -30 <<<"$block")
+grep -q 'geoip:telegram' <<<"$block" && fail "template has geoip:telegram" || pass "template clean of geoip:telegram"
 
 echo "=== AC: offline DB smoke — clean init (no routing_profiles) + migrate A/B/C/home ==="
 TMP=$(mktemp -d)
