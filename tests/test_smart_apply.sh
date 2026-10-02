@@ -62,7 +62,33 @@ grep -q 'validate_fail:' "$SCRIPT" && pass "validate_fail log" || fail "validate
 grep -q 'VLESS_SMART_APPLY' "$SCRIPT" && pass "kill-switch" || fail "kill-switch"
 
 echo "=== I: offline selftest (unchanged/changed/invalid) ==="
-if bash "$SCRIPT" --smart-apply-selftest; then pass "selftest"; else fail "selftest"; fi
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin"
+export VLESS_SMART_XRAY_CALLS="$WORK/xray.calls"
+cat > "$WORK/bin/xray" <<'XRAY'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$VLESS_SMART_XRAY_CALLS"
+if [[ "${1:-}" == run ]]; then
+  shift
+fi
+[[ "$#" -eq 3 && "$1" == -test && "$2" == -c ]] || exit 1
+jq empty "$3" >/dev/null 2>&1
+XRAY
+chmod +x "$WORK/bin/xray"
+PATH="$WORK/bin:$PATH"
+export PATH
+if bash "$SCRIPT" --smart-apply-selftest; then
+  pass "selftest"
+else
+  fail "selftest"
+fi
+if grep -q -- '-test' "$VLESS_SMART_XRAY_CALLS"; then
+  pass "selftest xray validation path"
+else
+  fail "selftest xray validation path not executed"
+fi
 
 echo "=== J: diff proves skip-restart path exists ==="
 ctx=$(grep -A80 '^_smart_apply_core()' "$SCRIPT")
