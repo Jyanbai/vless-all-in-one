@@ -2,35 +2,21 @@
 
 [English](./README.md) | [简体中文](./README_CN.md)
 
-Linux 服务器一体化代理部署脚本。
+## 简介
 
-它可以帮助你快速部署和管理多种协议，包括 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5**、**SS2022**、**VLESS Encryption + FinalMask (Sudoku)**、**mieru**。
+这是一个面向 Linux 服务器的一体化代理部署脚本，基于 Zyx0rx 的原作和 mozisen/surge 的维护版。目前处于维护模式：只修复 bug、加固测试，不增加新功能。
 
-## 功能特性
+## 支持的协议
 
-- 一键安装与管理
-- 支持多协议共存部署
-- 适配 Debian、Ubuntu、CentOS 和 Alpine
-- 基于 Xray + Sing-box 双核心架构
-- 提供用户管理、路由、订阅与故障排查文档
-- **mieru**（v3.5.20）：TCP/UDP、`port`/`portRange`、流量模式默认关闭；官方 `mierus://` 分享链接
-- **v3.5.26：** 从产品面移除 **SSH Tunnel**（选择/安装/创建）；仅保留可选遗留清理（`cleanup_legacy_ssh_tunnel`）；永不 stop/disable 系统 sshd
-- **v3.5.31：** 修复安装与隧道删除的错误处理、节点计数，清理无用代码，并将回归测试纳入 CI。
-- **v3.5.30：**
-  - 实例出口（「实例出口管理」、安装与管理、Xray 与 Mieru）简化为 继承 / 直连 / WARP / 链式 / 负载均衡
-  - 旧版本已有的分流规则仅作为兼容保留：原样保留、可继续使用或切换掉
-  - 修复缺少 `jq` 时全新安装启动失败（现在会先安装 `jq` 再读写数据库）
-  - 干净系统启动时不再初始化旧分流数据
-- **v3.5.29：** 「实例出口管理」列出 Mieru（含状态列表；绝不把 mieru 加入 XRAY_PROTOCOLS）。自更新以配置的 `SCRIPT_SOURCE_REPO`/`REF`/`PATH` 为准（手动「脚本更新」忽略 1h 缓存；不以过期 tag/release 盖住源分支 VERSION）。本版的分流选择改动 **已被 v3.5.30 取代**
-- **v3.5.28：** 实例级分流选择 — **已被 v3.5.30 取代**（仅作旧版兼容保留）
-- **v3.5.27：** Mieru **实例级**运行时与出口 — 每个 port/`portRange` = 一个 mita（独立 JSON/UDS/unit/metrics，状态目录 `/var/lib/vless-mieru/<slug>`）；库字段 `.xray.mieru[].instance_outbound`（缺省/空=继承；从不写入字面量 `inherit`）；最终模型 **无** `.service_outbound.mieru`（菜单启动时 fail-closed 迁移）；「实例出口管理」按端口列出 mieru（无「Mieru（全部实例）」）
-- **v3.5.21：** 添加链式节点时延迟/批量 regenerate（未使用仅写库；添加+路由 ≤1 次 regen）；自定义路由 token 解析器，支持混合 geosite/域名/IP（Xray + Sing-box）
-- **v3.5.22：** Mieru 回退路径复用同一套路由 token helpers（修复混合自定义规则导致 Xray 异常）
-- **v3.5.23：** 实例级 Xray 出口（`instance_outbound`）；菜单「实例出口管理」；默认继承全局；优先级 用户 > 实例 > 全局；仅 Xray 共享核心
-- **智能应用（v3.5.24）：** 重新生成代理配置时先校验，仅在 live 配置确有变化时才重启 Xray / Sing-box / mieru（`VLESS_SMART_APPLY=0` 恢复为每次生成后都重启）
-- **v3.5.25：** Mieru 服务级出口（`.service_outbound.mieru` +「Mieru（全部实例）」）— **已被 v3.5.27 取代**
+支持 **VLESS**、**VMess**、**Trojan**、**Hysteria2**、**TUIC**、**NaiveProxy**、**Snell**、**SOCKS5**、**SS2022**、**VLESS Encryption + FinalMask (Sudoku)** 和 **mieru**。
+
+## 支持的系统
+
+适配 Debian、Ubuntu、CentOS 和 Alpine。
 
 ## 快速安装
+
+请使用 root 身份运行以下命令：
 
 ```bash
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
@@ -38,17 +24,29 @@ wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-o
 
 当前脚本版本：**v3.5.31**
 
-## 用于流量统计的自定义 Sing-box 构建
+## nftables 端口转发
 
-从 **v3.5.3** 开始，**Hysteria2 / TUIC / AnyTLS** 的用户流量统计功能需要启用 `with_v2ray_api` 的自定义 Sing-box 构建。
+可以从主菜单 `10) 端口转发` 进入，再选择 `2) nftables 转发`。
 
-默认的上游 Sing-box 二进制通常 **不包含** 此能力。
+也可以单独下载本仓库的脚本并以 root 身份运行：
 
-如果你需要使用 Sing-box 的流量同步 / 配额 / 到期等功能，请下载对应 GitHub Release 附件中的自定义 Sing-box，并替换当前的 `/usr/local/bin/sing-box`。
+```bash
+wget -O nft.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/nft.sh && chmod +x nft.sh && ./nft.sh
+```
 
-Release 附件中已提供安装说明：
+安装后的快捷命令是 `nftm`。本仓库的 `nft.sh` 与上游保持一致。
 
-- `README-sing-box-with-v2ray-api.md`
+## 已知限制
+
+Hysteria2 / TUIC / AnyTLS 的用户流量统计需要带 `with_v2ray_api` 的 Sing-box 构建。本仓库目前不提供这样的构建。
+
+## 版本说明
+
+本仓库的 3.5.x 是独立的版本线，与上游 3.6 或 3.7 没有对应关系。
+
+## 更新日志
+
+请参阅 [CHANGELOG_CN.md](./CHANGELOG_CN.md)。
 
 ## Star History
 
