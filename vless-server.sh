@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.30 [服务端]
+#  多协议代理一键部署脚本 v3.5.31 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -36,7 +36,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.30"
+readonly VERSION="3.5.31"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Jyanbai/vless-all-in-one"
 readonly SCRIPT_REPO="Jyanbai/vless-all-in-one"
@@ -3578,7 +3578,7 @@ get_all_traffic_stats() {
 
     # 使用临时文件存储，避免大变量导致内存问题
     local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
+    trap "rm -f '$tmp_stats'; trap - RETURN" RETURN
     : > "$tmp_stats"
 
     # === Xray 流量统计 ===
@@ -12642,7 +12642,8 @@ install_xray() {
     local channel="${1:-stable}"
     local force="${2:-false}"
     local version_override="${3:-}"
-    local xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
+    local xarch
+    xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
@@ -12829,7 +12830,8 @@ install_singbox() {
     local channel="${1:-stable}"
     local force="${2:-false}"
     local version_override="${3:-}"
-    local sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
+    local sarch
+    sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
         apk add --no-cache gcompat libc6-compat &>/dev/null
@@ -15317,7 +15319,8 @@ _snell_alpine_diagnostics() { # _snell_alpine_diagnostics <binary>
 # 安装 Snell v4
 install_snell() {
     check_cmd snell-server && { _ok "Snell 已安装"; return 0; }
-    local sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
+    local sarch
+    sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
     local version="4.1.1" expected_sha="${SNELL_V4_SHA256:-}"
     [[ -n "$expected_sha" ]] || expected_sha=$(_snell_release_sha256 "$version" "$sarch")
     [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
@@ -15533,21 +15536,10 @@ install_snell_v6() {
     _ok "Snell v6 v${version} 已安装"
 }
 
-# 安装 AnyTLS
-install_anytls() {
-    local aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
-    # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
-    if [[ "$DISTRO" == "alpine" ]]; then
-        apk add --no-cache gcompat libc6-compat &>/dev/null
-    fi
-    _install_binary "anytls-server" "anytls/anytls-go" \
-        'https://github.com/anytls/anytls-go/releases/download/v$version/anytls_${version}_linux_${aarch}.zip' \
-        anytls
-}
-
 # 安装 ShadowTLS
 install_shadowtls() {
-    local aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
+    local aarch
+    aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
     _install_binary "shadow-tls" "ihciah/shadow-tls" \
         'https://github.com/ihciah/shadow-tls/releases/download/v$version/shadow-tls-${aarch}' \
         shadowtls
@@ -15565,7 +15557,8 @@ install_naive() {
         return 1
     fi
     
-    local narch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
+    local narch
+    narch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     
     # 安装依赖
     case "$DISTRO" in
@@ -26845,9 +26838,6 @@ do_install_server() {
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
             ;;
-        anytls)
-            install_anytls || { _err "AnyTLS 安装失败"; _pause; return 1; }
-            ;;
         naive)
             install_naive || { _err "NaïveProxy 安装失败"; _pause; return 1; }
             ;;
@@ -28482,14 +28472,17 @@ show_status() {
         local warp_count=0
         local block_count=0
         local unique_nodes=""
+        local -A seen=()
         
         while IFS= read -r outbound; do
             [[ -z "$outbound" ]] && continue
             if [[ "$outbound" == chain:* ]]; then
                 ((chain_count++))
                 local node_name="${outbound#chain:}"
+                [[ -n "$node_name" ]] || continue
                 # 收集唯一节点名
-                if [[ ! "$unique_nodes" =~ "$node_name" ]]; then
+                if [[ -z "${seen[$node_name]+x}" ]]; then
+                    seen["$node_name"]=1
                     [[ -n "$unique_nodes" ]] && unique_nodes+=","
                     unique_nodes+="$node_name"
                 fi
@@ -28504,7 +28497,7 @@ show_status() {
         local display_info=""
         if [[ $chain_count -gt 0 ]]; then
             # 统计唯一节点数
-            local node_count=$(echo "$unique_nodes" | tr ',' '\n' | wc -l)
+            local node_count=${#seen[@]}
             if [[ $node_count -eq 1 ]]; then
                 display_info="→${unique_nodes}"
             else
@@ -31085,7 +31078,8 @@ create_tunnel_interactive() {
     # 同时检查 Cloudflare 远程是否有隧道（本地配置可能已丢失）
     if [[ -z "$existing_tunnel" ]]; then
         _info "检查 Cloudflare 账户中的隧道..."
-        local remote_tunnels=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null) || true
+        local remote_tunnels
+        remote_tunnels=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel list 2>/dev/null) || true
         local tunnel_names=$(echo "$remote_tunnels" | grep -E "^[a-f0-9-]{36}" | awk '{print $2}' | head -5 || true)
         if [[ -n "$tunnel_names" ]]; then
             echo ""
@@ -31980,6 +31974,34 @@ uninstall_cloudflared() {
     _pause
 }
 
+_cloudflared_delete_tunnel_and_cleanup() {
+    local selected_name="$1" selected_id="$2" local_name="$3"
+    local delete_output
+    delete_output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$selected_name" 2>&1)
+    local delete_exit_code=$?
+
+    if [[ $delete_exit_code -eq 0 ]]; then
+        _ok "隧道 '$selected_name' 已删除"
+
+        # 如果是本地配置的隧道，清理本地文件
+        if [[ "$selected_name" == "$local_name" ]]; then
+            rm -f "$CLOUDFLARED_DIR/tunnel.info"
+            rm -f "$CLOUDFLARED_CONFIG"
+            rm -f "$CLOUDFLARED_DIR/$selected_id.json"
+            _info "本地配置文件已清理"
+        fi
+
+        echo ""
+        echo -e "  ${Y}提示: 相关的 DNS 记录可能需要手动在 Cloudflare 后台删除${NC}"
+    else
+        _err "删除失败"
+        echo ""
+        echo -e "  ${Y}错误信息:${NC}"
+        echo "$delete_output"
+    fi
+    return "$delete_exit_code"
+}
+
 # 删除隧道（保留 cloudflared）
 delete_tunnel() {
     _header
@@ -32085,29 +32107,7 @@ delete_tunnel() {
     
     # 删除隧道
     _info "删除隧道..."
-    local delete_output=$("$CLOUDFLARED_BIN" $CLOUDFLARED_EDGE_OPTS tunnel delete "$selected_name" 2>&1)
-    local delete_exit_code=$?
-    
-    # 调试：显示错误信息以便诊断
-    if [[ $delete_exit_code -eq 0 ]] || echo "$delete_output" | grep -qiE "deleted|success"; then
-        _ok "隧道 '$selected_name' 已删除"
-        
-        # 如果是本地配置的隧道，清理本地文件
-        if [[ "$selected_name" == "$local_name" ]]; then
-            rm -f "$CLOUDFLARED_DIR/tunnel.info"
-            rm -f "$CLOUDFLARED_CONFIG"
-            rm -f "$CLOUDFLARED_DIR/$selected_id.json"
-            _info "本地配置文件已清理"
-        fi
-        
-        echo ""
-        echo -e "  ${Y}提示: 相关的 DNS 记录可能需要手动在 Cloudflare 后台删除${NC}"
-    else
-        _err "删除失败"
-        echo ""
-        echo -e "  ${Y}错误信息:${NC}"
-        echo "$delete_output"
-    fi
+    _cloudflared_delete_tunnel_and_cleanup "$selected_name" "$selected_id" "$local_name"
     
     _pause
 }

@@ -90,7 +90,9 @@ else
   pass "FinalMask verify free of service_outbound.mieru"
 fi
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-[[ "$VER" == "3.5.30" ]] && pass "VERSION=$VER (3.5.30)" || fail "VERSION=$VER unexpected"
+R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
+C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
+[[ "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo ""
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

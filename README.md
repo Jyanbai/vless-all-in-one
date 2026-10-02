@@ -15,6 +15,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 - User management, routing, subscriptions, and troubleshooting docs
 - **mieru** (v3.5.20): TCP/UDP, `port`/`portRange`, Traffic Pattern default Off; official `mierus://` links
 - **v3.5.26:** remove **SSH Tunnel** from product surface (select/install/create); opt-in legacy cleanup only (`cleanup_legacy_ssh_tunnel`); never stop/disable system sshd
+- **v3.5.31:** Fix installation and tunnel deletion error handling, correct node counts, remove unused code, and run regression tests in CI.
 - **v3.5.30:**
   - Instance outbound (实例出口管理, install and manage, Xray and Mieru) is simplified to inherit / direct / WARP / chain / balancer
   - Existing routing rules from older versions keep working as legacy compatibility only; they are kept as-is and can be left in place or switched off
@@ -35,7 +36,7 @@ It helps you quickly deploy and manage multiple protocols in one place, includin
 wget -O vless-server.sh https://raw.githubusercontent.com/Jyanbai/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && ./vless-server.sh
 ```
 
-Current script version: **v3.5.30**
+Current script version: **v3.5.31**
 
 ## Sing-box custom build for traffic stats
 
