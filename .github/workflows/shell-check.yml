@@ -2,8 +2,7 @@ name: shell-check
 
 on:
   push:
-    branches-ignore:
-      - test/hardening
+    branches: [main]
   pull_request:
 
 permissions:
