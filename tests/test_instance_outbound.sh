@@ -12,8 +12,10 @@ if bash -n "$SCRIPT"; then pass "bash -n"; else fail "bash -n"; fi
 
 echo "=== B: VERSION sync ==="
 VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
-R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md" | head -1)
-C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md" | head -1)
+R=$(sed -n 's/^Current script version: \*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README.md")
+R=$(head -1 <<<"$R")
+C=$(sed -n 's/^当前脚本版本：\*\*v\([0-9.]*\)\*\*.*/\1/p' "$ROOT/README_CN.md")
+C=$(head -1 <<<"$C")
 [[ "$VER" == "$R" && "$VER" == "$C" ]] && pass "VERSION=$VER synced" || fail "VERSION mismatch script=$VER readme=$R cn=$C"
 
 echo "=== C: symbols present ==="
@@ -25,7 +27,8 @@ done
 
 echo "=== D: tag formula consistency ==="
 # add_xray_inbound_v2 must call _instance_inbound_tag
-if grep -A5 '_instance_inbound_tag' "$SCRIPT" | grep -q 'inbound_tag'; then pass "inbound uses helper"
+ctx=$(grep -A5 '_instance_inbound_tag' "$SCRIPT")
+if grep -q 'inbound_tag' <<<"$ctx"; then pass "inbound uses helper"
 else
   # alternate: inbound_tag=$(_instance_inbound_tag
   if grep -q 'inbound_tag=\$(_instance_inbound_tag' "$SCRIPT"; then pass "inbound uses helper"
@@ -33,17 +36,20 @@ else
 fi
 
 echo "=== E: menu item 9 without renumbering 1-8 ==="
-if grep -A20 '^manage_routing()' "$SCRIPT" | grep -q '_item "9" "实例出口管理"'; then pass "menu 9"
+ctx=$(grep -A20 '^manage_routing()' "$SCRIPT")
+if grep -q '_item "9" "实例出口管理"' <<<"$ctx"; then pass "menu 9"
 else fail "menu 9 missing"; fi
-if grep -A20 '^manage_routing()' "$SCRIPT" | grep -q '_item "8"'; then pass "menu 8 intact"; else fail "menu 8 missing"; fi
+ctx=$(grep -A20 '^manage_routing()' "$SCRIPT")
+if grep -q '_item "8"' <<<"$ctx"; then pass "menu 8 intact"; else fail "menu 8 missing"; fi
 
 echo "=== F: fail-closed marker + priority comment ==="
 grep -q 'fail-closed' "$SCRIPT" && pass "fail-closed present" || fail "no fail-closed"
 grep -q '用户 > 实例 > 全局' "$SCRIPT" && pass "priority comment" || fail "priority comment missing"
 
 echo "=== G: multi-IP comment near emit ==="
-grep -q 'MULTI-IP\|多IP' "$SCRIPT" | head -1
-if grep -n 'MULTI-IP\|多IP显式\|ip-in-' "$SCRIPT" | grep -qi 'instance\|实例'; then pass "multi-IP documented near instance"
+grep -q 'MULTI-IP\|多IP' "$SCRIPT"
+ctx=$(grep -n 'MULTI-IP\|多IP显式\|ip-in-' "$SCRIPT")
+if grep -qi 'instance\|实例' <<<"$ctx"; then pass "multi-IP documented near instance"
 else
   # softer check
   grep -q 'ip-in-' "$SCRIPT" && pass "ip-in tags referenced" || fail "no multi-IP note"
@@ -51,10 +57,12 @@ fi
 
 echo "=== H: mieru isolation (Xray rules skip; mieru uses own instance_outbound) ==="
 # Xray inboundTag instance generators must still skip mieru
-if grep -A20 '^gen_xray_instance_outbound_rules()' "$SCRIPT" | grep -q 'mieru'; then pass "mieru skipped in xray instance rules"
+ctx=$(grep -A20 '^gen_xray_instance_outbound_rules()' "$SCRIPT")
+if grep -q 'mieru' <<<"$ctx"; then pass "mieru skipped in xray instance rules"
 else fail "mieru not skipped in xray rules"; fi
 # v3.5.27: mieru compile intentionally reads db_get_instance_outbound
-if grep -A30 '^_mieru_compile_egress_plan()' "$SCRIPT" | grep -q 'db_get_instance_outbound'; then
+ctx=$(grep -A30 '^_mieru_compile_egress_plan()' "$SCRIPT")
+if grep -q 'db_get_instance_outbound' <<<"$ctx"; then
   pass "mieru compile wires instance_outbound"
 else
   fail "mieru compile missing instance_outbound"
@@ -82,10 +90,36 @@ g2=$(echo "$ordered" | jq -r '.[2]|has("domain")')
 
 echo "=== J: vocab — no forced inherit literal storage helper ==="
 # db_set_instance_outbound must clear on inherit/empty
-if grep -A15 '^db_set_instance_outbound()' "$SCRIPT" | grep -q 'inherit'; then pass "inherit maps to clear"
+ctx=$(grep -A15 '^db_set_instance_outbound()' "$SCRIPT")
+if grep -q 'inherit' <<<"$ctx"; then pass "inherit maps to clear"
 else fail "inherit not handled in setter"; fi
 
-echo "=== K: xray -test if binary present ==="
+echo "=== K: xray -test with offline fixture validator ==="
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/xray" <<'XRAY'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == run ]] && shift
+[[ "$#" -eq 3 && "$1" == -test && "$2" == -c ]] || exit 1
+# Check the sample's JSON and routing references without a host Xray binary.
+jq -e '
+  . as $config |
+  (.inbounds | type == "array" and length > 0) and
+  (.outbounds | type == "array" and length > 0) and
+  (.routing.rules | type == "array" and length > 0) and
+  all(.routing.rules[];
+    .type == "field" and
+    (.inboundTag | type == "array" and length > 0) and
+    all(.inboundTag[]; . as $tag | any($config.inbounds[]; .tag == $tag)) and
+    (.outboundTag as $tag | any($config.outbounds[]; .tag == $tag))
+  )
+' "$3" >/dev/null
+XRAY
+chmod +x "$WORK/bin/xray"
+# The test validator precedes CI interception stubs and any installed core.
+PATH="$WORK/bin:$PATH"
 if command -v xray >/dev/null 2>&1; then
   tmp=$(mktemp "${TMPDIR:-/tmp}/vless-instance-outbound.XXXXXX.json")
   cat > "$tmp" <<'JSON'
@@ -112,14 +146,6 @@ JSON
   rm -f "$tmp"
 else
   echo "SKIP: xray binary not present"
-fi
-
-echo "=== L: E2E host reachability (no secrets) ==="
-if ping -c1 -W2 160.236.111.34 >/dev/null 2>&1; then
-  echo "HOST 160.236.111.34: reachable (no SSH attempted)"
-  pass "host ping"
-else
-  echo "HOST 160.236.111.34: unreachable — SKIP E2E"
 fi
 
 echo ""

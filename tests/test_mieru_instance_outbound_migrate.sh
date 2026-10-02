@@ -22,7 +22,8 @@ else
   fail "startup wire missing"
 fi
 # rename must NOT write service_outbound.mieru anymore (instance path covers mieru)
-if awk '/^db_rename_chain_node\(\)/{f=1} f{print} f && /^\}$/{exit}' "$SCRIPT" | grep -q 'service_outbound.mieru'; then
+ctx=$(awk '/^db_rename_chain_node\(\)/{f=1} f{print} f && /^\}$/{exit}' "$SCRIPT")
+if grep -q 'service_outbound.mieru' <<<"$ctx"; then
   fail "db_rename_chain_node still writes service_outbound.mieru"
 else
   pass "db_rename_chain_node has no service_outbound.mieru branch"
@@ -215,17 +216,20 @@ VER=$(grep -m1 '^readonly VERSION=' "$SCRIPT" | cut -d'"' -f2)
 [[ -n "$VER" ]] && pass "VERSION=$VER" || fail "VERSION missing"
 
 echo "=== H: service setter hard-error (no new writes) ==="
-if grep -A8 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q '_db_apply'; then
+ctx=$(grep -A8 '^db_set_service_outbound_mieru()' "$SCRIPT")
+if grep -q '_db_apply' <<<"$ctx"; then
   fail "db_set_service_outbound_mieru still writes via _db_apply"
 else
   pass "setter has no _db_apply write path"
 fi
-if grep -A6 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q 'return 1'; then
+ctx=$(grep -A6 '^db_set_service_outbound_mieru()' "$SCRIPT")
+if grep -q 'return 1' <<<"$ctx"; then
   pass "setter returns 1"
 else
   fail "setter missing return 1"
 fi
-if grep -A5 '^db_set_service_outbound_mieru()' "$SCRIPT" | grep -q '已移除'; then
+ctx=$(grep -A5 '^db_set_service_outbound_mieru()' "$SCRIPT")
+if grep -q '已移除' <<<"$ctx"; then
   pass "setter hard-error message"
 else
   fail "setter missing hard-error message"
