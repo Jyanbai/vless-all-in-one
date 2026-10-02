@@ -1,82 +1,81 @@
 # Agent notes (vless-all-in-one)
 
 ## Scope
+
 - Fat installer: `vless-server.sh` (table-driven, mozisen/surge style). Prefer porting named upstream hunks; do not redesign.
-- Companion: `nft.sh`. Docs: `README.md` / `README_CN.md` (keep minimal).
+- Companion: `nft.sh`. Docs: `README.md` / `README_CN.md` (keep minimal), with history in `CHANGELOG.md` / `CHANGELOG_CN.md`.
+
+## Maintenance and upstream policy
+
+- Maintenance mode: only fix bugs and strengthen tests; do not add new features.
+- `nft.sh` is an upstream mirror. Do not modify it locally; update it only by syncing the complete upstream file.
 
 ## Version sync (CI blocking)
+
 - `readonly VERSION="…"` in `vless-server.sh` must match:
   - `Current script version: **v…**` in `README.md`
   - `当前脚本版本：**v…**` in `README_CN.md`
+- Keep the version in the script header comment synchronized too.
 - Workflow: `.github/workflows/shell-check.yml` (`bash -n` + `VERSION_SYNC`).
 
-## v3.5.30 product notes (docs surface)
+## Documentation
+
+- Keep English and Chinese README structures consistent and verify feature claims against the code.
+- Keep database paths, function names, environment variables, and internal terminology out of README prose. Keep the required `with_v2ray_api` build flag in known limitations.
+- Keep version history in the changelogs; preserve existing entry text when moving it.
+- Do not advertise routing profiles, 家宽, 直出备用, internal ids/schema, or the retired SSH Tunnel as current product features.
+
+## Instance outbound and legacy routing constraints
+
 - **Routing Profiles retired from normal UI.** Instance outbound prompt (Xray + Mieru, install-time + `9) 实例出口管理`) = `1` inherit / `2` direct / `3` WARP / `4` chain / `5` balancer / `0` back. Options 6/7/8, `wizard_home_broadband_direct_backup`, `_select_instance_outbound_policy`, `manage_routing_profiles`, `_edit_routing_profile`, `_show_routing_profile_users`, `_routing_profile_validate_and_apply` deleted. No special-casing of `profile:home` / `profile:direct_backup`. Do not advertise profiles / 家宽 / 直出备用 / ids / schema in READMEs.
 - **Legacy compat (internal only):** stored `profile:*` stays readable + runnable. Picker shows `旧规则集: <name>` (missing ⇒ `旧规则集: 已缺失`; never print id), default `k` = keep (no write, no restart). Switching off last ref clears only `instance_outbound`; profile object kept as orphan. Missing profile fails closed in `_resolve_instance_outbound_target` (`分流规则集不存在: profile:<id>`). Compilers kept fail-closed: `_gen_xray_profile_inbound_rules`, `_gen_xray_profile_outbound_needs`, `_mieru_expand_profile_rules`, `_resolve_profile_rule_outbound`, `_profile_rule_domains_csv`, `_list_profiles_referencing_outbound`.
 - **Write vocab:** `db_set_instance_outbound` accepts only empty / `direct` / `warp` / `chain:<n>` / `balancer:<n>` (non-empty name). `profile:*` rejected unless equal to stored value (returns 0, writes nothing). `db_add/update/delete/copy_routing_profile*` kept but unreachable from UI.
 - **Migration gate:** `_has_legacy_routing_profile_state` true only for non-empty `.routing_profiles`, any `instance_outbound` `profile:*` (Mieru included), `home_broadband`, or exact leftover `.routing_profiles == []`. `db_migrate_routing_profiles_v3529` returns 0 with no write / no snapshot when false. Never creates `routing_profiles: []`; drops the leftover `[]` only when nothing references `profile:*`. Seed drop requires exact seed id + name + rules and zero refs; user-created/edited/renamed profiles always kept. `db_ensure_routing_profiles_defaults` removed; `init_db` never creates `.routing_profiles`; readers use `// []`.
-- **Startup order:** `check_root` → `init_log` → `ensure_startup_db_dependencies` (jq only, distro pkg helpers, verify after; else exit `缺少数据库依赖 jq，自动安装失败。请安装 jq 后重新运行脚本。`) → `init_db` → migrations. Full `check_dependencies` no longer runs at menu start. Missing jq must never surface as a profile-migration failure.
-- **Invariants:** never add mieru to `XRAY_PROTOCOLS`; Mieru `portRange` = one row.
-- **Tests:** `tests/test_routing_profile_retirement.sh` (A–N), `tests/test_startup_db_dependencies.sh` (A–F, mocked package managers; never real apt/apk), `tests/test_routing_profile_data_v3530.sh`, plus regressions.
-- **VERSION sync:** `3.5.30` in `vless-server.sh` (header comment too) + both READMEs.
-
-## v3.5.29 product notes (docs surface)
-- **Superseded by v3.5.30** for routing UI (profile picker / wizard / 家宽 / 直出备用 entries removed); kept below as history.
 - **WITHDRAWN (not normal product entry):** top-level `10) 分流规则集` / `manage_routing_profiles` CRUD. Do not document it as a user-facing menu.
 - **KEEP backend:** `.routing_profiles`, `profile:<id>` vocab, compilers, validation, migration, templates (DA helpers unchanged).
-- **NEW surface — only via `9) 实例出口管理` picker:** inherit / direct / WARP / chain / balancer / 家宽 / 直出备用 / 配置重建 wizard. Stable ASCII ids `home` / `direct_backup` (`instance_outbound` stores `profile:home` | `profile:direct_backup`; no nested `profile:*`). Chinese names are UI-only — never emphasize internal ids in user-facing docs.
 - **Templates:** `finance_crypto` / `telegram_dc` / `ai_media` = matchers-only; stop auto-seeding them as profiles. Migrate seed/legacy `home_broadband`.
-- **Legacy profiles** (id ≠ `home`|`direct_backup`): preserved; show read-only「旧规则集」(keep; no edit/delete from picker).
-- **Wizard:** upserts BOTH `home` + `direct_backup` (finance+TG same on both; AI JP on home / DIRECT on direct_backup).
-- **Mieru in 实例出口管理:** `manage_instance_outbound` lists mieru after the Xray loop via `db_exists`/`db_list_ports` (xray + mieru) + status list. NEVER add mieru to `XRAY_PROTOCOLS`. One `portRange` row = one listed instance.
-- **Self-updater SoT:** configured `SCRIPT_SOURCE_REPO`/`REF`/`PATH`. Manual「脚本更新」ignores 1h cache; cache-bust raw fetch; keep blob SHA + `bash -n`. Tag/release must not mask a newer source-ref `VERSION`.
-- **VERSION sync:** `3.5.29` in `vless-server.sh` + both READMEs.
-
-## v3.5.28 product notes (docs surface)
-- **Per-instance routing profiles:** DB `.routing_profiles[]` — stable `id`, editable `name`, ordered `rules[]`, `fallback` always `"inherit"` (unmatched traffic continues to global routing; never a profile catch-all DIRECT). Missing keys on old DBs ⇒ identical to 3.5.27 (no migrate).
-- **`instance_outbound` vocab (extends 3.5.23):** `direct` | `warp` | `chain:…` | `balancer:…` | `profile:<stable_id>`. Empty/missing = inherit global (never store literal `inherit`). Missing `profile:<id>` fail-closed.
+- **Legacy routing profile data:** DB `.routing_profiles[]` — stable `id`, editable `name`, ordered `rules[]`, `fallback` always `"inherit"` (unmatched traffic continues to global routing; never a profile catch-all DIRECT). Missing keys on old DBs must not trigger migration.
+- For Xray shared-core inbounds, `instance_outbound` is per-port. Empty/missing means inherit global (never store literal `inherit`); `profile:<id>` is for retaining existing legacy settings only and missing targets fail closed.
 - **inherit vs direct vs chain vs profile:**
   - **inherit** (empty field): use global routing only.
-  - **direct / warp / chain / balancer:** single outbound override for that inbound (same as 3.5.23).
+  - **direct / warp / chain / balancer:** single outbound override for that inbound.
   - **profile:<id>:** expand the named rule set in order onto that instance’s inboundTag scope (Xray) or per-instance Mieru egress plan — not a service-wide Mieru switch.
 - **Compile:** Xray `_gen_xray_profile_inbound_rules` — inboundTag-scoped, preserve rule order (DIRECT does not reorder), no catch-all → inherit global. Mieru `_mieru_expand_profile_rules` inside `_mieru_compile_egress_plan` only (per-instance). Chain/balancer/WARP guards include profile refs; delete profile refused while in use (`db_list_instances_using_profile`).
 - **Telegram DC (Choice A):** `.telegram_dc_matchers` versioned best-effort known-endpoint seed (IPv4/IPv6) — NOT a full CIDR DB / not permanent. Rule `type=telegram_dc` expands matchers; misses use Telegram fallback (`geosite:telegram` in built-in). **Forbidden in profiles:** fake `geoip:telegram`.
-- **Built-ins** (`db_ensure_routing_profiles_defaults`): originally seeded once `finance_crypto` → `telegram_dc` → `ai_media` as profiles (finance/TG above AI/media for wizard/combined). **v3.5.29:** those packs are templates (matchers-only); wizard profiles are only `home` + `direct_backup`. Top-level UI「分流规则集」**withdrawn** — picker surface is `9) 实例出口管理` (家宽 / 直出备用 / 配置重建 wizard); shared-profile edit backend still goes through validate/apply + smart-apply.
-- **Helpers:** `db_list/get/add/update/delete/copy_routing_profile`, rule helpers, `db_get/set/seed_telegram_dc_matchers*`, `db_ensure_routing_profiles_defaults`.
-- Local matrix: `tests/test_instance_routing_profiles.sh` (A–AB) + regressions (smart_apply, instance_outbound, mieru_per_instance, mieru_migrate, finalmask, remove_ssh, bash -n).
+- Menu `9) 实例出口管理`; install prompt only when routing is meaningfully configured; same-port replace preserves the field.
+- Emit `inboundTag` rules as user → instance → global (API rule prepended). Multi-IP: base tag + `ip-in-*-$port` clones get the instance override; more-specific multi-IP rules stay higher.
+- Fail-closed on missing chain/WARP/balancer targets (no silent DIRECT). Deleting a referenced chain/balancer asks to clear refs → inherit (never auto-DIRECT).
+- Xray inboundTag overrides apply only to Xray shared-core inbounds. Mieru uses its own per-instance compiler; standalone / Snell / Naive / SSH-Tunnel do not use this path. Sing-box per-inbound detours require inbound matchers; do not document unsupported behavior.
 
-## v3.5.26 product notes (docs surface)
-- **Remove SSH Tunnel** from supported product surface (select menu, STANDALONE/PROTO tables, install/create). No new `ssh-tunnel` DB writes (`db_add`/`db_add_port`/`db_update_port` reject).
-- Legacy: opt-in `cleanup_legacy_ssh_tunnel` only — schema-lock snapshot → DB delete → scoped drop-in + `$CFG/ssh-tunnel`; proven-ownership `userdel`; never stop/disable system `sshd`.
-- Local matrix: `tests/test_remove_ssh_tunnel.sh`.
+## Mieru constraints
 
-## v3.5.27 product notes (docs surface)
+- **Invariants:** never add mieru to `XRAY_PROTOCOLS`; Mieru `portRange` = one row.
+- **Mieru in 实例出口管理:** `manage_instance_outbound` lists mieru after the Xray loop via `db_exists`/`db_list_ports` (xray + mieru) + status list. NEVER add mieru to `XRAY_PROTOCOLS`. One `portRange` row = one listed instance.
 - **Mieru per-instance runtime + outbound:** one DB row (port OR portRange) = one mita = own JSON/UDS/unit/outbound/metrics state. portRange is ONE logical instance.
 - Layout: `$CFG/mieru/<slug>.json`, UDS `/run/mita/<slug>/mita.sock`, unit `vless-mieru-<slug>`, state `/var/lib/vless-mieru/<slug>` bind-mounted over `/var/lib/mita` (metrics.pb hardcoded — systemd `BindPaths=` / OpenRC `unshare -m`+bind).
 - DB: `.xray.mieru[].instance_outbound` via `db_get/set/clear_instance_outbound xray mieru <port|range>`; empty/missing = inherit (never store literal `inherit`). FINAL model has NO `.service_outbound.mieru` (DA migrate: `db_migrate_mieru_service_outbound_to_instances`).
 - Compile: `_mieru_compile_egress_plan <key>` reads instance_outbound only (not service getter). Fail-closed on missing warp/chain/balancer.
 - UI: `manage_instance_outbound` lists mieru like Xray via `db_list_ports` — no「Mieru（全部实例）」. Same-value → no regen. smart_apply restarts only changed instances.
-- Local matrix: `tests/test_mieru_per_instance.sh` + `tests/test_mieru_instance_outbound_migrate.sh` + `tests/test_smart_apply.sh`.
-
-## v3.5.25 product notes (superseded by 3.5.27)
-- Was: one service-wide Mieru egress (`.service_outbound.mieru` + single `mieru.json`/`vless-mieru`). Replaced by per-instance model above.
-
-## v3.5.24 product notes (docs surface)
-- **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; snap restore fail-closed (`restore_fail:`, never false `skip_restart`). `configure_direct_outbound` writes `$CFG/direct_ip_version` then calls it (no private stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0` (always restart after gen). Count: `VLESS_COUNT_REGEN=1` → `VLESS_REGEN_LOG` (default `/tmp/vless-regen.count`) lines `restart:` / `skip_restart:` / `validate_fail:` / `restore_fail:`.
-- Local matrix: `tests/test_smart_apply.sh` (A–K) / `./vless-server.sh --smart-apply-selftest`.
-
-## v3.5.23 product notes (docs surface)
-- **instance_outbound (Xray shared-core only):** per-port field; absent/empty = inherit global (never store literal `inherit`); vocab `direct|warp|chain:…|balancer:…` (v3.5.28 adds `profile:<id>` — see above).
-- Menu `9) 实例出口管理`; install prompt only when routing is meaningfully configured; same-port replace preserves the field.
-- Emit `inboundTag` rules as user → instance → global (API rule prepended). Multi-IP: base tag + `ip-in-*-$port` clones get the instance override; more-specific multi-IP rules stay higher.
-- Fail-closed on missing chain/WARP/balancer targets (no silent DIRECT). Deleting a referenced chain/balancer asks to clear refs → inherit (never auto-DIRECT).
-- Not on Xray-inboundTag path for mieru (mieru uses own instance_outbound as of 3.5.27); not on standalone / Snell / Naive / SSH-Tunnel engine path. Sing-box per-inbound detour needs inbound matchers — follow-up, not this patch.
-- Local matrix: `tests/test_instance_outbound.sh`.
-
-## v3.5.20 product notes (docs surface)
 - **mieru:** TCP|UDP; exclusive `port` or `port_range`; Traffic Pattern Advanced default off (UI Off/Conservative/Custom → store `off`/`conservative`/`unlocked`); `mierus://`; no port→user ACL; runtime-only `trafficPattern` object (not in db.json).
-- **SSH Tunnel:** system OpenSSH only; Match Group; key-only; client TCP `-N -L/-D/-R`; no shell/exec/TTY/SFTP; no native UDP; no `ssh://` URI; keys on disk `0600` via `authorized_keys_path` only (never raw keys in db.json); candidate → `sshd -t/-T` → reload → admin verify → commit else rollback.
+
+## Retired SSH Tunnel constraints
+
+- **Remove SSH Tunnel** from supported product surface (select menu, STANDALONE/PROTO tables, install/create). No new `ssh-tunnel` DB writes (`db_add`/`db_add_port`/`db_update_port` reject).
+- Legacy: opt-in `cleanup_legacy_ssh_tunnel` only — schema-lock snapshot → DB delete → scoped drop-in + `$CFG/ssh-tunnel`; proven-ownership `userdel`; never stop/disable system `sshd`.
+
+## Startup, self-update, and config application
+
+- **Startup order:** `check_root` → `init_log` → `ensure_startup_db_dependencies` (jq only, distro pkg helpers, verify after; else exit `缺少数据库依赖 jq，自动安装失败。请安装 jq 后重新运行脚本。`) → `init_db` → migrations. Full `check_dependencies` no longer runs at menu start. Missing jq must never surface as a profile-migration failure.
+- **Self-updater SoT:** configured `SCRIPT_SOURCE_REPO`/`REF`/`PATH`. Manual「脚本更新」ignores 1h cache; cache-bust raw fetch; keep blob SHA + `bash -n`. Tag/release must not mask a newer source-ref `VERSION`.
+- **smart-apply:** `_regenerate_proxy_configs [xray|singbox|mieru|all]` — candidate→validate→diff→restart only if changed; snap restore fail-closed (`restore_fail:`, never false `skip_restart`). `configure_direct_outbound` writes `$CFG/direct_ip_version` then calls it (no private stop→gen→start). Kill-switch `VLESS_SMART_APPLY=0` (always restart after gen). Count: `VLESS_COUNT_REGEN=1` → `VLESS_REGEN_LOG` (default `/tmp/vless-regen.count`) lines `restart:` / `skip_restart:` / `validate_fail:` / `restore_fail:`.
+
+## Regression coverage
+
+- Preserve routing and startup coverage: `tests/test_routing_profile_retirement.sh`, `tests/test_startup_db_dependencies.sh` (mock package managers; never real apt/apk), `tests/test_routing_profile_data_v3530.sh`, `tests/test_instance_routing_profiles.sh`, and `tests/test_instance_outbound.sh`.
+- Preserve Mieru, cleanup, config application, and error handling coverage: `tests/test_mieru_per_instance.sh`, `tests/test_mieru_instance_outbound_migrate.sh`, `tests/test_remove_ssh_tunnel.sh`, `tests/test_smart_apply.sh` / `./vless-server.sh --smart-apply-selftest`, `tests/test_finalmask_outbound_verify.sh`, and `tests/test_v3531_return_codes.sh`.
+- In test files, the receiving end of a pipeline must not use commands that can exit early (`grep -q`, `grep -m`, or `head`). CI lint rejects these pipelines.
 
 ## Do not
+
 - Force-push / FF `main` from feature work unless explicitly ordered.
 - Store SSH private/public key material in `db.json`.
